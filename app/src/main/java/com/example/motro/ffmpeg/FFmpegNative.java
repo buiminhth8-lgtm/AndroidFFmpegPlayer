@@ -81,6 +81,23 @@ public final class FFmpegNative {
 
     public static native String getPlayerRtspTransportState(long handle);
 
+    /*
+     * Low latency RTSP example:
+     * long handle = FFmpegNative.createPlayer();
+     * FFmpegNative.setRtspTransport(handle, "udp");
+     * FFmpegNative.setPlayerLatencyMode(handle, "low_latency");
+     * FFmpegNative.setPlayerOption(handle, "drop_late_frame_threshold_us", "150000");
+     * FFmpegNative.preparePlayer(handle, rtspUrl, 3000000);
+     * FFmpegNative.startPlayer(handle);
+     */
+    public static native String setRtspTransport(long handle, String transport);
+
+    public static native String setPlayerLatencyMode(long handle, String mode);
+
+    public static native String setPlayerOption(long handle, String key, String value);
+
+    public static native String getPlayerLatencyConfig(long handle);
+
     public static native String startPlayerRecord(long handle, String outputPath);
 
     public static native String startPlayerSegmentRecord(long handle, String outputPattern, int segmentDurationSec);

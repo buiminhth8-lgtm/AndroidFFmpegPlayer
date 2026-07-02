@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -16,6 +17,7 @@ extern "C" {
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
+#include "libavutil/dict.h"
 #include "libavutil/error.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/pixfmt.h"
@@ -120,19 +122,6 @@ bool isNetworkUrl(const std::string &url) {
            || lower.rfind("udp://", 0) == 0;
 }
 
-std::string normalizeRtspTransport(std::string value) {
-    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
-        return std::isspace(c) != 0;
-    }), value.end());
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (value == "tcp" || value == "udp" || value == "auto") {
-        return value;
-    }
-    return "";
-}
-
 } // namespace
 
 NativePlayer::NativePlayer() {
@@ -192,6 +181,16 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         swsSourceFormat_ = -1;
     }
 
+    SourceType sourceType = detectSourceType(url);
+    PlayerOptions optionsSnapshot;
+    bool preferUdpInAuto = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sourceType_ = sourceType;
+        optionsSnapshot = playerOptions_;
+        preferUdpInAuto = preferUdpTransport_.load();
+    }
+
     avformat_network_init();
     formatContext_ = avformat_alloc_context();
     if (formatContext_ == nullptr) {
@@ -200,34 +199,63 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     }
     formatContext_->interrupt_callback.callback = NativePlayer::interruptCallback;
     formatContext_->interrupt_callback.opaque = this;
+    if (isRtspSource(sourceType)) {
+        formatContext_->max_delay = static_cast<int>(std::min<int64_t>(optionsSnapshot.maxDelayUs, std::numeric_limits<int>::max()));
+        formatContext_->max_probe_packets = optionsSnapshot.maxProbePackets;
+        if (optionsSnapshot.fflagsNoBuffer) {
+            formatContext_->flags |= AVFMT_FLAG_NOBUFFER;
+        }
+    }
 
     AVDictionary *options = nullptr;
-    const int64_t timeoutUs = static_cast<int64_t>(std::max(timeoutMs, 1)) * 1000;
-    const std::string timeoutValue = std::to_string(timeoutUs);
-    std::string transportMode;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        transportMode = rtspTransportMode_;
+    if (isRtspSource(sourceType)) {
+        const std::string transport = effectiveRtspTransportName(optionsSnapshot, preferUdpInAuto);
+        av_dict_set(&options, "rtsp_transport", transport.c_str(), 0);
+        if (transport == "tcp") {
+            av_dict_set(&options, "rtsp_flags", "prefer_tcp", 0);
+            if (optionsSnapshot.tcpNoDelay) {
+                av_dict_set(&options, "tcp_nodelay", "1", 0);
+            }
+        }
+        if (optionsSnapshot.fflagsNoBuffer) {
+            av_dict_set(&options, "fflags", "nobuffer", 0);
+        }
+        if (optionsSnapshot.avioDirect) {
+            av_dict_set(&options, "avioflags", "direct", 0);
+        }
+        av_dict_set(&options, "stimeout", std::to_string(optionsSnapshot.openTimeoutUs).c_str(), 0);
+        av_dict_set(&options, "timeout", std::to_string(optionsSnapshot.openTimeoutUs).c_str(), 0);
+        av_dict_set(&options, "rw_timeout", std::to_string(optionsSnapshot.readTimeoutUs).c_str(), 0);
+        av_dict_set(&options, "max_delay", std::to_string(optionsSnapshot.maxDelayUs).c_str(), 0);
+        av_dict_set(&options, "buffer_size", std::to_string(optionsSnapshot.socketBufferSize).c_str(), 0);
+        av_dict_set(&options, "probesize", std::to_string(optionsSnapshot.probesize).c_str(), 0);
+        av_dict_set(&options, "analyzeduration", std::to_string(optionsSnapshot.analyzeduration).c_str(), 0);
+        av_dict_set(&options, "max_probe_packets", std::to_string(optionsSnapshot.maxProbePackets).c_str(), 0);
+        if (optionsSnapshot.reorderQueueSize >= 0) {
+            av_dict_set(&options, "reorder_queue_size", std::to_string(optionsSnapshot.reorderQueueSize).c_str(), 0);
+        }
+
+        LOGI("RTSP options sourceType=%s transport=%s latencyMode=%s maxDelayUs=%lld reorderQueueSize=%d bufferSize=%d probesize=%lld analyzeduration=%lld fflagsNoBuffer=%d avioDirect=%d tcpNoDelay=%d",
+             sourceTypeName(sourceType).c_str(), transport.c_str(), latencyModeName(optionsSnapshot.latencyMode).c_str(),
+             static_cast<long long>(optionsSnapshot.maxDelayUs), optionsSnapshot.reorderQueueSize,
+             optionsSnapshot.socketBufferSize, static_cast<long long>(optionsSnapshot.probesize),
+             static_cast<long long>(optionsSnapshot.analyzeduration), optionsSnapshot.fflagsNoBuffer ? 1 : 0,
+             optionsSnapshot.avioDirect ? 1 : 0, optionsSnapshot.tcpNoDelay ? 1 : 0);
+        LOGI("RTSP fmtCtx max_delay=%d max_probe_packets=%d flags=0x%x",
+             formatContext_->max_delay, formatContext_->max_probe_packets, formatContext_->flags);
+    } else if (isNetworkUrl(url)) {
+        const int64_t timeoutUs = static_cast<int64_t>(std::max(timeoutMs, 1)) * 1000;
+        const std::string timeoutValue = std::to_string(timeoutUs);
+        av_dict_set(&options, "stimeout", timeoutValue.c_str(), 0);
+        av_dict_set(&options, "timeout", timeoutValue.c_str(), 0);
+        av_dict_set(&options, "rw_timeout", timeoutValue.c_str(), 0);
     }
-    const bool useUdpTransport = isNetworkUrl(url)
-                                 && (transportMode == "udp"
-                                     || (transportMode == "auto" && preferUdpTransport_.load()));
-    const char *transport = useUdpTransport ? "udp" : "tcp";
-    av_dict_set(&options, "rtsp_transport", transport, 0);
-    if (!useUdpTransport) {
-        av_dict_set(&options, "rtsp_flags", "prefer_tcp", 0);
-    }
-    av_dict_set(&options, "stimeout", timeoutValue.c_str(), 0);
-    av_dict_set(&options, "timeout", timeoutValue.c_str(), 0);
-    av_dict_set(&options, "rw_timeout", timeoutValue.c_str(), 0);
-    av_dict_set(&options, "max_delay", "300000", 0);
-    av_dict_set(&options, "buffer_size", "1048576", 0);
-    av_dict_set(&options, "probesize", "65536", 0);
-    av_dict_set(&options, "analyzeduration", "200000", 0);
-    LOGI("RTSP stable options mode=%s transport=%s maxDelayUs=300000 bufferSize=1048576",
-         transportMode.c_str(), transport);
 
     int result = avformat_open_input(&formatContext_, url.c_str(), nullptr, &options);
+    AVDictionaryEntry *unusedOption = nullptr;
+    while ((unusedOption = av_dict_get(options, "", unusedOption, AV_DICT_IGNORE_SUFFIX)) != nullptr) {
+        LOGI("unused FFmpeg open option %s=%s", unusedOption->key, unusedOption->value);
+    }
     av_dict_free(&options);
     if (result < 0) {
         errorMessage = ffmpegErrorToString(result);
@@ -235,7 +263,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         releaseFfmpegResources();
         return result;
     }
-    LOGI("RTSP open success url=%s", url.c_str());
+    LOGI("open input success sourceType=%s url=%s", sourceTypeName(sourceType).c_str(), url.c_str());
 
     result = avformat_find_stream_info(formatContext_, nullptr);
     if (result < 0) {
@@ -303,8 +331,30 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         return result;
     }
 
-    videoCodecContext_->thread_count = 0;
-    LOGI("video decoder stable realtime mode threadCount=auto");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+    if (optionsSnapshot.lowDelayDecode) {
+        videoCodecContext_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        videoCodecContext_->flags2 |= AV_CODEC_FLAG2_FAST;
+    }
+    if (optionsSnapshot.decoderThreadCount > 0) {
+        videoCodecContext_->thread_count = optionsSnapshot.decoderThreadCount;
+        if (optionsSnapshot.lowDelayDecode) {
+            videoCodecContext_->thread_type = FF_THREAD_SLICE;
+        }
+    } else {
+        videoCodecContext_->thread_count = 0;
+    }
+    if (optionsSnapshot.skipNonRef) {
+        videoCodecContext_->skip_frame = AVDISCARD_NONREF;
+    }
+    LOGI("video decoder options lowDelay=%d threadCount=%d threadType=%d skipNonRef=%d frameDrop=%d thresholdUs=%lld",
+         optionsSnapshot.lowDelayDecode ? 1 : 0, videoCodecContext_->thread_count,
+         videoCodecContext_->thread_type, optionsSnapshot.skipNonRef ? 1 : 0,
+         optionsSnapshot.enableFrameDrop ? 1 : 0,
+         static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
 
     result = avcodec_open2(videoCodecContext_, decoder, nullptr);
     if (result < 0) {
@@ -467,7 +517,8 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     pauseRequested_.store(false);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        preferUdpTransport_.store(rtspTransportMode_ == "udp");
+        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
+                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
     }
     transportSwitchRequested_.store(false);
     resetStats();
@@ -479,6 +530,7 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         url_ = url;
         timeoutMs_ = std::max(timeoutMs, 1);
         isRealtimeInput_ = isNetworkUrl(url);
+        sourceType_ = detectSourceType(url);
         errorMessage_.clear();
         lastReconnectError_.clear();
     }
@@ -509,7 +561,10 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnectMaxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
-        << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << "}";
+        << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"sourceType\":\"" << sourceTypeName(sourceType_) << "\","
+        << "\"latencyMode\":\"" << latencyModeName(playerOptions_.latencyMode) << "\","
+        << "\"rtspTransport\":\"" << rtspTransportName(playerOptions_.rtspTransport) << "\"}";
     return out.str();
 }
 
@@ -636,6 +691,9 @@ std::string NativePlayer::getStats() {
     std::string lastError;
     std::string reconnectError;
     std::string rtspTransportMode;
+    PlayerOptions optionsSnapshot;
+    SourceType sourceType;
+    bool preferUdpInAuto = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         state = state_;
@@ -643,6 +701,9 @@ std::string NativePlayer::getStats() {
         lastError = errorMessage_;
         reconnectError = lastReconnectError_;
         rtspTransportMode = rtspTransportMode_;
+        optionsSnapshot = playerOptions_;
+        sourceType = sourceType_;
+        preferUdpInAuto = preferUdpTransport_.load();
     }
 
     int frameWidth = 0;
@@ -694,6 +755,26 @@ std::string NativePlayer::getStats() {
         << "\"lastSnapshotTimeMs\":" << lastSnapshotTimeMs_.load() << ","
         << "\"startPlayTimeMs\":" << startPlayTimeMs_.load() << ","
         << "\"lastError\":\"" << escapeJson(lastError) << "\"," 
+        << "\"sourceType\":\"" << sourceTypeName(sourceType) << "\","
+        << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
+        << "\"rtspTransport\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\","
+        << "\"effectiveRtspTransport\":\"" << effectiveRtspTransportName(optionsSnapshot, preferUdpInAuto) << "\","
+        << "\"maxDelayUs\":" << optionsSnapshot.maxDelayUs << ","
+        << "\"reorderQueueSize\":" << optionsSnapshot.reorderQueueSize << ","
+        << "\"socketBufferSize\":" << optionsSnapshot.socketBufferSize << ","
+        << "\"probesize\":" << optionsSnapshot.probesize << ","
+        << "\"analyzeduration\":" << optionsSnapshot.analyzeduration << ","
+        << "\"maxProbePackets\":" << optionsSnapshot.maxProbePackets << ","
+        << "\"fflagsNoBuffer\":" << (optionsSnapshot.fflagsNoBuffer ? "true" : "false") << ","
+        << "\"avioDirect\":" << (optionsSnapshot.avioDirect ? "true" : "false") << ","
+        << "\"tcpNoDelay\":" << (optionsSnapshot.tcpNoDelay ? "true" : "false") << ","
+        << "\"lowDelayDecode\":" << (optionsSnapshot.lowDelayDecode ? "true" : "false") << ","
+        << "\"decoderThreadCount\":" << optionsSnapshot.decoderThreadCount << ","
+        << "\"enableFrameDrop\":" << (optionsSnapshot.enableFrameDrop ? "true" : "false") << ","
+        << "\"dropLateFrameThresholdUs\":" << optionsSnapshot.dropLateFrameThresholdUs << ","
+        << "\"lastVideoDelayUs\":" << lastVideoDelayUs_.load() << ","
+        << "\"readPacketQueueSize\":0,"
+        << "\"videoFrameQueueSize\":0,"
         << "\"rtspTransportMode\":\"" << escapeJson(rtspTransportMode) << "\","
         << "\"currentRtspTransport\":\"" << (preferUdpTransport_.load() ? "udp" : "tcp") << "\","
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
@@ -741,38 +822,46 @@ std::string NativePlayer::setRtspTransport(const std::string &transport) {
         return jsonError(-1, "player is released");
     }
 
-    const std::string mode = normalizeRtspTransport(transport);
-    if (mode.empty()) {
-        return jsonError(-1, "transport must be tcp, udp, or auto");
+    RtspTransport parsedTransport;
+    if (!parseRtspTransport(transport, parsedTransport)) {
+        return jsonError(-1, "transport must be tcp, udp, udp_multicast, or auto");
     }
 
     bool requestSwitch = false;
-    bool sourceIsNetwork = false;
+    PlayerOptions optionsSnapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const bool active = (state_ == PlayerState::Playing
                              || state_ == PlayerState::Paused
                              || state_ == PlayerState::Reconnecting)
                             && formatContext_ != nullptr;
+        const bool sourceIsRtsp = sourceType_ == SourceType::RTSP;
+        if (state_ == PlayerState::Prepared && formatContext_ != nullptr) {
+            return jsonError(-1, "player already prepared, option will not take effect until next prepare");
+        }
         if (active && remuxRecorder_.isRecording()) {
             return jsonError(-1, "cannot switch RTSP transport while recording");
         }
 
-        rtspTransportMode_ = mode;
-        preferUdpTransport_.store(mode == "udp");
-        sourceIsNetwork = isNetworkUrl(url_);
-        requestSwitch = active && sourceIsNetwork;
+        playerOptions_.rtspTransport = parsedTransport;
+        applyLatencyProfile(playerOptions_);
+        rtspTransportMode_ = rtspTransportName(parsedTransport);
+        preferUdpTransport_.store(parsedTransport == RtspTransport::UDP
+                                  || parsedTransport == RtspTransport::UDP_MULTICAST);
+        optionsSnapshot = playerOptions_;
+        requestSwitch = active && sourceIsRtsp;
     }
 
     if (requestSwitch) {
         transportSwitchRequested_.store(true);
     }
 
-    LOGI("setPlayerRtspTransport mode=%s switchRequested=%d", mode.c_str(), requestSwitch ? 1 : 0);
+    LOGI("setPlayerRtspTransport mode=%s switchRequested=%d", rtspTransportName(parsedTransport).c_str(), requestSwitch ? 1 : 0);
     std::ostringstream out;
     out << "{\"success\":true,\"message\":\"rtsp transport updated\","
-        << "\"mode\":\"" << mode << "\","
-        << "\"currentTransport\":\"" << (preferUdpTransport_.load() ? "udp" : "tcp") << "\","
+        << "\"mode\":\"" << rtspTransportName(parsedTransport) << "\","
+        << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
+        << "\"currentTransport\":\"" << effectiveRtspTransportName(optionsSnapshot, preferUdpTransport_.load()) << "\","
         << "\"switchRequested\":" << (requestSwitch ? "true" : "false") << "}";
     return out.str();
 }
@@ -783,20 +872,108 @@ std::string NativePlayer::getRtspTransportState() {
     }
 
     PlayerState state;
-    std::string mode;
+    PlayerOptions optionsSnapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         state = state_;
-        mode = rtspTransportMode_;
+        optionsSnapshot = playerOptions_;
     }
 
     std::ostringstream out;
     out << "{\"success\":true,"
-        << "\"mode\":\"" << mode << "\","
-        << "\"currentTransport\":\"" << (preferUdpTransport_.load() ? "udp" : "tcp") << "\","
+        << "\"mode\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\","
+        << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
+        << "\"currentTransport\":\"" << effectiveRtspTransportName(optionsSnapshot, preferUdpTransport_.load()) << "\","
         << "\"switchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"state\":\"" << stateName(state) << "\"}";
     return out.str();
+}
+
+std::string NativePlayer::setLatencyMode(const std::string &mode) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+
+    LatencyMode parsedMode;
+    if (!parseLatencyMode(mode, parsedMode)) {
+        return jsonError(-1, "invalid latency mode: " + mode);
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Prepared || state_ == PlayerState::Playing
+            || state_ == PlayerState::Paused || state_ == PlayerState::Reconnecting) {
+            return jsonError(-1, "player already prepared, option will not take effect until next prepare");
+        }
+        playerOptions_.latencyMode = parsedMode;
+        applyLatencyProfile(playerOptions_);
+        rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
+        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
+                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
+        optionsSnapshot = playerOptions_;
+    }
+
+    LOGI("setPlayerLatencyMode mode=%s transport=%s", latencyModeName(parsedMode).c_str(), rtspTransportName(optionsSnapshot.rtspTransport).c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"message\":\"latency mode updated\","
+        << "\"latencyMode\":\"" << latencyModeName(parsedMode) << "\","
+        << "\"rtspTransport\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\"}";
+    return out.str();
+}
+
+std::string NativePlayer::setOption(const std::string &key, const std::string &value) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (key == "rtsp_transport") {
+        return setRtspTransport(value);
+    }
+    if (key == "latency_mode") {
+        return setLatencyMode(value);
+    }
+
+    PlayerOptions optionsSnapshot;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Prepared || state_ == PlayerState::Playing
+            || state_ == PlayerState::Paused || state_ == PlayerState::Reconnecting) {
+            return jsonError(-1, "player already prepared, option will not take effect until next prepare");
+        }
+        if (!setPlayerOptionValue(playerOptions_, key, value, error)) {
+            return jsonError(-1, error);
+        }
+        rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
+        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
+                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
+        optionsSnapshot = playerOptions_;
+    }
+
+    LOGI("setPlayerOption key=%s value=%s", key.c_str(), value.c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"message\":\"player option updated\","
+        << "\"key\":\"" << escapeJson(key) << "\","
+        << "\"value\":\"" << escapeJson(value) << "\","
+        << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
+        << "\"rtspTransport\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\"}";
+    return out.str();
+}
+
+std::string NativePlayer::getLatencyConfig() {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    PlayerOptions optionsSnapshot;
+    SourceType sourceType;
+    bool preferUdp = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+        sourceType = sourceType_;
+        preferUdp = preferUdpTransport_.load();
+    }
+    return playerOptionsToJson(optionsSnapshot, sourceType, preferUdp);
 }
 
 std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
@@ -958,15 +1135,51 @@ void NativePlayer::resetRealtimeClock() {
 }
 
 bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
-    if (!isRealtimeInput_ || ptsUs < 0) {
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+
+    if (!isRealtimeInput_ || !optionsSnapshot.enableFrameDrop || ptsUs < 0) {
+        lastVideoDelayUs_.store(0);
         return false;
     }
 
     const int64_t nowUs = av_gettime_relative();
+    const int64_t audioClockUs = audioClockUs_.load();
+    if (sourceHasAudio_.load() && audioClockUs > 0) {
+        const int64_t diffUs = ptsUs - audioClockUs;
+        lastVideoDelayUs_.store(diffUs);
+        if (diffUs >= -optionsSnapshot.dropLateFrameThresholdUs) {
+            return false;
+        }
+
+        droppedVideoFrameCount_.fetch_add(1);
+        const int64_t nowMsValue = nowMs();
+        if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
+            LOGE("drop realtime frame by audio clock diffUs=%lld ptsUs=%lld audioClockUs=%lld thresholdUs=%lld",
+                 static_cast<long long>(diffUs), static_cast<long long>(ptsUs),
+                 static_cast<long long>(audioClockUs),
+                 static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
+            lastRealtimeDropLogMs_ = nowMsValue;
+        }
+        if (-diffUs > keyFrameCatchupLatencyUs_) {
+            dropUntilKeyFrame_ = true;
+            if (videoCodecContext_ != nullptr) {
+                avcodec_flush_buffers(videoCodecContext_);
+            }
+            LOGE("realtime audio/video delay too high, skip packets until next keyframe diffUs=%lld",
+                 static_cast<long long>(diffUs));
+        }
+        return true;
+    }
+
     if (!realtimeClockInitialized_ || ptsUs <= realtimeFirstPtsUs_) {
         realtimeClockInitialized_ = true;
         realtimeFirstPtsUs_ = ptsUs;
         realtimeStartWallUs_ = nowUs;
+        lastVideoDelayUs_.store(0);
         return false;
     }
 
@@ -974,33 +1187,37 @@ bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
     const int64_t wallElapsedUs = nowUs - realtimeStartWallUs_;
     if (streamElapsedUs < 0 || wallElapsedUs < 0) {
         resetRealtimeClock();
+        lastVideoDelayUs_.store(0);
         return false;
     }
     if (streamElapsedUs < 100000) {
+        lastVideoDelayUs_.store(0);
         return false;
     }
 
-    const int64_t latencyUs = wallElapsedUs - streamElapsedUs;
-    if (latencyUs <= maxRealtimeLatencyUs_) {
+    const int64_t diffUs = streamElapsedUs - wallElapsedUs;
+    lastVideoDelayUs_.store(diffUs);
+    if (diffUs >= -optionsSnapshot.dropLateFrameThresholdUs) {
         return false;
     }
 
     droppedVideoFrameCount_.fetch_add(1);
     const int64_t nowMsValue = nowMs();
     if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
-        LOGE("drop realtime frame latencyUs=%lld ptsUs=%lld streamElapsedUs=%lld wallElapsedUs=%lld",
-             static_cast<long long>(latencyUs), static_cast<long long>(ptsUs),
-             static_cast<long long>(streamElapsedUs), static_cast<long long>(wallElapsedUs));
+        LOGE("drop realtime frame diffUs=%lld ptsUs=%lld streamElapsedUs=%lld wallElapsedUs=%lld thresholdUs=%lld",
+             static_cast<long long>(diffUs), static_cast<long long>(ptsUs),
+             static_cast<long long>(streamElapsedUs), static_cast<long long>(wallElapsedUs),
+             static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
         lastRealtimeDropLogMs_ = nowMsValue;
     }
 
-    if (latencyUs > keyFrameCatchupLatencyUs_) {
+    if (-diffUs > keyFrameCatchupLatencyUs_) {
         dropUntilKeyFrame_ = true;
         if (videoCodecContext_ != nullptr) {
             avcodec_flush_buffers(videoCodecContext_);
         }
-        LOGE("realtime latency too high, skip packets until next keyframe latencyUs=%lld",
-             static_cast<long long>(latencyUs));
+        LOGE("realtime latency too high, skip packets until next keyframe diffUs=%lld",
+             static_cast<long long>(diffUs));
     }
     return true;
 }
@@ -1301,6 +1518,16 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         return false;
     }
 
+    int64_t ptsUs = 0;
+    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
+    }
+    videoClockUs_.store(ptsUs);
+    lastVideoFrameTimeMs_.store(nowMs());
+    if (shouldDropRealtimeFrame(ptsUs)) {
+        return true;
+    }
+
     if (swsContext_ == nullptr || swsSourceFormat_ != frame->format || videoWidth_ != frameWidth || videoHeight_ != frameHeight) {
         if (swsContext_ != nullptr) {
             sws_freeContext(swsContext_);
@@ -1339,15 +1566,6 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     sws_scale(swsContext_, frame->data, frame->linesize, 0, frameHeight,
               rgbaFrame_->data, rgbaFrame_->linesize);
 
-    int64_t ptsUs = 0;
-    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-        ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
-    }
-    videoClockUs_.store(ptsUs);
-    lastVideoFrameTimeMs_.store(nowMs());
-    if (shouldDropRealtimeFrame(ptsUs)) {
-        return true;
-    }
     saveLastFrame(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight, ptsUs);
 
     if (!renderer_.hasSurface()) {
@@ -1419,6 +1637,7 @@ void NativePlayer::resetStats() {
     startPlayTimeMs_.store(0);
     audioClockUs_.store(0);
     videoClockUs_.store(0);
+    lastVideoDelayUs_.store(0);
     reconnecting_.store(false);
     reconnectAttemptCount_.store(0);
     reconnectSuccessCount_.store(0);
@@ -1443,6 +1662,9 @@ void NativePlayer::releaseFfmpegResources() {
     rgbaBuffer_.clear();
     if (videoCodecContext_ != nullptr) {
         avcodec_free_context(&videoCodecContext_);
+    }
+    if (audioCodecContext_ != nullptr) {
+        avcodec_free_context(&audioCodecContext_);
     }
     if (formatContext_ != nullptr) {
         avformat_close_input(&formatContext_);

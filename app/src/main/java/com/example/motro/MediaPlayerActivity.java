@@ -47,6 +47,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private Switch audioSwitch;
     private Switch reconnectSwitch;
     private RadioGroup transportRadioGroup;
+    private RadioGroup latencyModeRadioGroup;
     private TextView handleTextView;
     private TextView logTextView;
 
@@ -83,6 +84,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         audioSwitch = findViewById(R.id.audioSwitch);
         reconnectSwitch = findViewById(R.id.reconnectSwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
+        latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
         handleTextView = findViewById(R.id.handleTextView);
         logTextView = findViewById(R.id.logTextView);
     }
@@ -93,6 +95,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         transportRadioGroup.check(R.id.tcpTransportRadio);
+        latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         recordPathEditText.setText(defaultFilePath("record_av_test.ts"));
         segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.ts"));
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
@@ -145,11 +148,13 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
             String transportResult = applyRtspTransport(handle);
+            String latencyResult = applyLatencyMode(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             return "{\"success\":true,\"handle\":" + handle + "}"
                     + "\nsurface=" + surfaceResult
                     + "\ntransport=" + transportResult
+                    + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult;
         }));
@@ -167,11 +172,13 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
             String transportResult = applyRtspTransport(handle);
+            String latencyResult = applyLatencyMode(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
                     + "\ntransport=" + transportResult
+                    + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\nprepare=" + prepareResult;
@@ -180,10 +187,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.startButton).setOnClickListener(v -> runNative("Start", () -> {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
-            String transportResult = applyRtspTransport(handle);
             String audioResult = applyAudioOption(handle);
             return "surface=" + surfaceResult
-                    + "\ntransport=" + transportResult
                     + "\naudio=" + audioResult
                     + "\nstart=" + FFmpegNative.startPlayer(handle);
         }));
@@ -223,8 +228,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.statsButton).setOnClickListener(v -> runNative("Player Stats", () ->
                 FFmpegNative.getPlayerStats(requireHandle())));
 
-        findViewById(R.id.reconnectStateButton).setOnClickListener(v -> runNative("Reconnect State", () ->
-                FFmpegNative.getPlayerReconnectState(requireHandle())));
+        findViewById(R.id.reconnectStateButton).setOnClickListener(v -> runNative("Reconnect/Latency State", () ->
+                FFmpegNative.getPlayerReconnectState(requireHandle())
+                        + "\nlatency=" + FFmpegNative.getPlayerLatencyConfig(requireHandle())));
 
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
                 FFmpegNative.clearPlayerSurface(requireHandle())));
@@ -247,6 +253,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long handle = getPlayerHandle();
             if (handle != 0) {
                 runNative("RTSP Transport", () -> applyRtspTransport(handle));
+            }
+        });
+        latencyModeRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            long handle = getPlayerHandle();
+            if (handle != 0) {
+                runNative("Latency Mode", () -> applyLatencyMode(handle));
             }
         });
     }
@@ -330,7 +342,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle == 0) {
             return jsonError("player handle is 0");
         }
-        return FFmpegNative.setPlayerRtspTransport(handle, selectedRtspTransport());
+        return FFmpegNative.setRtspTransport(handle, selectedRtspTransport());
+    }
+
+    private String applyLatencyMode(long handle) {
+        if (handle == 0) {
+            return jsonError("player handle is 0");
+        }
+        return FFmpegNative.setPlayerLatencyMode(handle, selectedLatencyMode());
     }
 
     private String selectedRtspTransport() {
@@ -342,6 +361,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return "auto";
         }
         return "tcp";
+    }
+
+    private String selectedLatencyMode() {
+        int checkedId = latencyModeRadioGroup.getCheckedRadioButtonId();
+        if (checkedId == R.id.lowLatencyRadio) {
+            return "low_latency";
+        }
+        if (checkedId == R.id.stableLatencyRadio) {
+            return "stable";
+        }
+        return "balanced";
     }
 
     private String requireUrl() {

@@ -2,6 +2,7 @@
 #define MOTRO_NATIVE_PLAYER_H
 
 #include "PlayerRemuxRecorder.h"
+#include "PlayerOptions.h"
 #include "VideoRenderer.h"
 
 #include <jni.h>
@@ -54,6 +55,9 @@ public:
     std::string getReconnectState();
     std::string setRtspTransport(const std::string &transport);
     std::string getRtspTransportState();
+    std::string setLatencyMode(const std::string &mode);
+    std::string setOption(const std::string &key, const std::string &value);
+    std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
     std::string startSegmentRecord(const std::string &outputPattern, int segmentDurationSec);
@@ -95,6 +99,8 @@ private:
     std::string errorMessage_;
     std::string lastReconnectError_;
     std::string rtspTransportMode_ = "tcp";
+    PlayerOptions playerOptions_;
+    SourceType sourceType_ = SourceType::OTHER;
     int timeoutMs_ = 5000;
     bool isRealtimeInput_ = false;
     bool realtimeClockInitialized_ = false;
@@ -106,6 +112,7 @@ private:
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
     std::atomic<bool> transportSwitchRequested_{false};
+    std::atomic<int64_t> lastVideoDelayUs_{0};
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;

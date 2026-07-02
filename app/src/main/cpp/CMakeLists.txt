@@ -14,6 +14,7 @@ add_library(native-ffmpeg SHARED
         native-ffmpeg-jni.cpp
         native/NativePlayer.cpp
         native/VideoRenderer.cpp
+        native/PlayerOptions.cpp
         native/PlayerRemuxRecorder.cpp
         native/SnapshotManager.cpp)
 
@@ -24,6 +25,10 @@ set_target_properties(avutil PROPERTIES
 add_library(swscale SHARED IMPORTED)
 set_target_properties(swscale PROPERTIES
         IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libswscale.so)
+
+add_library(swresample SHARED IMPORTED)
+set_target_properties(swresample PROPERTIES
+        IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libswresample.so)
 
 add_library(avcodec SHARED IMPORTED)
 set_target_properties(avcodec PROPERTIES
@@ -49,6 +54,7 @@ target_link_libraries(native-ffmpeg
         avformat
         avcodec
         avutil
+        swresample
         swscale
         ${log-lib}
         ${android-lib})

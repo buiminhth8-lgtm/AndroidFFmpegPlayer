@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "native/NativePlayer.h"
+#include "native/PlayerOptions.h"
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -305,6 +306,18 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
         return toJString(env, std::string("{\"success\":true,\"decoders\":")
                               + getAvailableDecodersJson() + "}");
     }
+    if (first == "-latency-config") {
+        return toJString(env, latencyProfilesJson());
+    }
+    if (first == "-sourceinfo") {
+        if (command.size() < 2 || command[1].empty()) {
+            return toJString(env, jsonError(-1, "-sourceinfo requires url"));
+        }
+        return toJString(env, sourceInfoJson(command[1]));
+    }
+    if (first == "-rtsp-low-latency-help") {
+        return toJString(env, rtspLowLatencyHelpJson());
+    }
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {
             return toJString(env, jsonError(-1, "-probe requires url"));
@@ -468,6 +481,68 @@ jstring nativeGetPlayerRtspTransportState(JNIEnv *env, jclass, jlong handle) {
     return toJString(env, player->getRtspTransportState());
 }
 
+jstring nativeSetRtspTransport(JNIEnv *env, jclass clazz, jlong handle, jstring transport) {
+    return nativeSetPlayerRtspTransport(env, clazz, handle, transport);
+}
+
+jstring nativeSetPlayerLatencyMode(JNIEnv *env, jclass, jlong handle, jstring mode) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    if (mode == nullptr) {
+        return toJString(env, jsonError(-1, "mode is null"));
+    }
+
+    const char *chars = env->GetStringUTFChars(mode, nullptr);
+    if (chars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read mode"));
+    }
+    std::string modeValue(chars);
+    env->ReleaseStringUTFChars(mode, chars);
+    return toJString(env, player->setLatencyMode(modeValue));
+}
+
+jstring nativeSetPlayerOption(JNIEnv *env, jclass, jlong handle, jstring key, jstring value) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    if (key == nullptr) {
+        return toJString(env, jsonError(-1, "key is null"));
+    }
+    if (value == nullptr) {
+        return toJString(env, jsonError(-1, "value is null"));
+    }
+
+    const char *keyChars = env->GetStringUTFChars(key, nullptr);
+    if (keyChars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read key"));
+    }
+    std::string keyValue(keyChars);
+    env->ReleaseStringUTFChars(key, keyChars);
+
+    const char *valueChars = env->GetStringUTFChars(value, nullptr);
+    if (valueChars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read value"));
+    }
+    std::string optionValue(valueChars);
+    env->ReleaseStringUTFChars(value, valueChars);
+
+    return toJString(env, player->setOption(keyValue, optionValue));
+}
+
+jstring nativeGetPlayerLatencyConfig(JNIEnv *env, jclass, jlong handle) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->getLatencyConfig());
+}
+
 jstring nativeTakePlayerSnapshot(JNIEnv *env, jclass, jlong handle, jstring outputPath) {
     std::string error;
     NativePlayer *player = getPlayer(handle, error);
@@ -613,6 +688,10 @@ bool registerNativeMethods(JNIEnv *env) {
             {"getPlayerReconnectState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerReconnectState)},
             {"setPlayerRtspTransport", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerRtspTransport)},
             {"getPlayerRtspTransportState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerRtspTransportState)},
+            {"setRtspTransport", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetRtspTransport)},
+            {"setPlayerLatencyMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerLatencyMode)},
+            {"setPlayerOption", "(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerOption)},
+            {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},
             {"stopPlayerRecord", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeStopPlayerRecord)},

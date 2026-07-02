@@ -1,13 +1,15 @@
 package com.example.motro;
 
+import android.content.Context;
+import android.graphics.SurfaceTexture;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Surface;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
+import android.view.TextureView;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -35,7 +37,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    private SurfaceView surfaceView;
+    private TextureView previewView;
     private EditText urlEditText;
     private EditText timeoutEditText;
     private EditText recordPathEditText;
@@ -48,7 +50,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
+    private volatile Surface textureSurface;
     private volatile boolean surfaceReady;
+    private volatile int surfaceWidth;
+    private volatile int surfaceHeight;
     private volatile boolean destroyed;
     private long playerHandle;
 
@@ -60,13 +65,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
         worker = Executors.newSingleThreadExecutor(r -> new Thread(r, "FFmpegDemoWorker"));
         bindViews();
         initDefaults();
-        bindSurfaceCallback();
+        bindPreviewCallback();
         bindActions();
         appendLog("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
     }
 
     private void bindViews() {
-        surfaceView = findViewById(R.id.playerSurfaceView);
+        previewView = findViewById(R.id.playerPreviewView);
+        previewView.setKeepScreenOn(true);
         urlEditText = findViewById(R.id.urlEditText);
         timeoutEditText = findViewById(R.id.timeoutEditText);
         recordPathEditText = findViewById(R.id.recordPathEditText);
@@ -89,30 +95,43 @@ public class MediaPlayerActivity extends AppCompatActivity {
         updateHandleLabel();
     }
 
-    private void bindSurfaceCallback() {
-        surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
+    private void bindPreviewCallback() {
+        previewView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
-            public void surfaceCreated(@NonNull SurfaceHolder holder) {
-                currentSurface = holder.getSurface();
+            public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
+                releaseTextureSurfaceOnly();
+                textureSurface = new Surface(surfaceTexture);
+                currentSurface = textureSurface;
                 surfaceReady = true;
-                bindSurfaceForExistingPlayer("Surface Created");
+                surfaceWidth = width;
+                surfaceHeight = height;
+                bindSurfaceForExistingPlayer("Texture Available");
             }
 
             @Override
-            public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
-                currentSurface = holder.getSurface();
+            public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
                 surfaceReady = true;
-                bindSurfaceForExistingPlayer("Surface Changed");
+                surfaceWidth = width;
+                surfaceHeight = height;
+                bindSurfaceForExistingPlayer("Texture Size Changed");
             }
 
             @Override
-            public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+            public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
                 surfaceReady = false;
+                surfaceWidth = 0;
+                surfaceHeight = 0;
                 currentSurface = null;
                 long handle = getPlayerHandle();
                 if (handle != 0) {
                     runNative("Clear Surface", () -> FFmpegNative.clearPlayerSurface(handle));
                 }
+                releaseTextureSurfaceOnly();
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surfaceTexture) {
             }
         });
     }
@@ -270,6 +289,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (!surfaceReady || surface == null || !surface.isValid()) {
             return jsonError("surface is not ready");
         }
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) {
+            return jsonError("surface size is not ready");
+        }
+        Log.d(TAG, "bind surface viewSize=" + surfaceWidth + "x" + surfaceHeight);
         return FFmpegNative.setPlayerSurface(handle, surface);
     }
 
@@ -352,10 +375,19 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return new File(dir, fileName).getAbsolutePath();
     }
 
+    private void releaseTextureSurfaceOnly() {
+        Surface oldSurface = textureSurface;
+        textureSurface = null;
+        if (oldSurface != null) {
+            oldSurface.release();
+        }
+    }
+
     private void runNative(String title, NativeAction action) {
         if (destroyed || worker == null) {
             return;
         }
+        hideKeyboard();
         appendLog(">>> " + title);
         worker.execute(() -> {
             String result;
@@ -373,6 +405,13 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 }
             });
         });
+    }
+
+    private void hideKeyboard() {
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null && getCurrentFocus() != null) {
+            imm.hideSoftInputFromWindow(getCurrentFocus().getWindowToken(), 0);
+        }
     }
 
     private void appendLog(String message) {
@@ -417,8 +456,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     Log.d(TAG, "onDestroy clearSurface=" + FFmpegNative.clearPlayerSurface(handle));
                     Log.d(TAG, "onDestroy release=" + FFmpegNative.releasePlayer(handle));
                 }
+                releaseTextureSurfaceOnly();
             });
             releaseWorker.shutdown();
+        } else {
+            releaseTextureSurfaceOnly();
         }
         super.onDestroy();
     }

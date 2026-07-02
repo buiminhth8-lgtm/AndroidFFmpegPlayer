@@ -903,11 +903,26 @@ void NativePlayer::playbackLoop() {
             break;
         }
 
-        readPacketCount_.fetch_add(1);
+        const int64_t packetCount = readPacketCount_.fetch_add(1) + 1;
+        if (packetCount == 1 || packetCount % 250 == 0) {
+            LOGI("read packet count=%lld stream=%d size=%d pts=%lld dts=%lld flags=0x%x",
+                 static_cast<long long>(packetCount), packet_->stream_index, packet_->size,
+                 static_cast<long long>(packet_->pts), static_cast<long long>(packet_->dts), packet_->flags);
+        }
         if (packet_->stream_index == videoStreamIndex_) {
-            videoPacketCount_.fetch_add(1);
+            const int64_t videoPackets = videoPacketCount_.fetch_add(1) + 1;
+            if (videoPackets == 1 || videoPackets % 100 == 0) {
+                LOGI("video packet count=%lld size=%d pts=%lld key=%d",
+                     static_cast<long long>(videoPackets), packet_->size,
+                     static_cast<long long>(packet_->pts), (packet_->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
+            }
         } else if (packet_->stream_index == audioStreamIndex_) {
-            audioPacketCount_.fetch_add(1);
+            const int64_t audioPackets = audioPacketCount_.fetch_add(1) + 1;
+            if (audioPackets == 1 || audioPackets % 100 == 0) {
+                LOGI("audio packet count=%lld size=%d pts=%lld",
+                     static_cast<long long>(audioPackets), packet_->size,
+                     static_cast<long long>(packet_->pts));
+            }
             lastAudioFrameTimeMs_.store(nowMs());
             if (formatContext_ != nullptr && audioStreamIndex_ >= 0 && packet_->pts != AV_NOPTS_VALUE) {
                 audioClockUs_.store(av_rescale_q(packet_->pts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
@@ -939,7 +954,16 @@ void NativePlayer::playbackLoop() {
                 }
 
                 if (renderFrame(decodedFrame_)) {
-                    videoFrameCount_.fetch_add(1);
+                    int64_t ptsUs = 0;
+                    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && decodedFrame_->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        ptsUs = av_rescale_q(decodedFrame_->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
+                    }
+                    const int64_t frames = videoFrameCount_.fetch_add(1) + 1;
+                    if (frames == 1 || frames % 100 == 0) {
+                        LOGI("decoded video frame count=%lld width=%d height=%d format=%d ptsUs=%lld",
+                             static_cast<long long>(frames), decodedFrame_->width, decodedFrame_->height,
+                             decodedFrame_->format, static_cast<long long>(ptsUs));
+                    }
                 }
                 av_frame_unref(decodedFrame_);
                 std::this_thread::sleep_for(std::chrono::milliseconds(frameDelayMs));
@@ -1001,6 +1025,8 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         swsSourceFormat_ = frame->format;
         videoWidth_ = frameWidth;
         videoHeight_ = frameHeight;
+        LOGI("sws context ready width=%d height=%d srcFormat=%d srcLineSize0=%d rgbaLineSize=%d",
+             frameWidth, frameHeight, frame->format, frame->linesize[0], rgbaFrame_->linesize[0]);
     }
 
     sws_scale(swsContext_, frame->data, frame->linesize, 0, frameHeight,
@@ -1015,6 +1041,9 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     saveLastFrame(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight, ptsUs);
 
     if (!renderer_.hasSurface()) {
+        if (renderedFrameCount_.load() == 0 && droppedVideoFrameCount_.load() == 0) {
+            LOGE("render skipped: surface not attached, frame width=%d height=%d", frameWidth, frameHeight);
+        }
         return true;
     }
 
@@ -1024,7 +1053,12 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         droppedVideoFrameCount_.fetch_add(1);
         return true;
     }
-    renderedFrameCount_.fetch_add(1);
+    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    if (renderedFrames == 1 || renderedFrames % 100 == 0) {
+        LOGI("render success count=%lld width=%d height=%d rgbaLineSize=%d ptsUs=%lld",
+             static_cast<long long>(renderedFrames), frameWidth, frameHeight,
+             rgbaFrame_->linesize[0], static_cast<long long>(ptsUs));
+    }
     lastRenderTimeMs_.store(nowMs());
     return true;
 }

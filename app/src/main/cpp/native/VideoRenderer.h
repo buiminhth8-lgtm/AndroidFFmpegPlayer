@@ -32,6 +32,7 @@ private:
     ANativeWindow *window_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int64_t renderCount_ = 0;
 };
 
 #endif // MOTRO_VIDEO_RENDERER_H

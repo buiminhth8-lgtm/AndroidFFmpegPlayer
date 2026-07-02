@@ -99,6 +99,12 @@ RenderResult VideoRenderer::renderRgba(const uint8_t *rgbaData, int lineSize, in
     const int dstStride = buffer.stride * 4;
     const int copyWidth = std::min(width, buffer.width) * 4;
     const int copyHeight = std::min(height, buffer.height);
+    ++renderCount_;
+    if (renderCount_ == 1 || renderCount_ % 100 == 0) {
+        LOGI("ANativeWindow buffer renderCount=%lld req=%dx%d buffer=%dx%d stride=%d copy=%dx%d",
+             static_cast<long long>(renderCount_), width, height, buffer.width, buffer.height,
+             buffer.stride, copyWidth / 4, copyHeight);
+    }
 
     for (int y = 0; y < copyHeight; ++y) {
         std::memcpy(dst + y * dstStride, rgbaData + y * lineSize, copyWidth);

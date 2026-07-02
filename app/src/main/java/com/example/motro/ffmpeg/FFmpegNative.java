@@ -77,6 +77,10 @@ public final class FFmpegNative {
 
     public static native String getPlayerReconnectState(long handle);
 
+    public static native String setPlayerRtspTransport(long handle, String transport);
+
+    public static native String getPlayerRtspTransportState(long handle);
+
     public static native String startPlayerRecord(long handle, String outputPath);
 
     public static native String startPlayerSegmentRecord(long handle, String outputPattern, int segmentDurationSec);

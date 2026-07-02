@@ -439,6 +439,35 @@ jstring nativeGetPlayerReconnectState(JNIEnv *env, jclass, jlong handle) {
     }
     return toJString(env, player->getReconnectState());
 }
+
+jstring nativeSetPlayerRtspTransport(JNIEnv *env, jclass, jlong handle, jstring transport) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    if (transport == nullptr) {
+        return toJString(env, jsonError(-1, "transport is null"));
+    }
+
+    const char *chars = env->GetStringUTFChars(transport, nullptr);
+    if (chars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read transport"));
+    }
+    std::string transportValue(chars);
+    env->ReleaseStringUTFChars(transport, chars);
+    return toJString(env, player->setRtspTransport(transportValue));
+}
+
+jstring nativeGetPlayerRtspTransportState(JNIEnv *env, jclass, jlong handle) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->getRtspTransportState());
+}
+
 jstring nativeTakePlayerSnapshot(JNIEnv *env, jclass, jlong handle, jstring outputPath) {
     std::string error;
     NativePlayer *player = getPlayer(handle, error);
@@ -582,6 +611,8 @@ bool registerNativeMethods(JNIEnv *env) {
             {"enableAudio", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeEnableAudio)},
             {"setPlayerReconnectOptions", "(JZII)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerReconnectOptions)},
             {"getPlayerReconnectState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerReconnectState)},
+            {"setPlayerRtspTransport", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerRtspTransport)},
+            {"getPlayerRtspTransportState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerRtspTransportState)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},
             {"stopPlayerRecord", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeStopPlayerRecord)},

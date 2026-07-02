@@ -52,6 +52,8 @@ public:
     std::string getStats();
     std::string setReconnectOptions(bool enabled, int maxRetryCount, int retryDelayMs);
     std::string getReconnectState();
+    std::string setRtspTransport(const std::string &transport);
+    std::string getRtspTransportState();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
     std::string startSegmentRecord(const std::string &outputPattern, int segmentDurationSec);
@@ -66,6 +68,7 @@ private:
     int openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage);
     bool refreshRealtimeInputForStart();
     bool reconnectInput(int readErrorCode);
+    bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
     bool renderFrame(AVFrame *frame);
     bool shouldDropRealtimeFrame(int64_t ptsUs);
@@ -91,6 +94,7 @@ private:
     std::string url_;
     std::string errorMessage_;
     std::string lastReconnectError_;
+    std::string rtspTransportMode_ = "tcp";
     int timeoutMs_ = 5000;
     bool isRealtimeInput_ = false;
     bool realtimeClockInitialized_ = false;
@@ -98,8 +102,10 @@ private:
     int64_t realtimeStartWallUs_ = 0;
     int64_t lastRealtimeDropLogMs_ = 0;
     bool dropUntilKeyFrame_ = false;
-    int64_t maxRealtimeLatencyUs_ = 150000;
-    int64_t keyFrameCatchupLatencyUs_ = 800000;
+    int64_t maxRealtimeLatencyUs_ = 250000;
+    int64_t keyFrameCatchupLatencyUs_ = 2000000;
+    std::atomic<bool> preferUdpTransport_{false};
+    std::atomic<bool> transportSwitchRequested_{false};
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;

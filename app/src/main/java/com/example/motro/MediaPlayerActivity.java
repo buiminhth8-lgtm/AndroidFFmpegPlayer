@@ -11,6 +11,7 @@ import android.view.Surface;
 import android.view.TextureView;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
+import android.widget.RadioGroup;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -45,6 +46,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private EditText snapshotPathEditText;
     private Switch audioSwitch;
     private Switch reconnectSwitch;
+    private RadioGroup transportRadioGroup;
     private TextView handleTextView;
     private TextView logTextView;
 
@@ -80,6 +82,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         snapshotPathEditText = findViewById(R.id.snapshotPathEditText);
         audioSwitch = findViewById(R.id.audioSwitch);
         reconnectSwitch = findViewById(R.id.reconnectSwitch);
+        transportRadioGroup = findViewById(R.id.transportRadioGroup);
         handleTextView = findViewById(R.id.handleTextView);
         logTextView = findViewById(R.id.logTextView);
     }
@@ -89,6 +92,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
+        transportRadioGroup.check(R.id.tcpTransportRadio);
         recordPathEditText.setText(defaultFilePath("record_av_test.ts"));
         segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.ts"));
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
@@ -140,10 +144,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.createButton).setOnClickListener(v -> runNative("Create Player", () -> {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
+            String transportResult = applyRtspTransport(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             return "{\"success\":true,\"handle\":" + handle + "}"
                     + "\nsurface=" + surfaceResult
+                    + "\ntransport=" + transportResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult;
         }));
@@ -160,10 +166,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.prepareButton).setOnClickListener(v -> runNative("Prepare", () -> {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
+            String transportResult = applyRtspTransport(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
+                    + "\ntransport=" + transportResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\nprepare=" + prepareResult;
@@ -172,8 +180,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.startButton).setOnClickListener(v -> runNative("Start", () -> {
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
+            String transportResult = applyRtspTransport(handle);
             String audioResult = applyAudioOption(handle);
             return "surface=" + surfaceResult
+                    + "\ntransport=" + transportResult
                     + "\naudio=" + audioResult
                     + "\nstart=" + FFmpegNative.startPlayer(handle);
         }));
@@ -231,6 +241,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long handle = getPlayerHandle();
             if (handle != 0) {
                 runNative("Reconnect Option", () -> applyReconnectOptions(handle));
+            }
+        });
+        transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            long handle = getPlayerHandle();
+            if (handle != 0) {
+                runNative("RTSP Transport", () -> applyRtspTransport(handle));
             }
         });
     }
@@ -308,6 +324,24 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return jsonError("player handle is 0");
         }
         return FFmpegNative.setPlayerReconnectOptions(handle, reconnectSwitch.isChecked(), 3, 1000);
+    }
+
+    private String applyRtspTransport(long handle) {
+        if (handle == 0) {
+            return jsonError("player handle is 0");
+        }
+        return FFmpegNative.setPlayerRtspTransport(handle, selectedRtspTransport());
+    }
+
+    private String selectedRtspTransport() {
+        int checkedId = transportRadioGroup.getCheckedRadioButtonId();
+        if (checkedId == R.id.udpTransportRadio) {
+            return "udp";
+        }
+        if (checkedId == R.id.autoTransportRadio) {
+            return "auto";
+        }
+        return "tcp";
     }
 
     private String requireUrl() {

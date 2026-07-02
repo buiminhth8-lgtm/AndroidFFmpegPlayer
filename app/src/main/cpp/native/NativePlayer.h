@@ -89,6 +89,7 @@ private:
     std::string errorMessage_;
     std::string lastReconnectError_;
     int timeoutMs_ = 5000;
+    bool isRealtimeInput_ = false;
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;

@@ -194,6 +194,12 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     av_dict_set(&options, "rtsp_transport", "tcp", 0);
     av_dict_set(&options, "stimeout", timeoutValue.c_str(), 0);
     av_dict_set(&options, "timeout", timeoutValue.c_str(), 0);
+    av_dict_set(&options, "fflags", "nobuffer", 0);
+    av_dict_set(&options, "flags", "low_delay", 0);
+    av_dict_set(&options, "max_delay", "200000", 0);
+    av_dict_set(&options, "reorder_queue_size", "0", 0);
+    av_dict_set(&options, "probesize", "32768", 0);
+    av_dict_set(&options, "analyzeduration", "100000", 0);
 
     int result = avformat_open_input(&formatContext_, url.c_str(), nullptr, &options);
     av_dict_free(&options);
@@ -436,11 +442,12 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         state_ = PlayerState::Preparing;
         url_ = url;
         timeoutMs_ = std::max(timeoutMs, 1);
+        isRealtimeInput_ = isNetworkUrl(url);
         errorMessage_.clear();
         lastReconnectError_.clear();
     }
 
-    LOGI("prepare url=%s timeoutMs=%d", url.c_str(), timeoutMs);
+    LOGI("prepare url=%s timeoutMs=%d realtimeInput=%d", url.c_str(), timeoutMs, isNetworkUrl(url) ? 1 : 0);
 
     std::string error;
     const int result = openInput(url, timeoutMs_, true, error);
@@ -877,7 +884,9 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
 
 void NativePlayer::playbackLoop() {
     LOGI("playback thread started player=%p", this);
-    const int frameDelayMs = static_cast<int>(std::clamp(1000.0 / std::max(fps_, 1.0), 5.0, 100.0));
+    const bool realtimeInput = isRealtimeInput_;
+    const int frameDelayMs = realtimeInput ? 0 : static_cast<int>(std::clamp(1000.0 / std::max(fps_, 1.0), 5.0, 100.0));
+    LOGI("playback pacing realtimeInput=%d fps=%.2f frameDelayMs=%d", realtimeInput ? 1 : 0, fps_, frameDelayMs);
 
     while (!stopRequested_.load()) {
         if (pauseRequested_.load()) {
@@ -966,7 +975,9 @@ void NativePlayer::playbackLoop() {
                     }
                 }
                 av_frame_unref(decodedFrame_);
-                std::this_thread::sleep_for(std::chrono::milliseconds(frameDelayMs));
+                if (frameDelayMs > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(frameDelayMs));
+                }
             }
         }
 

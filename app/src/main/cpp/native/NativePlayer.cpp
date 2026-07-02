@@ -1148,7 +1148,20 @@ bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
 
     const int64_t nowUs = av_gettime_relative();
     const int64_t audioClockUs = audioClockUs_.load();
-    if (sourceHasAudio_.load() && audioClockUs > 0) {
+    const bool useAudioMaster = sourceHasAudio_.load()
+                                && audioEnabled_.load()
+                                && audioPlayable_.load()
+                                && audioClockUs > 0;
+    if (!useAudioMaster && sourceHasAudio_.load() && audioClockUs > 0 && audioEnabled_.load()) {
+        const int64_t nowMsValue = nowMs();
+        if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
+            LOGI("frame drop uses wall clock because audio master is not playable audioEnabled=%d audioPlayable=%d audioClockUs=%lld",
+                 audioEnabled_.load() ? 1 : 0, audioPlayable_.load() ? 1 : 0,
+                 static_cast<long long>(audioClockUs));
+            lastRealtimeDropLogMs_ = nowMsValue;
+        }
+    }
+    if (useAudioMaster) {
         const int64_t diffUs = ptsUs - audioClockUs;
         lastVideoDelayUs_.store(diffUs);
         if (diffUs >= -optionsSnapshot.dropLateFrameThresholdUs) {

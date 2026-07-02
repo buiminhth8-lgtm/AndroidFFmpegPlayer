@@ -64,9 +64,12 @@ private:
 
     void playbackLoop();
     int openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage);
+    bool refreshRealtimeInputForStart();
     bool reconnectInput(int readErrorCode);
     bool waitForReconnectDelay(int delayMs);
     bool renderFrame(AVFrame *frame);
+    bool shouldDropRealtimeFrame(int64_t ptsUs);
+    void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
     void resetStats();
@@ -90,6 +93,13 @@ private:
     std::string lastReconnectError_;
     int timeoutMs_ = 5000;
     bool isRealtimeInput_ = false;
+    bool realtimeClockInitialized_ = false;
+    int64_t realtimeFirstPtsUs_ = 0;
+    int64_t realtimeStartWallUs_ = 0;
+    int64_t lastRealtimeDropLogMs_ = 0;
+    bool dropUntilKeyFrame_ = false;
+    int64_t maxRealtimeLatencyUs_ = 150000;
+    int64_t keyFrameCatchupLatencyUs_ = 800000;
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;

@@ -185,6 +185,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         errorMessage = "avformat_alloc_context failed";
         return -1;
     }
+    formatContext_->flags |= AVFMT_FLAG_NOBUFFER;
+    formatContext_->flags |= AVFMT_FLAG_FLUSH_PACKETS;
     formatContext_->interrupt_callback.callback = NativePlayer::interruptCallback;
     formatContext_->interrupt_callback.opaque = this;
 
@@ -196,10 +198,13 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     av_dict_set(&options, "timeout", timeoutValue.c_str(), 0);
     av_dict_set(&options, "fflags", "nobuffer", 0);
     av_dict_set(&options, "flags", "low_delay", 0);
-    av_dict_set(&options, "max_delay", "200000", 0);
+    av_dict_set(&options, "avioflags", "direct", 0);
+    av_dict_set(&options, "flush_packets", "1", 0);
+    av_dict_set(&options, "max_delay", "50000", 0);
     av_dict_set(&options, "reorder_queue_size", "0", 0);
-    av_dict_set(&options, "probesize", "32768", 0);
-    av_dict_set(&options, "analyzeduration", "100000", 0);
+    av_dict_set(&options, "buffer_size", "65536", 0);
+    av_dict_set(&options, "probesize", "16384", 0);
+    av_dict_set(&options, "analyzeduration", "0", 0);
 
     int result = avformat_open_input(&formatContext_, url.c_str(), nullptr, &options);
     av_dict_free(&options);
@@ -276,6 +281,12 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         releaseFfmpegResources();
         return result;
     }
+
+    videoCodecContext_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    videoCodecContext_->flags2 |= AV_CODEC_FLAG2_FAST;
+    videoCodecContext_->thread_count = 1;
+    videoCodecContext_->thread_type = FF_THREAD_SLICE;
+    LOGI("video decoder low latency enabled threadCount=%d", videoCodecContext_->thread_count);
 
     result = avcodec_open2(videoCodecContext_, decoder, nullptr);
     if (result < 0) {
@@ -485,28 +496,47 @@ std::string NativePlayer::start() {
         return jsonError(-1, "Surface is not set");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == PlayerState::Playing) {
-        return jsonSuccess("player already playing");
-    }
-    if (state_ == PlayerState::Paused && playbackThread_.joinable()) {
-        pauseRequested_.store(false);
-        state_ = PlayerState::Playing;
-        LOGI("startPlayer resume player=%p", this);
-        return jsonSuccess("player resumed");
-    }
-    if (state_ != PlayerState::Prepared) {
-        return jsonError(-1, "player is not prepared");
-    }
-    if (playbackThread_.joinable()) {
-        return jsonError(-1, "playback thread is already running");
+    bool shouldRefreshRealtimeInput = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Playing) {
+            return jsonSuccess("player already playing");
+        }
+        if (state_ == PlayerState::Paused && playbackThread_.joinable()) {
+            pauseRequested_.store(false);
+            state_ = PlayerState::Playing;
+            LOGI("startPlayer resume player=%p", this);
+            return jsonSuccess("player resumed");
+        }
+        if (state_ != PlayerState::Prepared) {
+            return jsonError(-1, "player is not prepared");
+        }
+        if (playbackThread_.joinable()) {
+            return jsonError(-1, "playback thread is already running");
+        }
+        shouldRefreshRealtimeInput = isRealtimeInput_ && !remuxRecorder_.isRecording();
+        if (shouldRefreshRealtimeInput) {
+            state_ = PlayerState::Preparing;
+        }
     }
 
-    stopRequested_.store(false);
-    pauseRequested_.store(false);
-    startPlayTimeMs_.store(nowMs());
-    state_ = PlayerState::Playing;
-    playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
+    if (shouldRefreshRealtimeInput && !refreshRealtimeInputForStart()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return jsonError(-1, errorMessage_.empty() ? "refresh realtime input failed" : errorMessage_);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != PlayerState::Prepared) {
+            return jsonError(-1, "player is not prepared");
+        }
+        stopRequested_.store(false);
+        pauseRequested_.store(false);
+        resetRealtimeClock();
+        startPlayTimeMs_.store(nowMs());
+        state_ = PlayerState::Playing;
+        playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
+    }
     LOGI("startPlayer player=%p", this);
     return jsonSuccess("player started");
 }
@@ -796,6 +826,85 @@ int NativePlayer::interruptCallback(void *opaque) {
     return player->stopRequested_.load() ? 1 : 0;
 }
 
+bool NativePlayer::refreshRealtimeInputForStart() {
+    std::string currentUrl;
+    int currentTimeoutMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        currentUrl = url_;
+        currentTimeoutMs = timeoutMs_;
+        errorMessage_.clear();
+    }
+
+    LOGI("refresh realtime input before start url=%s", currentUrl.c_str());
+    releaseFfmpegResources();
+    clearLastFrame();
+
+    std::string error;
+    const int result = openInput(currentUrl, currentTimeoutMs, true, error);
+    if (result < 0) {
+        setState(PlayerState::Error, error);
+        LOGE("refresh realtime input failed url=%s error=%s", currentUrl.c_str(), error.c_str());
+        return false;
+    }
+
+    setState(PlayerState::Prepared);
+    LOGI("refresh realtime input success url=%s", currentUrl.c_str());
+    return true;
+}
+
+void NativePlayer::resetRealtimeClock() {
+    realtimeClockInitialized_ = false;
+    realtimeFirstPtsUs_ = 0;
+    realtimeStartWallUs_ = 0;
+    lastRealtimeDropLogMs_ = 0;
+    dropUntilKeyFrame_ = false;
+}
+
+bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
+    if (!isRealtimeInput_ || ptsUs < 0) {
+        return false;
+    }
+
+    const int64_t nowUs = av_gettime_relative();
+    if (!realtimeClockInitialized_) {
+        realtimeClockInitialized_ = true;
+        realtimeFirstPtsUs_ = ptsUs;
+        realtimeStartWallUs_ = nowUs;
+        return false;
+    }
+
+    const int64_t streamElapsedUs = ptsUs - realtimeFirstPtsUs_;
+    const int64_t wallElapsedUs = nowUs - realtimeStartWallUs_;
+    if (streamElapsedUs < 0 || wallElapsedUs < 0) {
+        return false;
+    }
+
+    const int64_t latencyUs = wallElapsedUs - streamElapsedUs;
+    if (latencyUs <= maxRealtimeLatencyUs_) {
+        return false;
+    }
+
+    droppedVideoFrameCount_.fetch_add(1);
+    const int64_t nowMsValue = nowMs();
+    if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
+        LOGE("drop realtime frame latencyUs=%lld ptsUs=%lld streamElapsedUs=%lld wallElapsedUs=%lld",
+             static_cast<long long>(latencyUs), static_cast<long long>(ptsUs),
+             static_cast<long long>(streamElapsedUs), static_cast<long long>(wallElapsedUs));
+        lastRealtimeDropLogMs_ = nowMsValue;
+    }
+
+    if (latencyUs > keyFrameCatchupLatencyUs_) {
+        dropUntilKeyFrame_ = true;
+        if (videoCodecContext_ != nullptr) {
+            avcodec_flush_buffers(videoCodecContext_);
+        }
+        LOGE("realtime latency too high, skip packets until next keyframe latencyUs=%lld",
+             static_cast<long long>(latencyUs));
+    }
+    return true;
+}
+
 
 bool NativePlayer::waitForReconnectDelay(int delayMs) {
     int remainingMs = std::max(delayMs, 0);
@@ -942,6 +1051,21 @@ void NativePlayer::playbackLoop() {
             remuxRecorder_.onPacket(packet_, formatContext_);
         }
 
+        if (isRealtimeInput_ && dropUntilKeyFrame_) {
+            if (packet_->stream_index == videoStreamIndex_) {
+                if ((packet_->flags & AV_PKT_FLAG_KEY) == 0) {
+                    av_packet_unref(packet_);
+                    continue;
+                }
+                LOGI("realtime catch-up keyframe received, resume decode pts=%lld",
+                     static_cast<long long>(packet_->pts));
+                dropUntilKeyFrame_ = false;
+            } else {
+                av_packet_unref(packet_);
+                continue;
+            }
+        }
+
         if (packet_->stream_index == videoStreamIndex_) {
             int result = avcodec_send_packet(videoCodecContext_, packet_);
             if (result < 0) {
@@ -1049,6 +1173,9 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     }
     videoClockUs_.store(ptsUs);
     lastVideoFrameTimeMs_.store(nowMs());
+    if (shouldDropRealtimeFrame(ptsUs)) {
+        return true;
+    }
     saveLastFrame(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight, ptsUs);
 
     if (!renderer_.hasSurface()) {

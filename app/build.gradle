@@ -1,0 +1,221 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'kotlin-android'
+    id 'kotlin-kapt'
+    id 'com.google.devtools.ksp'
+}
+
+ksp {
+    arg("AROUTER_MODULE_NAME", project.getName())
+}
+
+android.sourceSets.configureEach { it.java.srcDir("build/generated/ksp/${it.name}/kotlin/") }
+android {
+    namespace 'com.example.motro'
+    compileSdk 36
+    defaultConfig {
+        applicationId "ccom.example.motro"
+        minSdk 31
+        targetSdk 36
+        versionCode 6
+        versionName "1.0.0.6"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        multiDexEnabled true
+        javaCompileOptions {
+            annotationProcessorOptions {
+                arguments = [AROUTER_MODULE_NAME: project.getName()]
+            }
+        }
+        ndk {
+            // 鎸囧畾鍙墦鍖?armeabi-v7a 鍜?arm64-v8a
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86_64"
+        }
+    }
+    
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+        }
+    }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    buildTypes {
+        release {
+            debuggable true // 纭繚璁剧疆涓?true
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+        }
+        debug {
+            debuggable true // 纭繚璁剧疆涓?true
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    kotlin {
+        jvmToolchain(17)
+    }
+
+    buildFeatures {
+        viewBinding true
+    }
+
+
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            if (variant.buildType.name == "release") {
+                def versionName = variant.versionName ?: "1.0"
+                def timestamp = new Date().format("yyyyMMdd_HHmmss", TimeZone.getTimeZone("GMT+8")) // 涓浗鏃堕棿
+                def fileName = "app_release_v${versionName}_${timestamp}.apk"
+                outputFileName = fileName
+            }
+        }
+    }
+
+}
+
+
+configurations.configureEach {
+    exclude group: 'com.android.support'
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+
+    implementation("androidx.multidex:multidex:2.0.1")
+    implementation 'com.github.bumptech.glide:glide:4.15.1'
+    implementation "io.github.cymchad:BaseRecyclerViewAdapterHelper:3.0.14"
+    implementation 'com.github.hackware1993:MagicIndicator:1.7.0' // for androidx
+    implementation "androidx.room:room-runtime:$rootProject.roomVersion"
+    implementation "androidx.room:room-ktx:$rootProject.roomVersion"
+    kapt "androidx.room:room-compiler:$rootProject.roomVersion"
+    implementation "io.coil-kt:coil:2.6.0"
+    implementation "androidx.biometric:biometric:1.2.0-alpha05"
+    ksp 'com.github.JailedBird:ArouterKspCompiler:2.1.20-1.0.31'
+
+    api 'androidx.media:media:1.4.0'
+    api 'androidx.appcompat:appcompat:1.4.1'
+    api 'com.google.android.material:material:1.10.0'
+    api 'androidx.constraintlayout:constraintlayout:2.1.3'
+    api 'androidx.navigation:navigation-fragment-ktx:2.4.1'
+    api 'androidx.recyclerview:recyclerview:1.3.2'
+    api 'com.squareup.okhttp3:logging-interceptor:3.6.0'
+    api 'com.squareup.retrofit2:adapter-rxjava3:2.9.0'
+    api 'com.squareup.retrofit2:retrofit:2.9.0'
+    api 'com.squareup.retrofit2:converter-gson:2.9.0'
+    api "com.squareup.okio:okio:3.12.0"
+    api 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    //dialogx
+    api "com.kongzue.dialogx:DialogX:0.0.49"
+    api "com.kongzue.dialogx.style:DialogXIOSStyle:0.0.49"
+    implementation 'com.github.Baseflow:PhotoView:2.3.0'
+    implementation "androidx.viewpager2:viewpager2:1.0.0"
+
+
+    api 'com.github.promeg:tinypinyin:2.0.3'
+
+    api "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"
+    api "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"  // 濡傛灉浣犲湪 Android 涓婁娇鐢?
+
+    //涓婃媺鍔犺浇涓嬫媺鍒锋柊
+
+    api  'io.github.scwang90:refresh-layout-kernel:3.0.0-alpha'      //鏍稿績蹇呴』渚濊禆
+    api  'io.github.scwang90:refresh-header-classics:3.0.0-alpha'    //缁忓吀鍒锋柊澶?    api  'io.github.scwang90:refresh-footer-classics:3.0.0-alpha'    //缁忓吀鍔犺浇
+
+
+    // 鏍稿績搴?    api 'com.github.bumptech.glide:glide:4.16.0'
+    // 娉ㄨВ澶勭悊鍣?    kapt 'com.github.bumptech.glide:compiler:4.16.0'
+    api 'com.blankj:utilcodex:1.31.1'
+    // ExoPlayer
+
+    def media3_version = "1.10.1"
+    // For media playback using ExoPlayer
+    implementation "androidx.media3:media3-exoplayer:$media3_version"
+    // For DASH playback support with ExoPlayer
+    implementation "androidx.media3:media3-exoplayer-dash:$media3_version"
+    // For HLS playback support with ExoPlayer
+    implementation "androidx.media3:media3-exoplayer-hls:$media3_version"
+    // For SmoothStreaming playback support with ExoPlayer
+    implementation "androidx.media3:media3-exoplayer-smoothstreaming:$media3_version"
+    // For RTSP playback support with ExoPlayer
+    implementation "androidx.media3:media3-exoplayer-rtsp:$media3_version"
+    // For loading data using librtmp
+    implementation "androidx.media3:media3-datasource-rtmp:$media3_version"
+    // For loading data using the OkHttp network stack
+    implementation "androidx.media3:media3-datasource-okhttp:$media3_version"
+    //鏍稿績搴?    // For transforming media files
+    implementation "androidx.media3:media3-transformer:$media3_version"
+    // For applying effects on video frames
+    implementation "androidx.media3:media3-effect:$media3_version"
+    // For muxing media files
+    implementation "androidx.media3:media3-muxer:$media3_version"
+    // For extracting data from media containers
+    implementation "androidx.media3:media3-extractor:$media3_version"
+    // For scheduling background operations using Jetpack Work's WorkManager with ExoPlayer
+    implementation "androidx.media3:media3-exoplayer-workmanager:$media3_version"
+    // Common functionality used across multiple media libraries
+    implementation "androidx.media3:media3-common:$media3_version"
+    // For building media playback UIs using Views
+    implementation "androidx.media3:media3-ui:$media3_version"
+    // For exposing and controlling media sessions
+    implementation "androidx.media3:media3-session:$media3_version"
+    // Common functionality for reading and writing media containers
+    implementation "androidx.media3:media3-container:$media3_version"
+    // Common functionality for media database components
+    implementation "androidx.media3:media3-database:$media3_version"
+    // Common functionality for media decoders
+    implementation "androidx.media3:media3-decoder:$media3_version"
+    // Common functionality for loading data
+    implementation "androidx.media3:media3-datasource:$media3_version"
+    //httpDns 浼樺寲
+    implementation 'com.aliyun.ams:alicloud-android-httpdns:2.2.2'
+    api 'androidx.lifecycle:lifecycle-extensions:2.2.0'
+
+    api 'androidx.work:work-runtime-ktx:2.10.5'
+    implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
+    implementation "androidx.core:core-ktx:$rootProject.kotlin_version"
+    // CameraX鏍稿績搴撳拰鐢熷懡鍛ㄦ湡搴?
+    def camerax_version = "1.5.0"
+    api "androidx.camera:camera-core:$camerax_version"
+    api "androidx.camera:camera-camera2:$camerax_version"
+    api "androidx.camera:camera-lifecycle:$camerax_version"
+    // 棰勮瑙嗗浘
+    api "androidx.camera:camera-view:$camerax_version"
+    // 鍙€夛細鍥剧墖鍒嗘瀽銆佸浘鐗囨媿鎽勩€佽棰戞媿鎽勭瓑
+    api "androidx.camera:camera-video:$camerax_version"
+    api "androidx.camera:camera-extensions:$camerax_version"
+    // 闇€瑕佺殑 ListenableFuture 鏀寔搴?    api 'androidx.concurrent:concurrent-futures:1.2.0'
+    api 'androidx.concurrent:concurrent-futures-ktx:1.2.0'
+
+    api 'org.tensorflow:tensorflow-lite:2.17.0'
+    api 'org.tensorflow:tensorflow-lite-gpu:2.17.0' // 鍙€夛紝GPU鍔犻€?    api ("com.google.mlkit:face-detection:16.1.7")
+    api 'com.google.guava:guava:33.5.0-android'
+    api("org.greenrobot:eventbus:3.3.1")
+
+
+
+
+}

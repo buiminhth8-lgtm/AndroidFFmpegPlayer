@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#F4F6F8"
+    android:orientation="vertical">
+
+    <SurfaceView
+        android:id="@+id/playerSurfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="5"
+        android:background="#000000" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="6"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <TextView
+                android:id="@+id/handleTextView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="handle: 0"
+                android:textColor="#202124"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/urlEditText"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="rtsp:// or http(s):// test url"
+                android:inputType="textUri"
+                android:singleLine="true"
+                android:textColor="#202124"
+                android:textSize="14sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/timeoutEditText"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:hint="timeoutMs"
+                    android:inputType="number"
+                    android:singleLine="true"
+                    android:textColor="#202124"
+                    android:textSize="14sp" />
+
+                <Switch
+                    android:id="@+id/audioSwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="48dp"
+                    android:paddingStart="10dp"
+                    android:paddingEnd="10dp"
+                    android:text="Audio"
+                    android:textColor="#202124" />
+
+                <Switch
+                    android:id="@+id/reconnectSwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="48dp"
+                    android:text="Reconnect"
+                    android:textColor="#202124" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/createButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Create" />
+
+                <Button
+                    android:id="@+id/infoButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Info" />
+
+                <Button
+                    android:id="@+id/probeButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Probe" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/prepareButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Prepare" />
+
+                <Button
+                    android:id="@+id/startButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Start" />
+
+                <Button
+                    android:id="@+id/pauseButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Pause" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/stopButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Stop" />
+
+                <Button
+                    android:id="@+id/releaseButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Release" />
+
+                <Button
+                    android:id="@+id/clearSurfaceButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Surface" />
+            </LinearLayout>
+
+            <EditText
+                android:id="@+id/recordPathEditText"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="record output .ts/.mp4"
+                android:inputType="textUri"
+                android:singleLine="true"
+                android:textColor="#202124"
+                android:textSize="13sp" />
+
+            <EditText
+                android:id="@+id/segmentPatternEditText"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="segment pattern, e.g. record_%03d.ts"
+                android:inputType="textUri"
+                android:singleLine="true"
+                android:textColor="#202124"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/startRecordButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Record" />
+
+                <Button
+                    android:id="@+id/startSegmentRecordButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Segment" />
+
+                <Button
+                    android:id="@+id/stopRecordButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Stop Rec" />
+            </LinearLayout>
+
+            <EditText
+                android:id="@+id/snapshotPathEditText"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:hint="snapshot output .png"
+                android:inputType="textUri"
+                android:singleLine="true"
+                android:textColor="#202124"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/snapshotButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Snapshot" />
+
+                <Button
+                    android:id="@+id/recordStateButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Rec State" />
+
+                <Button
+                    android:id="@+id/stateButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="State" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/statsButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Stats" />
+
+                <Button
+                    android:id="@+id/reconnectStateButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Reconnect" />
+
+                <Button
+                    android:id="@+id/clearLogButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Clear Log" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/logTextView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="#111827"
+                android:fontFamily="monospace"
+                android:minHeight="180dp"
+                android:padding="10dp"
+                android:textColor="#E5E7EB"
+                android:textIsSelectable="true"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

@@ -81,7 +81,7 @@ public final class FFmpegNative {
 
     public static native String getPlayerRtspTransportState(long handle);
 
-    /*
+    /**
      * Low latency RTSP example:
      * long handle = FFmpegNative.createPlayer();
      * FFmpegNative.setRtspTransport(handle, "udp");
@@ -102,6 +102,20 @@ public final class FFmpegNative {
 
     public static native String startPlayerSegmentRecord(long handle, String outputPattern, int segmentDurationSec);
 
+    /**
+     *
+     * @param handle
+     * @param outputPathOrPattern
+     * @param format
+     * @param segmentDurationSec
+     * @return
+     *
+     *
+     * // 单文件 fragmented MP4
+     * FFmpegNative.startPlayerRecordWithConfig(handle, "/path/record.mp4", "mp4", 0);
+     * // 每 5 分钟一个 MKV 文件
+     * FFmpegNative.startPlayerRecordWithConfig(handle, "/path/record_%03d.mkv", "mkv", 300);
+     */
     public static native String startPlayerRecordWithConfig(long handle, String outputPathOrPattern, String format, int segmentDurationSec);
 
     public static native String stopPlayerRecord(long handle);

@@ -14,6 +14,7 @@ extern "C" {
 #include "libavcodec/packet.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
+#include "libavutil/dict.h"
 #include "libavutil/error.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/time.h"
@@ -91,14 +92,78 @@ bool endsWith(const std::string &value, const std::string &suffix) {
     return lowerCopy(value.substr(value.size() - suffix.size())) == suffix;
 }
 
-const char *formatNameForPath(const std::string &path) {
+std::string trimLower(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }), value.end());
+    return lowerCopy(value);
+}
+
+std::string normalizeFormatName(const std::string &formatName) {
+    const std::string format = trimLower(formatName);
+    if (format.empty() || format == "auto") {
+        return std::string();
+    }
+    if (format == "ts" || format == "mpegts") {
+        return "mpegts";
+    }
+    if (format == "mp4" || format == "m4v") {
+        return "mp4";
+    }
+    if (format == "mov" || format == "quicktime") {
+        return "mov";
+    }
+    if (format == "mkv" || format == "matroska") {
+        return "matroska";
+    }
+    if (format == "webm") {
+        return "webm";
+    }
+    if (format == "flv") {
+        return "flv";
+    }
+    return format;
+}
+
+std::string formatNameForPath(const std::string &path) {
     if (endsWith(path, ".ts")) {
         return "mpegts";
     }
-    if (endsWith(path, ".mp4")) {
+    if (endsWith(path, ".mp4") || endsWith(path, ".m4v")) {
         return "mp4";
     }
-    return nullptr;
+    if (endsWith(path, ".mov")) {
+        return "mov";
+    }
+    if (endsWith(path, ".mkv")) {
+        return "matroska";
+    }
+    if (endsWith(path, ".webm")) {
+        return "webm";
+    }
+    if (endsWith(path, ".flv")) {
+        return "flv";
+    }
+    return std::string();
+}
+
+std::string resolveFormatName(const std::string &path, const std::string &requestedFormatName) {
+    const std::string requested = normalizeFormatName(requestedFormatName);
+    if (!requested.empty()) {
+        return requested;
+    }
+    return formatNameForPath(path);
+}
+
+bool isMp4LikeFormat(const std::string &formatName) {
+    const std::string format = normalizeFormatName(formatName);
+    return format == "mp4" || format == "mov";
+}
+
+std::string muxerOptionsJson(bool fragmentedMp4) {
+    std::ostringstream out;
+    out << "{\"fragmentedMp4\":" << (fragmentedMp4 ? "true" : "false") << "}";
+    return out.str();
 }
 
 std::string parentDirectory(const std::string &path) {
@@ -187,20 +252,31 @@ PlayerRemuxRecorder::~PlayerRemuxRecorder() {
 
 std::string PlayerRemuxRecorder::start(AVFormatContext *inputFmtCtx, const std::string &outputPath) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return startLocked(inputFmtCtx, outputPath, false, 0);
+    RemuxRecordConfig config;
+    config.outputPathOrPattern = outputPath;
+    config.segmentMode = false;
+    config.segmentDurationSec = 0;
+    return startLocked(inputFmtCtx, config);
 }
 
 std::string PlayerRemuxRecorder::startSegmented(AVFormatContext *inputFmtCtx,
                                                 const std::string &outputPattern,
                                                 int segmentDurationSec) {
     std::lock_guard<std::mutex> lock(mutex_);
-    return startLocked(inputFmtCtx, outputPattern, true, segmentDurationSec);
+    RemuxRecordConfig config;
+    config.outputPathOrPattern = outputPattern;
+    config.segmentMode = true;
+    config.segmentDurationSec = segmentDurationSec;
+    return startLocked(inputFmtCtx, config);
+}
+
+std::string PlayerRemuxRecorder::startWithConfig(AVFormatContext *inputFmtCtx, const RemuxRecordConfig &config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return startLocked(inputFmtCtx, config);
 }
 
 std::string PlayerRemuxRecorder::startLocked(AVFormatContext *inputFmtCtx,
-                                             const std::string &outputPathOrPattern,
-                                             bool segmentMode,
-                                             int segmentDurationSec) {
+                                             const RemuxRecordConfig &config) {
     if (state_ == RecorderState::Released) {
         return jsonError(-1, "recorder is released");
     }
@@ -210,29 +286,31 @@ std::string PlayerRemuxRecorder::startLocked(AVFormatContext *inputFmtCtx,
     if (inputFmtCtx == nullptr) {
         return jsonError(-1, "input format context is null; player is not prepared");
     }
-    if (outputPathOrPattern.empty()) {
-        return jsonError(-1, segmentMode ? "outputPattern is empty" : "outputPath is empty");
+    if (config.outputPathOrPattern.empty()) {
+        return jsonError(-1, config.segmentMode ? "outputPattern is empty" : "outputPath is empty");
     }
-    if (segmentMode && segmentDurationSec <= 0) {
+    if (config.segmentMode && config.segmentDurationSec <= 0) {
         return jsonError(-1, "segmentDurationSec must be greater than 0");
     }
 
-    segmentMode_ = segmentMode;
-    outputPattern_ = outputPathOrPattern;
+    segmentMode_ = config.segmentMode;
+    outputPattern_ = config.outputPathOrPattern;
     currentSegmentIndex_ = 0;
-    const std::string firstOutputPath = segmentMode_ ? makeSegmentPathLocked(currentSegmentIndex_) : outputPathOrPattern;
+    const std::string firstOutputPath = segmentMode_ ? makeSegmentPathLocked(currentSegmentIndex_) : config.outputPathOrPattern;
     const std::string parent = parentDirectory(firstOutputPath);
     if (!directoryExists(parent)) {
         return jsonError(-1, "output parent directory does not exist: " + parent);
     }
 
     resetLocked(false);
-    segmentMode_ = segmentMode;
-    outputPattern_ = outputPathOrPattern;
+    segmentMode_ = config.segmentMode;
+    outputPattern_ = config.outputPathOrPattern;
+    requestedFormatName_ = normalizeFormatName(config.formatName);
+    fragmentedMp4_ = config.fragmentedMp4;
     outputPath_ = firstOutputPath;
     currentSegmentPath_ = firstOutputPath;
     currentSegmentIndex_ = 0;
-    segmentDurationUs_ = segmentMode_ ? static_cast<int64_t>(segmentDurationSec) * AV_TIME_BASE : 0;
+    segmentDurationUs_ = segmentMode_ ? static_cast<int64_t>(config.segmentDurationSec) * AV_TIME_BASE : 0;
     startTimeUs_ = av_gettime_relative();
     stopTimeUs_ = 0;
     state_ = RecorderState::Starting;
@@ -258,6 +336,10 @@ std::string PlayerRemuxRecorder::startLocked(AVFormatContext *inputFmtCtx,
         << "\"segmentMode\":" << (segmentMode_ ? "true" : "false") << ","
         << "\"segmentDurationUs\":" << segmentDurationUs_ << ","
         << "\"format\":\"" << escapeJson(formatName_) << "\","
+        << "\"requestedFormat\":\"" << escapeJson(requestedFormatName_) << "\","
+        << "\"muxerOptions\":" << muxerOptionsJson(isMp4LikeFormat(formatName_) && fragmentedMp4_) << ","
+        << "\"fragmentedMp4\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
+        << "\"abnormalExitReadable\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
         << "\"sourceHasVideo\":" << (sourceHasVideo_ ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_ ? "true" : "false") << ","
         << "\"videoStreamRecorded\":" << (videoStreamRecorded_ ? "true" : "false") << ","
@@ -284,7 +366,8 @@ int PlayerRemuxRecorder::openOutputLocked(AVFormatContext *inputFmtCtx, const st
     currentSegmentVideoPacketCount_ = 0;
     currentSegmentAudioPacketCount_ = 0;
 
-    const char *requestedFormatName = formatNameForPath(outputPath);
+    const std::string resolvedFormatName = resolveFormatName(outputPath, requestedFormatName_);
+    const char *requestedFormatName = resolvedFormatName.empty() ? nullptr : resolvedFormatName.c_str();
     int result = avformat_alloc_output_context2(&outputFmtCtx_, nullptr, requestedFormatName, outputPath.c_str());
     if (result < 0 || outputFmtCtx_ == nullptr) {
         const std::string error = result < 0 ? ffmpegErrorToString(result) : "avformat_alloc_output_context2 failed";
@@ -294,6 +377,9 @@ int PlayerRemuxRecorder::openOutputLocked(AVFormatContext *inputFmtCtx, const st
     }
 
     formatName_ = outputFmtCtx_->oformat && outputFmtCtx_->oformat->name ? outputFmtCtx_->oformat->name : "unknown";
+    LOGI("record output format requested=%s resolved=%s actual=%s fragmentedMp4=%d path=%s",
+         requestedFormatName_.c_str(), resolvedFormatName.c_str(), formatName_.c_str(),
+         fragmentedMp4_ ? 1 : 0, outputPath.c_str());
     streamMapping_.assign(inputFmtCtx->nb_streams, -1);
     firstPts_.assign(inputFmtCtx->nb_streams, AV_NOPTS_VALUE);
     firstDts_.assign(inputFmtCtx->nb_streams, AV_NOPTS_VALUE);
@@ -393,7 +479,20 @@ int PlayerRemuxRecorder::openOutputLocked(AVFormatContext *inputFmtCtx, const st
         }
     }
 
-    result = avformat_write_header(outputFmtCtx_, nullptr);
+    AVDictionary *muxerOptions = nullptr;
+    const bool usingFragmentedMp4 = isMp4LikeFormat(formatName_) && fragmentedMp4_;
+    if (usingFragmentedMp4) {
+        av_dict_set(&muxerOptions, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+        av_dict_set(&muxerOptions, "flush_packets", "1", 0);
+        LOGI("mp4/mov recorder uses fragmented MP4 movflags=frag_keyframe+empty_moov+default_base_moof path=%s", outputPath.c_str());
+    }
+
+    result = avformat_write_header(outputFmtCtx_, &muxerOptions);
+    AVDictionaryEntry *unusedOption = nullptr;
+    while ((unusedOption = av_dict_get(muxerOptions, "", unusedOption, AV_DICT_IGNORE_SUFFIX)) != nullptr) {
+        LOGI("unused muxer option %s=%s", unusedOption->key, unusedOption->value);
+    }
+    av_dict_free(&muxerOptions);
     if (result < 0) {
         const std::string error = ffmpegErrorToString(result);
         LOGE("avformat_write_header failed path=%s error=%s", outputPath.c_str(), error.c_str());
@@ -507,12 +606,14 @@ std::string PlayerRemuxRecorder::stop() {
     const std::string stoppedSegmentPath = currentSegmentPath_;
     const std::string stoppedLastSegmentPath = lastSegmentPath_;
     const std::string stoppedFormat = formatName_;
+    const std::string stoppedRequestedFormat = requestedFormatName_;
     const int64_t stoppedVideoPackets = videoPacketCount_;
     const int64_t stoppedAudioPackets = audioPacketCount_;
     const int64_t stoppedDurationUs = elapsedUs(startTimeUs_, stopTimeUs_);
     const int64_t stoppedCompletedSegments = completedSegmentCount_;
     const bool stoppedSegmentMode = segmentMode_;
     const int64_t stoppedSegmentDurationUs = segmentDurationUs_;
+    const bool stoppedFragmentedMp4 = fragmentedMp4_;
 
     resetLocked(false);
     state_ = RecorderState::Stopped;
@@ -521,11 +622,13 @@ std::string PlayerRemuxRecorder::stop() {
     currentSegmentPath_ = stoppedSegmentPath;
     lastSegmentPath_ = stoppedLastSegmentPath;
     formatName_ = stoppedFormat;
+    requestedFormatName_ = stoppedRequestedFormat;
     videoPacketCount_ = stoppedVideoPackets;
     audioPacketCount_ = stoppedAudioPackets;
     completedSegmentCount_ = stoppedCompletedSegments;
     segmentMode_ = stoppedSegmentMode;
     segmentDurationUs_ = stoppedSegmentDurationUs;
+    fragmentedMp4_ = stoppedFragmentedMp4;
     sourceHasVideo_ = stoppedSourceHasVideo;
     sourceHasAudio_ = stoppedSourceHasAudio;
     videoStreamRecorded_ = stoppedVideoStreamRecorded;
@@ -545,6 +648,10 @@ std::string PlayerRemuxRecorder::stop() {
         << "\"lastSegmentPath\":\"" << escapeJson(lastSegmentPath_) << "\","
         << "\"segmentMode\":" << (segmentMode_ ? "true" : "false") << ","
         << "\"completedSegmentCount\":" << completedSegmentCount_ << ","
+        << "\"format\":\"" << escapeJson(formatName_) << "\","
+        << "\"requestedFormat\":\"" << escapeJson(requestedFormatName_) << "\","
+        << "\"fragmentedMp4\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
+        << "\"abnormalExitReadable\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
         << "\"sourceHasVideo\":" << (sourceHasVideo_ ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_ ? "true" : "false") << ","
         << "\"videoStreamRecorded\":" << (videoStreamRecorded_ ? "true" : "false") << ","
@@ -615,6 +722,7 @@ void PlayerRemuxRecorder::resetLocked(bool keepReleasedState) {
     currentSegmentPath_.clear();
     lastSegmentPath_.clear();
     formatName_.clear();
+    requestedFormatName_.clear();
     videoInputStreamIndex_ = -1;
     audioInputStreamIndex_ = -1;
     videoPacketCount_ = 0;
@@ -636,6 +744,7 @@ void PlayerRemuxRecorder::resetLocked(bool keepReleasedState) {
     waitingForKeyFrame_ = false;
     headerWritten_ = false;
     segmentMode_ = false;
+    fragmentedMp4_ = true;
 }
 
 std::string PlayerRemuxRecorder::buildStateJsonLocked(bool success) const {
@@ -647,8 +756,11 @@ std::string PlayerRemuxRecorder::buildStateJsonLocked(bool success) const {
         << "\"outputPath\":\"" << escapeJson(outputPath_) << "\","
         << "\"outputPattern\":\"" << escapeJson(outputPattern_) << "\","
         << "\"format\":\"" << escapeJson(formatName_) << "\","
+        << "\"requestedFormat\":\"" << escapeJson(requestedFormatName_) << "\","
         << "\"segmentMode\":" << (segmentMode_ ? "true" : "false") << ","
         << "\"segmentDurationUs\":" << segmentDurationUs_ << ","
+        << "\"fragmentedMp4\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
+        << "\"abnormalExitReadable\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
         << "\"sourceHasVideo\":" << (sourceHasVideo_ ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_ ? "true" : "false") << ","
         << "\"videoStreamRecorded\":" << (videoStreamRecorded_ ? "true" : "false") << ","
@@ -835,6 +947,9 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
         av_packet_free(&recordPacket);
         setErrorLocked(error, result);
         return false;
+    }
+    if (isMp4LikeFormat(formatName_) && fragmentedMp4_ && outputFmtCtx_ != nullptr && outputFmtCtx_->pb != nullptr) {
+        avio_flush(outputFmtCtx_->pb);
     }
 
     if (packet->stream_index == videoInputStreamIndex_) {

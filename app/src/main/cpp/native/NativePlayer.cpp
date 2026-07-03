@@ -1052,6 +1052,40 @@ std::string NativePlayer::startSegmentRecord(const std::string &outputPattern, i
     LOGI("startPlayerSegmentRecord outputPattern=%s segmentDurationSec=%d sourceHasAudio=%d audioPlaybackEnabled=%d", outputPattern.c_str(), segmentDurationSec, sourceHasAudio_.load() ? 1 : 0, audioEnabled_.load() ? 1 : 0);
     return remuxRecorder_.startSegmented(input, outputPattern, segmentDurationSec);
 }
+
+std::string NativePlayer::startRecordWithConfig(const std::string &outputPathOrPattern,
+                                                const std::string &formatName,
+                                                int segmentDurationSec) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+
+    AVFormatContext *input = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != PlayerState::Prepared && state_ != PlayerState::Playing && state_ != PlayerState::Paused) {
+            return jsonError(-1, "player is not prepared");
+        }
+        input = formatContext_;
+    }
+
+    RemuxRecordConfig config;
+    config.outputPathOrPattern = outputPathOrPattern;
+    config.formatName = formatName;
+    config.segmentMode = segmentDurationSec > 0;
+    config.segmentDurationSec = segmentDurationSec;
+    config.fragmentedMp4 = true;
+
+    remuxRecorder_.setAudioPlaybackState(audioEnabled_.load());
+    if (sourceHasAudio_.load() && !audioEnabled_.load()) {
+        LOGI("AudioTrack disabled but configured remux recording remains enabled by source audio stream");
+    }
+    LOGI("startPlayerRecordWithConfig output=%s format=%s segmentDurationSec=%d segmentMode=%d sourceHasAudio=%d audioPlaybackEnabled=%d",
+         outputPathOrPattern.c_str(), formatName.c_str(), segmentDurationSec, config.segmentMode ? 1 : 0,
+         sourceHasAudio_.load() ? 1 : 0, audioEnabled_.load() ? 1 : 0);
+    return remuxRecorder_.startWithConfig(input, config);
+}
+
 std::string NativePlayer::stopRecord() {
     if (isReleased()) {
         return jsonError(-1, "player is released");

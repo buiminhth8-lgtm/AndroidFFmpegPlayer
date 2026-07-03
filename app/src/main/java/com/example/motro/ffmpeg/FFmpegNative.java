@@ -102,6 +102,8 @@ public final class FFmpegNative {
 
     public static native String startPlayerSegmentRecord(long handle, String outputPattern, int segmentDurationSec);
 
+    public static native String startPlayerRecordWithConfig(long handle, String outputPathOrPattern, String format, int segmentDurationSec);
+
     public static native String stopPlayerRecord(long handle);
 
     public static native String getPlayerRecordState(long handle);

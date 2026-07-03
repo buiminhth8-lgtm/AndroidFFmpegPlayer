@@ -33,7 +33,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private static final String TAG = "FFmpegPlayerDemo";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
-    private static final int DEFAULT_SEGMENT_SECONDS = 60;
+    private static final int DEFAULT_SEGMENT_SECONDS = 300;
 
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -43,6 +43,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private EditText timeoutEditText;
     private EditText recordPathEditText;
     private EditText segmentPatternEditText;
+    private EditText recordFormatEditText;
+    private EditText segmentDurationEditText;
     private EditText snapshotPathEditText;
     private Switch audioSwitch;
     private Switch reconnectSwitch;
@@ -80,6 +82,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         timeoutEditText = findViewById(R.id.timeoutEditText);
         recordPathEditText = findViewById(R.id.recordPathEditText);
         segmentPatternEditText = findViewById(R.id.segmentPatternEditText);
+        recordFormatEditText = findViewById(R.id.recordFormatEditText);
+        segmentDurationEditText = findViewById(R.id.segmentDurationEditText);
         snapshotPathEditText = findViewById(R.id.snapshotPathEditText);
         audioSwitch = findViewById(R.id.audioSwitch);
         reconnectSwitch = findViewById(R.id.reconnectSwitch);
@@ -90,14 +94,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void initDefaults() {
-        urlEditText.setText("rtsp://192.168.1.101:554/main.mov");
+        urlEditText.setText("rtsp://192.168.52.128:8554/video");
         timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
-        recordPathEditText.setText(defaultFilePath("record_av_test.ts"));
-        segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.ts"));
+        recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
+        segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
+        recordFormatEditText.setText("mp4");
+        segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
         updateHandleLabel();
     }
@@ -211,10 +217,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 FFmpegNative.takePlayerSnapshot(requireHandle(), requireSnapshotPath())));
 
         findViewById(R.id.startRecordButton).setOnClickListener(v -> runNative("Start Record", () ->
-                FFmpegNative.startPlayerRecord(requireHandle(), requireRecordPath())));
+                FFmpegNative.startPlayerRecordWithConfig(requireHandle(), requireRecordPath(), requireRecordFormat(), 0)));
 
         findViewById(R.id.startSegmentRecordButton).setOnClickListener(v -> runNative("Start Segment Record", () ->
-                FFmpegNative.startPlayerSegmentRecord(requireHandle(), requireSegmentPattern(), DEFAULT_SEGMENT_SECONDS)));
+                FFmpegNative.startPlayerRecordWithConfig(requireHandle(), requireSegmentPattern(), requireRecordFormat(), requireSegmentDurationSec())));
 
         findViewById(R.id.stopRecordButton).setOnClickListener(v -> runNative("Stop Record", () ->
                 FFmpegNative.stopPlayerRecord(requireHandle())));
@@ -412,6 +418,26 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
         ensureParentExists(pattern.replace("%03d", "000"));
         return pattern;
+    }
+
+    private String requireRecordFormat() {
+        String format = recordFormatEditText.getText().toString().trim();
+        if (TextUtils.isEmpty(format)) {
+            return "auto";
+        }
+        return format;
+    }
+
+    private int requireSegmentDurationSec() {
+        String value = segmentDurationEditText.getText().toString().trim();
+        if (TextUtils.isEmpty(value)) {
+            return DEFAULT_SEGMENT_SECONDS;
+        }
+        try {
+            return Math.max(1, Integer.parseInt(value));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("segment duration must be a number");
+        }
     }
 
     private String requireSnapshotPath() {

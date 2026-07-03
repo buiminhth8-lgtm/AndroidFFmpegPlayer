@@ -61,6 +61,7 @@ public:
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
     std::string startSegmentRecord(const std::string &outputPattern, int segmentDurationSec);
+    std::string startRecordWithConfig(const std::string &outputPathOrPattern, const std::string &formatName, int segmentDurationSec);
     std::string stopRecord();
     std::string getRecordState();
     std::string release();

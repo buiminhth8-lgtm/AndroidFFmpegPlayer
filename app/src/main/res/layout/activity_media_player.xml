@@ -229,7 +229,7 @@
                 android:id="@+id/recordPathEditText"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
-                android:hint="record output .ts/.mp4"
+                android:hint="record output .mp4/.mkv/.ts"
                 android:inputType="textUri"
                 android:singleLine="true"
                 android:textColor="@color/black"
@@ -239,11 +239,39 @@
                 android:id="@+id/segmentPatternEditText"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
-                android:hint="segment pattern, e.g. record_%03d.ts"
+                android:hint="segment pattern, e.g. record_%03d.mp4"
                 android:inputType="textUri"
                 android:singleLine="true"
                 android:textColor="@color/black"
                 android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/recordFormatEditText"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:hint="format: mp4/mkv/ts"
+                    android:inputType="text"
+                    android:singleLine="true"
+                    android:textColor="@color/black"
+                    android:textSize="13sp" />
+
+                <EditText
+                    android:id="@+id/segmentDurationEditText"
+                    android:layout_width="0dp"
+                    android:layout_height="48dp"
+                    android:layout_weight="1"
+                    android:hint="segment seconds"
+                    android:inputType="number"
+                    android:singleLine="true"
+                    android:textColor="@color/black"
+                    android:textSize="13sp" />
+            </LinearLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"

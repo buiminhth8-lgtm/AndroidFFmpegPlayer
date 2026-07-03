@@ -10,6 +10,14 @@
 struct AVFormatContext;
 struct AVPacket;
 
+struct RemuxRecordConfig {
+    std::string outputPathOrPattern;
+    std::string formatName;
+    bool segmentMode = false;
+    int segmentDurationSec = 0;
+    bool fragmentedMp4 = true;
+};
+
 enum class RecorderState {
     Idle,
     Starting,
@@ -31,6 +39,7 @@ public:
 
     std::string start(AVFormatContext *inputFmtCtx, const std::string &outputPath);
     std::string startSegmented(AVFormatContext *inputFmtCtx, const std::string &outputPattern, int segmentDurationSec);
+    std::string startWithConfig(AVFormatContext *inputFmtCtx, const RemuxRecordConfig &config);
     void onPacket(const AVPacket *packet, AVFormatContext *inputFmtCtx);
     std::string stop();
     std::string getState();
@@ -43,9 +52,7 @@ public:
 
 private:
     std::string startLocked(AVFormatContext *inputFmtCtx,
-                            const std::string &outputPathOrPattern,
-                            bool segmentMode,
-                            int segmentDurationSec);
+                            const RemuxRecordConfig &config);
     int openOutputLocked(AVFormatContext *inputFmtCtx, const std::string &outputPath);
     int closeOutputLocked(bool writeTrailer);
     void resetLocked(bool keepReleasedState);
@@ -69,6 +76,7 @@ private:
     std::string currentSegmentPath_;
     std::string lastSegmentPath_;
     std::string formatName_;
+    std::string requestedFormatName_;
     std::string lastError_;
     int lastErrorCode_ = 0;
     int videoInputStreamIndex_ = -1;
@@ -93,6 +101,7 @@ private:
     bool waitingForKeyFrame_ = false;
     bool headerWritten_ = false;
     bool segmentMode_ = false;
+    bool fragmentedMp4_ = true;
 };
 
 #endif // MOTRO_PLAYER_REMUX_RECORDER_H

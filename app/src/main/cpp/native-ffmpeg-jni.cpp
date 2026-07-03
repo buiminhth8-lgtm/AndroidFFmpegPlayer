@@ -617,6 +617,37 @@ jstring nativeStartPlayerSegmentRecord(JNIEnv *env, jclass, jlong handle, jstrin
     env->ReleaseStringUTFChars(outputPattern, chars);
     return toJString(env, player->startSegmentRecord(outputPatternValue, segmentDurationSec));
 }
+
+jstring nativeStartPlayerRecordWithConfig(JNIEnv *env, jclass, jlong handle, jstring outputPathOrPattern, jstring format, jint segmentDurationSec) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    if (outputPathOrPattern == nullptr) {
+        return toJString(env, jsonError(-1, "outputPathOrPattern is null"));
+    }
+
+    const char *pathChars = env->GetStringUTFChars(outputPathOrPattern, nullptr);
+    if (pathChars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read outputPathOrPattern"));
+    }
+    std::string outputValue(pathChars);
+    env->ReleaseStringUTFChars(outputPathOrPattern, pathChars);
+
+    std::string formatValue;
+    if (format != nullptr) {
+        const char *formatChars = env->GetStringUTFChars(format, nullptr);
+        if (formatChars == nullptr) {
+            return toJString(env, jsonError(-1, "failed to read format"));
+        }
+        formatValue = formatChars;
+        env->ReleaseStringUTFChars(format, formatChars);
+    }
+
+    return toJString(env, player->startRecordWithConfig(outputValue, formatValue, segmentDurationSec));
+}
+
 jstring nativeStopPlayerRecord(JNIEnv *env, jclass, jlong handle) {
     std::string error;
     NativePlayer *player = getPlayer(handle, error);
@@ -694,6 +725,7 @@ bool registerNativeMethods(JNIEnv *env) {
             {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},
+            {"startPlayerRecordWithConfig", "(JLjava/lang/String;Ljava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecordWithConfig)},
             {"stopPlayerRecord", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeStopPlayerRecord)},
             {"getPlayerRecordState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerRecordState)},
             {"releasePlayer", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeReleasePlayer)},

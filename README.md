@@ -258,6 +258,7 @@ released
 | --- | --- | --- |
 | `startPlayerRecord(long handle, String outputPath)` | 开始同路 remux 录制。 | `outputPath` 支持 `.ts`、`.mp4`，推荐优先测试 `.ts`。 |
 | `startPlayerSegmentRecord(long handle, String outputPattern, int segmentDurationSec)` | 开始分片 remux 录制。 | `outputPattern` 建议包含 `%03d`，例如 `record_segment_%03d.ts`。 |
+| `startPlayerRecordWithConfig(long handle, String outputPathOrPattern, String format, int segmentDurationSec)` | 按配置开始 remux 录制。 | `format` 支持 `mp4`、`mkv/matroska`、`ts/mpegts`、`mov`、`webm`、`flv` 等；`segmentDurationSec > 0` 时按时长分片。 |
 | `stopPlayerRecord(long handle)` | 停止录制但不停止播放。 | 写 trailer、关闭输出、返回 packet 统计。 |
 | `getPlayerRecordState(long handle)` | 查询录制状态。 | 包含 outputPath、format、video/audio packet count、waiting keyframe、分片统计等。 |
 
@@ -281,12 +282,26 @@ released
 - 源无音频时可生成纯视频文件。
 - 源有音频但音频播放关闭或失败时，仍尽量录入音频 packet。
 - 播放停止时如果正在录制，会自动 stop recorder。
+- MP4/MOV 默认启用 fragmented MP4：`movflags=frag_keyframe+empty_moov+default_base_moof`，并在写 packet 后 flush，异常退出时已写 fragment 更容易恢复播放。
+- `segmentDurationSec=300` 表示每 5 分钟切一个文件；如果 pattern 包含 `%03d` 会按序号替换，否则自动在文件名后追加序号。
 
 推荐路径：
 
 ```java
 String tsPath = new File(context.getExternalFilesDir(null), "record_av_test.ts").getAbsolutePath();
 String mp4Path = new File(context.getExternalFilesDir(null), "record_av_test.mp4").getAbsolutePath();
+```
+
+推荐配置型录制：
+
+```java
+// 单个 fragmented MP4 文件
+String oneMp4 = new File(context.getExternalFilesDir(null), "record_av_test.mp4").getAbsolutePath();
+FFmpegNative.startPlayerRecordWithConfig(handle, oneMp4, "mp4", 0);
+
+// 每 5 分钟一个 Matroska 文件
+String mkvPattern = new File(context.getExternalFilesDir(null), "record_%03d.mkv").getAbsolutePath();
+FFmpegNative.startPlayerRecordWithConfig(handle, mkvPattern, "mkv", 300);
 ```
 
 ### 截图 API

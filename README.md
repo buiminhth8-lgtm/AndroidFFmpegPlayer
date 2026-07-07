@@ -84,6 +84,78 @@ Native 构建由 `app/src/main/cpp/CMakeLists.txt` 生成 `native-ffmpeg`：
 .\gradlew.bat :app:assembleDebug
 ```
 
+
+## AAR 打包和三方引用
+
+项目新增 `ffmpegplayer` Android Library module，用于生成可被三方项目引用的 AAR。该模块复用现有 JNI/CMake/FFmpeg so，但只导出 `com.example.motro.ffmpeg.FFmpegNative`，不包含 demo `MediaPlayerActivity`，避免宿主应用被合入 launcher Activity 和 UI 依赖。
+
+构建 release AAR：
+
+```bash
+./gradlew :ffmpegplayer:assembleRelease
+```
+
+也可以使用根工程别名任务：
+
+```bash
+./gradlew assembleFfmpegPlayerAar
+```
+
+构建需要 JDK 17。如果本机默认 Java 指向不含 `javac` 的运行时，可临时指定：
+
+```bash
+./gradlew -Dorg.gradle.java.home=/path/to/jdk17 assembleFfmpegPlayerAar
+```
+
+产物路径：
+
+```text
+ffmpegplayer/build/outputs/aar/ffmpegplayer-release.aar
+```
+
+AAR 内包含：
+
+- `classes.jar`：`FFmpegNative` Java API。
+- `jni/{armeabi-v7a,arm64-v8a,x86_64}`：`native-ffmpeg` 以及 FFmpeg 动态库。
+- `consumer-rules.pro`：保留 JNI 注册所需的 `FFmpegNative` 类和方法名。
+- `AndroidManifest.xml`：仅声明网络访问权限。
+
+三方项目直接引用本地 AAR：
+
+```groovy
+dependencies {
+    implementation files("libs/ffmpegplayer-release.aar")
+}
+```
+
+如需发布到本机 Maven 仓库：
+
+```bash
+./gradlew :ffmpegplayer:publishReleasePublicationToMavenLocal
+```
+
+三方项目再引用：
+
+```groovy
+repositories {
+    mavenLocal()
+}
+
+dependencies {
+    implementation "com.example.motro:ffmpegplayer:1.0.0.6"
+}
+```
+
+宿主项目使用示例：
+
+```java
+import com.example.motro.ffmpeg.FFmpegNative;
+
+long handle = FFmpegNative.createPlayer();
+FFmpegNative.setRtspTransport(handle, "tcp");
+FFmpegNative.setPlayerLatencyMode(handle, "balanced");
+```
+
 ## so 加载顺序
 
 `FFmpegNative` 静态代码块按以下顺序加载：

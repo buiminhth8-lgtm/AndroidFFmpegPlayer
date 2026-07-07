@@ -21,3 +21,9 @@ ext {
     geckoviewVersion = "70.0.20190712095934"
 
 }
+
+tasks.register("assembleFfmpegPlayerAar") {
+    group = "build"
+    description = "Build the FFmpeg player AAR for third-party Android projects."
+    dependsOn(":ffmpegplayer:assembleRelease")
+}

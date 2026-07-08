@@ -89,7 +89,12 @@ void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
         << "\"decoderThreadCount\":" << options.decoderThreadCount << ","
         << "\"enableFrameDrop\":" << (options.enableFrameDrop ? "true" : "false") << ","
         << "\"dropLateFrameThresholdUs\":" << options.dropLateFrameThresholdUs << ","
-        << "\"skipNonRef\":" << (options.skipNonRef ? "true" : "false");
+        << "\"enablePacketDrop\":" << (options.enablePacketDrop ? "true" : "false") << ","
+        << "\"dropLatePacketThresholdUs\":" << options.dropLatePacketThresholdUs << ","
+        << "\"enableLatestFrameOnly\":" << (options.enableLatestFrameOnly ? "true" : "false") << ","
+        << "\"syncMaster\":\"" << syncMasterName(options.syncMaster) << "\","
+        << "\"skipNonRef\":" << (options.skipNonRef ? "true" : "false") << ","
+        << "\"cacheLastFrameEveryN\":" << options.cacheLastFrameEveryN;
 }
 
 } // namespace
@@ -134,10 +139,20 @@ std::string rtspTransportName(RtspTransport transport) {
 std::string latencyModeName(LatencyMode mode) {
     switch (mode) {
         case LatencyMode::LOW_LATENCY: return "low_latency";
+        case LatencyMode::ULTRA_LOW_LATENCY: return "ultra_low_latency";
         case LatencyMode::BALANCED: return "balanced";
         case LatencyMode::STABLE: return "stable";
     }
     return "balanced";
+}
+
+std::string syncMasterName(SyncMaster syncMaster) {
+    switch (syncMaster) {
+        case SyncMaster::AUDIO: return "audio";
+        case SyncMaster::VIDEO: return "video";
+        case SyncMaster::WALL_CLOCK: return "wall_clock";
+    }
+    return "audio";
 }
 
 std::string sourceTypeName(SourceType sourceType) {
@@ -186,12 +201,33 @@ bool parseLatencyMode(const std::string &value, LatencyMode &mode) {
         mode = LatencyMode::LOW_LATENCY;
         return true;
     }
+    if (normalized == "ultra_low_latency" || normalized == "ultra" || normalized == "ull") {
+        mode = LatencyMode::ULTRA_LOW_LATENCY;
+        return true;
+    }
     if (normalized == "balanced" || normalized == "balance") {
         mode = LatencyMode::BALANCED;
         return true;
     }
     if (normalized == "stable" || normalized == "stability") {
         mode = LatencyMode::STABLE;
+        return true;
+    }
+    return false;
+}
+
+bool parseSyncMaster(const std::string &value, SyncMaster &syncMaster) {
+    const std::string normalized = lowerTrim(value);
+    if (normalized == "audio") {
+        syncMaster = SyncMaster::AUDIO;
+        return true;
+    }
+    if (normalized == "video") {
+        syncMaster = SyncMaster::VIDEO;
+        return true;
+    }
+    if (normalized == "wall_clock" || normalized == "wallclock" || normalized == "clock") {
+        syncMaster = SyncMaster::WALL_CLOCK;
         return true;
     }
     return false;
@@ -213,6 +249,32 @@ void applyLatencyProfile(PlayerOptions &options) {
     options.latencyMode = mode;
 
     const bool udp = transport == RtspTransport::UDP || transport == RtspTransport::UDP_MULTICAST;
+    const bool ultraUdp = udp || transport == RtspTransport::AUTO;
+
+    if (mode == LatencyMode::ULTRA_LOW_LATENCY) {
+        options.openTimeoutUs = 3000000;
+        options.readTimeoutUs = 3000000;
+        options.probesize = 32768;
+        options.analyzeduration = 0;
+        options.maxProbePackets = 32;
+        options.maxDelayUs = 0;
+        options.reorderQueueSize = ultraUdp ? 0 : -1;
+        options.socketBufferSize = 262144;
+        options.fflagsNoBuffer = true;
+        options.avioDirect = true;
+        options.lowDelayDecode = true;
+        options.tcpNoDelay = true;
+        options.enableFrameDrop = true;
+        options.enablePacketDrop = true;
+        options.enableLatestFrameOnly = true;
+        options.decoderThreadCount = 1;
+        options.dropLateFrameThresholdUs = 80000;
+        options.dropLatePacketThresholdUs = 80000;
+        options.syncMaster = SyncMaster::VIDEO;
+        options.skipNonRef = false;
+        options.cacheLastFrameEveryN = 1;
+        return;
+    }
 
     if (mode == LatencyMode::LOW_LATENCY) {
         options.openTimeoutUs = 3000000;
@@ -380,6 +442,47 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
         options.dropLateFrameThresholdUs = parsedLong;
         return true;
     }
+    if (normalizedKey == "enable_packet_drop") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_packet_drop must be boolean";
+            return false;
+        }
+        options.enablePacketDrop = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "drop_late_packet_threshold_us") {
+        if (!parseInt64(value, parsedLong) || parsedLong < 0) {
+            errorMessage = "drop_late_packet_threshold_us must be a non-negative integer";
+            return false;
+        }
+        options.dropLatePacketThresholdUs = parsedLong;
+        return true;
+    }
+    if (normalizedKey == "enable_latest_frame_only") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_latest_frame_only must be boolean";
+            return false;
+        }
+        options.enableLatestFrameOnly = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "sync_master") {
+        SyncMaster syncMaster;
+        if (!parseSyncMaster(value, syncMaster)) {
+            errorMessage = "sync_master must be audio, video, or wall_clock";
+            return false;
+        }
+        options.syncMaster = syncMaster;
+        return true;
+    }
+    if (normalizedKey == "cache_last_frame_every_n") {
+        if (!parseInt(value, parsedInt) || parsedInt <= 0) {
+            errorMessage = "cache_last_frame_every_n must be greater than 0";
+            return false;
+        }
+        options.cacheLastFrameEveryN = parsedInt;
+        return true;
+    }
     if (normalizedKey == "fflags_nobuffer") {
         if (!parseBool(value, parsedBool)) {
             errorMessage = "fflags_nobuffer must be boolean";
@@ -409,13 +512,13 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
     return false;
 }
 
-std::string playerOptionsToJson(const PlayerOptions &options, SourceType sourceType, bool preferUdpInAuto) {
+std::string playerOptionsToJson(const PlayerOptions &options, SourceType sourceType, bool preferUdpInAuto, const std::string &effectiveSyncMaster) {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"sourceType\":\"" << sourceTypeName(sourceType) << "\","
         << "\"effectiveRtspTransport\":\"" << effectiveRtspTransportName(options, preferUdpInAuto) << "\",";
     appendOptionsJson(out, options);
-    out << "}";
+    out << ",\"effectiveSyncMaster\":\"" << escapeJson(effectiveSyncMaster) << "\"}";
     return out.str();
 }
 
@@ -423,6 +526,7 @@ std::string latencyProfilesJson() {
     std::ostringstream out;
     out << "{\"success\":true,\"profiles\":{"
         << "\"low_latency\":{\"description\":\"minimum latency for LAN preview; UDP may lose packets or show artifacts\"},"
+        << "\"ultra_low_latency\":{\"description\":\"aggressive realtime preview with packet/frame drop, video master, and latest-frame-only behavior\"},"
         << "\"balanced\":{\"description\":\"default compromise between latency and stability\"},"
         << "\"stable\":{\"description\":\"larger buffers for WAN/Wi-Fi jitter and recording-first workflows\"}"
         << "}}";
@@ -433,7 +537,20 @@ std::string rtspLowLatencyHelpJson() {
     return "{\"success\":true,"
            "\"tcp\":\"tcp is stable and ordered but retransmission can add latency; low_latency uses tcp_nodelay and smaller buffers\","
            "\"udp\":\"udp has lower latency and avoids TCP head-of-line blocking, but packet loss can cause artifacts\","
-           "\"modes\":\"use udp+low_latency for LAN control preview, tcp+stable for WAN or recording-first sessions\"}";
+           "\"modes\":\"use udp+low_latency for LAN control preview, udp+ultra_low_latency for most aggressive realtime preview, tcp+stable for WAN or recording-first sessions\"}";
+}
+
+std::string ultraLowLatencyHelpJson() {
+    return "{\"success\":true,"
+           "\"mode\":\"ultra_low_latency\","
+           "\"purpose\":\"aggressive realtime preview; allows artifacts, dropped packets, dropped frames, and discontinuous video\","
+           "\"defaults\":{\"rtspTransportWhenAuto\":\"udp\",\"openTimeoutUs\":3000000,\"readTimeoutUs\":3000000,\"probesize\":32768,\"analyzeduration\":0,\"maxProbePackets\":32,\"maxDelayUs\":0,\"reorderQueueSize\":0,\"socketBufferSize\":262144,\"fflagsNoBuffer\":true,\"avioDirect\":true,\"lowDelayDecode\":true,\"tcpNoDelay\":true,\"enableFrameDrop\":true,\"enablePacketDrop\":true,\"enableLatestFrameOnly\":true,\"decoderThreadCount\":1,\"dropLateFrameThresholdUs\":80000,\"dropLatePacketThresholdUs\":80000,\"syncMaster\":\"video\",\"skipNonRef\":false,\"cacheLastFrameEveryN\":1},"
+           "\"recording\":\"remux recording receives packets before playback packet/frame drop\"}";
+}
+
+std::string latencyReportHelpJson() {
+    return "{\"success\":true,"
+           "\"fields\":{\"read\":\"last/avg/max av_read_frame cost in us\",\"decode\":\"send_packet and receive_frame/decode cost in us\",\"swsScale\":\"RGBA conversion cost in us\",\"render\":\"ANativeWindow lock/copy/post and total render cost in us\",\"frameProcess\":\"decode-to-render processing cost in us\",\"videoDelay\":\"estimated video delay relative to effective sync master in us\",\"drop\":\"packet/frame drop counters before decode/render\",\"clock\":\"sync master plus audio/video/wall clocks\",\"queue\":\"read packet and video frame queue sizes; zero for serial pipeline\"}}";
 }
 
 std::string sourceInfoJson(const std::string &url) {
@@ -445,8 +562,8 @@ std::string sourceInfoJson(const std::string &url) {
         << "\"isRtsp\":" << (isRtspSource(sourceType) ? "true" : "false") << ",";
     if (isRtspSource(sourceType)) {
         out << "\"recommendedTransport\":\"udp\","
-            << "\"recommendedLatencyMode\":\"balanced\","
-            << "\"message\":\"try udp low_latency on LAN; use tcp stable if packet loss or artifacts are visible\"";
+            << "\"recommendedLatencyMode\":\"ultra_low_latency\","
+            << "\"message\":\"try udp ultra_low_latency for lowest preview latency; use balanced or stable if packet loss or artifacts are visible\"";
     } else {
         out << "\"recommendedTransport\":\"none\","
             << "\"recommendedLatencyMode\":\"balanced\","

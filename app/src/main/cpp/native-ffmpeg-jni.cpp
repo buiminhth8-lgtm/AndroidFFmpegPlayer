@@ -318,6 +318,12 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     if (first == "-rtsp-low-latency-help") {
         return toJString(env, rtspLowLatencyHelpJson());
     }
+    if (first == "-ultra-low-latency-help" || first == "-rtsp-ultra-low-latency-help") {
+        return toJString(env, ultraLowLatencyHelpJson());
+    }
+    if (first == "-latency-report-help" || first == "-player-stats-help") {
+        return toJString(env, latencyReportHelpJson());
+    }
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {
             return toJString(env, jsonError(-1, "-probe requires url"));

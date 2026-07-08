@@ -5,6 +5,7 @@
 #include <android/native_window_jni.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 
@@ -25,6 +26,11 @@ std::string jsonError(int errorCode, const std::string &message) {
     out << "{\"success\":false,\"errorCode\":" << errorCode
         << ",\"errorMessage\":\"" << message << "\"}";
     return out.str();
+}
+
+int64_t steadyNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 } // namespace
@@ -70,29 +76,36 @@ std::string VideoRenderer::setSurface(JNIEnv *env, jobject surface, int width, i
 
 RenderResult VideoRenderer::renderRgba(const uint8_t *rgbaData, int lineSize, int width, int height) {
     if (rgbaData == nullptr || lineSize <= 0 || width <= 0 || height <= 0) {
-        return {false, -1, "invalid RGBA frame"};
+        return {false, -1, "invalid RGBA frame", {}};
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (window_ == nullptr) {
-        return {false, -1, "Surface is not set"};
+        return {false, -1, "Surface is not set", {}};
     }
+
+    RenderStats stats;
+    const int64_t renderStartUs = steadyNowUs();
 
     if (width_ != width || height_ != height) {
         const int geometryResult = ANativeWindow_setBuffersGeometry(window_, width, height, WINDOW_FORMAT_RGBA_8888);
         if (geometryResult < 0) {
             LOGE("ANativeWindow_setBuffersGeometry failed: %d", geometryResult);
-            return {false, geometryResult, "ANativeWindow_setBuffersGeometry failed"};
+            stats.totalCostUs = steadyNowUs() - renderStartUs;
+            return {false, geometryResult, "ANativeWindow_setBuffersGeometry failed", stats};
         }
         width_ = width;
         height_ = height;
     }
 
     ANativeWindow_Buffer buffer;
+    const int64_t lockStartUs = steadyNowUs();
     const int lockResult = ANativeWindow_lock(window_, &buffer, nullptr);
+    stats.lockCostUs = steadyNowUs() - lockStartUs;
     if (lockResult < 0) {
         LOGE("ANativeWindow_lock failed: %d", lockResult);
-        return {false, lockResult, "ANativeWindow_lock failed"};
+        stats.totalCostUs = steadyNowUs() - renderStartUs;
+        return {false, lockResult, "ANativeWindow_lock failed", stats};
     }
 
     auto *dst = static_cast<uint8_t *>(buffer.bits);
@@ -106,17 +119,22 @@ RenderResult VideoRenderer::renderRgba(const uint8_t *rgbaData, int lineSize, in
              buffer.stride, copyWidth / 4, copyHeight);
     }
 
+    const int64_t copyStartUs = steadyNowUs();
     for (int y = 0; y < copyHeight; ++y) {
         std::memcpy(dst + y * dstStride, rgbaData + y * lineSize, copyWidth);
     }
+    stats.copyCostUs = steadyNowUs() - copyStartUs;
 
+    const int64_t postStartUs = steadyNowUs();
     const int unlockResult = ANativeWindow_unlockAndPost(window_);
+    stats.postCostUs = steadyNowUs() - postStartUs;
+    stats.totalCostUs = steadyNowUs() - renderStartUs;
     if (unlockResult < 0) {
         LOGE("ANativeWindow_unlockAndPost failed: %d", unlockResult);
-        return {false, unlockResult, "ANativeWindow_unlockAndPost failed"};
+        return {false, unlockResult, "ANativeWindow_unlockAndPost failed", stats};
     }
 
-    return {true, 0, ""};
+    return {true, 0, "", stats};
 }
 
 void VideoRenderer::release() {

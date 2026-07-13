@@ -322,6 +322,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         audioDecodeOpened_.store(false);
         audioPlayable_.store(false);
         fps_ = 25.0;
+        streamBitRate_.store(0);
+        videoBitRate_.store(0);
+        audioBitRate_.store(0);
         videoCodec_.clear();
         audioCodec_.clear();
         lastFrameFormatName_.clear();
@@ -419,6 +422,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         releaseFfmpegResources();
         return result;
     }
+    streamBitRate_.store(std::max<int64_t>(0, formatContext_->bit_rate));
 
     for (unsigned int i = 0; i < formatContext_->nb_streams; ++i) {
         AVStream *stream = formatContext_->streams[i];
@@ -431,6 +435,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
             videoWidth_ = params->width;
             videoHeight_ = params->height;
             videoCodec_ = codecName(params->codec_id);
+            videoBitRate_.store(std::max<int64_t>(0, params->bit_rate));
             sourceHasVideo_.store(true);
             fps_ = rationalToDouble(stream->avg_frame_rate.num != 0 ? stream->avg_frame_rate : stream->r_frame_rate);
             if (fps_ <= 1.0 || std::isnan(fps_) || std::isinf(fps_)) {
@@ -439,6 +444,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         } else if (params->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex_ < 0) {
             audioStreamIndex_ = static_cast<int>(i);
             audioCodec_ = codecName(params->codec_id);
+            audioBitRate_.store(std::max<int64_t>(0, params->bit_rate));
             audioSampleRate_ = params->sample_rate;
             audioChannels_ = params->ch_layout.nb_channels;
             audioSampleFormat_ = params->format;
@@ -1067,6 +1073,15 @@ std::string NativePlayer::getStats() {
         << "\"readPacketCount\":" << readPacketCount_.load() << ","
         << "\"videoPacketCount\":" << videoPacketCount_.load() << ","
         << "\"audioPacketCount\":" << audioPacketCount_.load() << ","
+        << "\"inputPacketBytes\":" << inputPacketBytes_.load() << ","
+        << "\"videoPacketBytes\":" << videoPacketBytes_.load() << ","
+        << "\"audioPacketBytes\":" << audioPacketBytes_.load() << ","
+        << "\"streamBitRate\":" << streamBitRate_.load() << ","
+        << "\"videoBitRate\":" << videoBitRate_.load() << ","
+        << "\"audioBitRate\":" << audioBitRate_.load() << ","
+        << "\"fps\":" << fps_ << ","
+        << "\"videoWidth\":" << videoWidth_ << ","
+        << "\"videoHeight\":" << videoHeight_ << ","
         << "\"videoFrameCount\":" << videoFrameCount_.load() << ","
         << "\"audioFrameCount\":" << audioFrameCount_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
@@ -1991,6 +2006,8 @@ void NativePlayer::playbackLoop() {
         }
 
         const int64_t packetCount = readPacketCount_.fetch_add(1) + 1;
+        const int packetSize = std::max(packet_->size, 0);
+        inputPacketBytes_.fetch_add(packetSize);
         ++sessionReadPacketCount;
         if (packetCount == 1 || packetCount % 250 == 0) {
             LOGI("read packet count=%lld stream=%d size=%d pts=%lld dts=%lld flags=0x%x",
@@ -1999,6 +2016,7 @@ void NativePlayer::playbackLoop() {
         }
         if (packet_->stream_index == videoStreamIndex_) {
             const int64_t videoPackets = videoPacketCount_.fetch_add(1) + 1;
+            videoPacketBytes_.fetch_add(packetSize);
             if (videoPackets == 1 || videoPackets % 100 == 0) {
                 LOGI("video packet count=%lld size=%d pts=%lld key=%d",
                      static_cast<long long>(videoPackets), packet_->size,
@@ -2006,6 +2024,7 @@ void NativePlayer::playbackLoop() {
             }
         } else if (packet_->stream_index == audioStreamIndex_) {
             const int64_t audioPackets = audioPacketCount_.fetch_add(1) + 1;
+            audioPacketBytes_.fetch_add(packetSize);
             if (audioPackets == 1 || audioPackets % 100 == 0) {
                 LOGI("audio packet count=%lld size=%d pts=%lld",
                      static_cast<long long>(audioPackets), packet_->size,
@@ -2438,6 +2457,9 @@ void NativePlayer::resetStats() {
     readPacketCount_.store(0);
     videoPacketCount_.store(0);
     audioPacketCount_.store(0);
+    inputPacketBytes_.store(0);
+    videoPacketBytes_.store(0);
+    audioPacketBytes_.store(0);
     videoFrameCount_.store(0);
     audioFrameCount_.store(0);
     renderedFrameCount_.store(0);

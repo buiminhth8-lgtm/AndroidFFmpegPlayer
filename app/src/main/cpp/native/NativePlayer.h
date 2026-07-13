@@ -174,6 +174,12 @@ private:
     std::atomic<int64_t> readPacketCount_{0};
     std::atomic<int64_t> videoPacketCount_{0};
     std::atomic<int64_t> audioPacketCount_{0};
+    std::atomic<int64_t> inputPacketBytes_{0};
+    std::atomic<int64_t> videoPacketBytes_{0};
+    std::atomic<int64_t> audioPacketBytes_{0};
+    std::atomic<int64_t> streamBitRate_{0};
+    std::atomic<int64_t> videoBitRate_{0};
+    std::atomic<int64_t> audioBitRate_{0};
     std::atomic<int64_t> videoFrameCount_{0};
     std::atomic<int64_t> audioFrameCount_{0};
     std::atomic<int64_t> renderedFrameCount_{0};

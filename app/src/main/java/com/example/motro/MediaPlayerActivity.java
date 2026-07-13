@@ -35,6 +35,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.json.JSONObject;
@@ -50,6 +51,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final JavaMediaCodecExperiment javaMediaCodecExperiment = new JavaMediaCodecExperiment();
+    private final AtomicBoolean playbackInfoRequestInFlight = new AtomicBoolean(false);
+    private final Runnable playbackInfoRunnable = new Runnable() {
+        @Override
+        public void run() {
+            updatePlaybackInfoAsync();
+            if (!destroyed) {
+                mainHandler.postDelayed(this, 1000);
+            }
+        }
+    };
 
     private EditText urlEditText;
     private EditText timeoutEditText;
@@ -63,6 +74,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
     private TextView handleTextView;
+    private TextView playbackInfoTextView;
     private TextView logTextView;
 
     private ExecutorService worker;
@@ -72,6 +84,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private volatile int surfaceHeight;
     private volatile boolean destroyed;
     private long playerHandle;
+    private long lastPlaybackInfoHandle;
+    private long lastPlaybackInfoTimeMs;
+    private long lastPlaybackInfoRenderedFrames;
+    private long lastPlaybackInfoDecodedFrames;
+    private long lastPlaybackInfoVideoBytes;
+    private long lastPlaybackInfoInputBytes;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -85,6 +103,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         initDefaults();
         bindPreviewCallback();
         bindActions();
+        startPlaybackInfoUpdates();
         appendLog("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
     }
 
@@ -102,6 +121,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
         handleTextView = findViewById(R.id.handleTextView);
+        playbackInfoTextView = findViewById(R.id.playbackInfoTextView);
         logTextView = findViewById(R.id.logTextView);
     }
 
@@ -218,6 +238,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (handle == 0) {
                 return jsonError("player handle is 0");
             }
+            resetPlaybackInfoCounters();
             return FFmpegNative.releasePlayer(handle);
         }));
 
@@ -301,6 +322,153 @@ public class MediaPlayerActivity extends AppCompatActivity {
         } else {
             appendLog(title + ": no player yet");
         }
+    }
+
+    private void startPlaybackInfoUpdates() {
+        resetPlaybackInfoCounters();
+        playbackInfoTextView.setText("等待播放");
+        mainHandler.post(playbackInfoRunnable);
+    }
+
+    private void updatePlaybackInfoAsync() {
+        long handle = getPlayerHandle();
+        ExecutorService statsWorker = worker;
+        if (destroyed || statsWorker == null) {
+            return;
+        }
+        if (handle == 0) {
+            resetPlaybackInfoCounters();
+            playbackInfoTextView.setText("等待播放");
+            return;
+        }
+        if (!playbackInfoRequestInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            statsWorker.execute(() -> {
+                String statsJson;
+                try {
+                    statsJson = FFmpegNative.getPlayerStats(handle);
+                } catch (Throwable t) {
+                    statsJson = jsonError(t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+                }
+                String finalStatsJson = statsJson;
+                mainHandler.post(() -> {
+                    playbackInfoRequestInFlight.set(false);
+                    if (!destroyed && handle == getPlayerHandle()) {
+                        updatePlaybackInfoFromStats(handle, finalStatsJson);
+                    }
+                });
+            });
+        } catch (Throwable t) {
+            playbackInfoRequestInFlight.set(false);
+        }
+    }
+
+    private void updatePlaybackInfoFromStats(long handle, String statsJson) {
+        try {
+            JSONObject stats = new JSONObject(statsJson);
+            if (!stats.optBoolean("success", false)) {
+                playbackInfoTextView.setText("播放信息不可用");
+                return;
+            }
+
+            long nowMs = System.currentTimeMillis();
+            long renderedFrames = stats.optLong("renderedFrameCount", 0);
+            long decodedFrames = stats.optLong("hardwareDecodedFrameCount", 0)
+                    + stats.optLong("softwareDecodedFrameCount", 0);
+            if (decodedFrames <= 0) {
+                decodedFrames = stats.optLong("videoFrameCount", 0);
+            }
+            long videoBytes = stats.optLong("videoPacketBytes", 0);
+            long inputBytes = stats.optLong("inputPacketBytes", 0);
+            if (handle != lastPlaybackInfoHandle || lastPlaybackInfoTimeMs <= 0) {
+                lastPlaybackInfoHandle = handle;
+                lastPlaybackInfoTimeMs = nowMs;
+                lastPlaybackInfoRenderedFrames = renderedFrames;
+                lastPlaybackInfoDecodedFrames = decodedFrames;
+                lastPlaybackInfoVideoBytes = videoBytes;
+                lastPlaybackInfoInputBytes = inputBytes;
+            }
+
+            long elapsedMs = Math.max(1, nowMs - lastPlaybackInfoTimeMs);
+            double renderFps = ratePerSecond(renderedFrames - lastPlaybackInfoRenderedFrames, elapsedMs);
+            double decodeFps = ratePerSecond(decodedFrames - lastPlaybackInfoDecodedFrames, elapsedMs);
+            double videoKbps = bitrateKbps(videoBytes - lastPlaybackInfoVideoBytes, elapsedMs);
+            double transferKbPerSec = bytesPerSecondKb(inputBytes - lastPlaybackInfoInputBytes, elapsedMs);
+
+            lastPlaybackInfoTimeMs = nowMs;
+            lastPlaybackInfoRenderedFrames = renderedFrames;
+            lastPlaybackInfoDecodedFrames = decodedFrames;
+            lastPlaybackInfoVideoBytes = videoBytes;
+            lastPlaybackInfoInputBytes = inputBytes;
+
+            String state = stats.optString("state", "unknown");
+            String mode = stats.optString("renderMode", "unknown");
+            String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
+            String frameFormat = stats.optString("frameFormat", "");
+            long dropped = stats.optLong("droppedVideoFrameCount", 0);
+            long videoBitRate = stats.optLong("videoBitRate", 0);
+            long streamBitRate = stats.optLong("streamBitRate", 0);
+            String nominalBitrate = videoBitRate > 0
+                    ? formatKbps(videoBitRate / 1000.0)
+                    : (streamBitRate > 0 ? formatKbps(streamBitRate / 1000.0) : "--");
+
+            playbackInfoTextView.setText(
+                    "状态 " + state
+                            + " | " + mode
+                            + " | " + codec
+                            + "\n解码 " + formatFps(decodeFps)
+                            + " fps  渲染 " + formatFps(renderFps)
+                            + " fps  丢帧 " + dropped
+                            + "\n码率 " + formatKbps(videoKbps)
+                            + "  传输 " + formatKbPerSec(transferKbPerSec)
+                            + "  标称 " + nominalBitrate
+                            + "\n格式 " + frameFormat
+                            + "  包 " + stats.optLong("readPacketCount", 0)
+                            + "  帧 " + renderedFrames);
+        } catch (Throwable t) {
+            playbackInfoTextView.setText("播放信息解析失败");
+        }
+    }
+
+    private void resetPlaybackInfoCounters() {
+        lastPlaybackInfoHandle = 0;
+        lastPlaybackInfoTimeMs = 0;
+        lastPlaybackInfoRenderedFrames = 0;
+        lastPlaybackInfoDecodedFrames = 0;
+        lastPlaybackInfoVideoBytes = 0;
+        lastPlaybackInfoInputBytes = 0;
+    }
+
+    private double ratePerSecond(long deltaCount, long elapsedMs) {
+        return Math.max(0, deltaCount) * 1000.0 / Math.max(1, elapsedMs);
+    }
+
+    private double bitrateKbps(long deltaBytes, long elapsedMs) {
+        return Math.max(0, deltaBytes) * 8.0 / Math.max(1, elapsedMs);
+    }
+
+    private double bytesPerSecondKb(long deltaBytes, long elapsedMs) {
+        return Math.max(0, deltaBytes) * 1000.0 / Math.max(1, elapsedMs) / 1024.0;
+    }
+
+    private String formatFps(double value) {
+        return String.format(Locale.US, "%.1f", value);
+    }
+
+    private String formatKbps(double value) {
+        if (value >= 1000.0) {
+            return String.format(Locale.US, "%.2f Mbps", value / 1000.0);
+        }
+        return String.format(Locale.US, "%.0f kbps", value);
+    }
+
+    private String formatKbPerSec(double value) {
+        if (value >= 1024.0) {
+            return String.format(Locale.US, "%.2f MB/s", value / 1024.0);
+        }
+        return String.format(Locale.US, "%.0f KB/s", value);
     }
 
     private long ensurePlayer() {
@@ -766,6 +934,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        mainHandler.removeCallbacks(playbackInfoRunnable);
+        playbackInfoRequestInFlight.set(false);
         stopJavaMediaCodecExperimentQuietly();
         long handle = takePlayerHandle();
         ExecutorService releaseWorker = worker;

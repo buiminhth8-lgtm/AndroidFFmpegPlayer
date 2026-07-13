@@ -1,14 +1,15 @@
 package com.example.motro;
 
 import android.content.Context;
-import android.graphics.SurfaceTexture;
+import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Log;
+import android.view.PixelCopy;
 import android.view.Surface;
-import android.view.TextureView;
+import android.view.SurfaceHolder;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.RadioGroup;
@@ -20,14 +21,23 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.example.motro.databinding.ActivityMediaPlayerBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
+import com.example.motro.ffmpeg.JavaMediaCodecExperiment;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.json.JSONObject;
 
 public class MediaPlayerActivity extends AppCompatActivity {
 
@@ -35,10 +45,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
 
+    private ActivityMediaPlayerBinding binding;
+
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final JavaMediaCodecExperiment javaMediaCodecExperiment = new JavaMediaCodecExperiment();
 
-    private TextureView previewView;
     private EditText urlEditText;
     private EditText timeoutEditText;
     private EditText recordPathEditText;
@@ -55,7 +67,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
-    private volatile Surface textureSurface;
     private volatile boolean surfaceReady;
     private volatile int surfaceWidth;
     private volatile int surfaceHeight;
@@ -65,7 +76,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_media_player);
+
+        binding = ActivityMediaPlayerBinding.inflate(getLayoutInflater());
+        setContentView(binding.getRoot());
 
         worker = Executors.newSingleThreadExecutor(r -> new Thread(r, "FFmpegDemoWorker"));
         bindViews();
@@ -76,8 +89,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void bindViews() {
-        previewView = findViewById(R.id.playerPreviewView);
-        previewView.setKeepScreenOn(true);
+        binding.playerPreviewView.setKeepScreenOn(true);
         urlEditText = findViewById(R.id.urlEditText);
         timeoutEditText = findViewById(R.id.timeoutEditText);
         recordPathEditText = findViewById(R.id.recordPathEditText);
@@ -94,7 +106,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void initDefaults() {
-        urlEditText.setText("rtsp://192.168.52.128:8554/video");
+        urlEditText.setText("rtsp://192.168.1.101:554/main.mov");
         timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
@@ -109,28 +121,22 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void bindPreviewCallback() {
-        previewView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+        binding.playerPreviewView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
-            public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
-                releaseTextureSurfaceOnly();
-                textureSurface = new Surface(surfaceTexture);
-                currentSurface = textureSurface;
-                surfaceReady = true;
-                surfaceWidth = width;
-                surfaceHeight = height;
-                bindSurfaceForExistingPlayer("Texture Available");
+            public void surfaceCreated(@NonNull SurfaceHolder holder) {
+                updateSurfaceFromHolder(holder, binding.playerPreviewView.getWidth(), binding.playerPreviewView.getHeight());
+                bindSurfaceForExistingPlayer("Surface Created");
             }
 
             @Override
-            public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
-                surfaceReady = true;
-                surfaceWidth = width;
-                surfaceHeight = height;
-                bindSurfaceForExistingPlayer("Texture Size Changed");
+            public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+                updateSurfaceFromHolder(holder, width, height);
+                bindSurfaceForExistingPlayer("Surface Changed");
             }
 
             @Override
-            public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
+            public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+                stopJavaMediaCodecExperimentQuietly();
                 surfaceReady = false;
                 surfaceWidth = 0;
                 surfaceHeight = 0;
@@ -139,14 +145,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 if (handle != 0) {
                     runNative("Clear Surface", () -> FFmpegNative.clearPlayerSurface(handle));
                 }
-                releaseTextureSurfaceOnly();
-                return true;
-            }
-
-            @Override
-            public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surfaceTexture) {
             }
         });
+    }
+
+    private void updateSurfaceFromHolder(@NonNull SurfaceHolder holder, int width, int height) {
+        Surface surface = holder.getSurface();
+        currentSurface = surface;
+        surfaceReady = surface != null && surface.isValid();
+        surfaceWidth = width;
+        surfaceHeight = height;
     }
 
     private void bindActions() {
@@ -214,7 +222,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }));
 
         findViewById(R.id.snapshotButton).setOnClickListener(v -> runNative("Snapshot", () ->
-                FFmpegNative.takePlayerSnapshot(requireHandle(), requireSnapshotPath())));
+                takePlayerSnapshotCompat(requireHandle(), requireSnapshotPath())));
 
         findViewById(R.id.startRecordButton).setOnClickListener(v -> runNative("Start Record", () ->
                 FFmpegNative.startPlayerRecordWithConfig(requireHandle(), requireRecordPath(), requireRecordFormat(), 0)));
@@ -237,6 +245,23 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.reconnectStateButton).setOnClickListener(v -> runNative("Reconnect/Latency State", () ->
                 FFmpegNative.getPlayerReconnectState(requireHandle())
                         + "\nlatency=" + FFmpegNative.getPlayerLatencyConfig(requireHandle())));
+
+        findViewById(R.id.testSoftwareRgbaButton).setOnClickListener(v -> runNative("Test software_rgba", () ->
+                runNativeRenderModeTest("software_rgba", false)));
+
+        findViewById(R.id.testSoftwareYuvGlButton).setOnClickListener(v -> runNative("Test software_yuv_gl", () ->
+                runNativeRenderModeTest("software_yuv_gl", false)));
+
+        findViewById(R.id.testMediaCodecSurfaceButton).setOnClickListener(v -> runNative("Test mediacodec_surface", () ->
+                runNativeRenderModeTest("mediacodec_surface", true)));
+
+        findViewById(R.id.testAllRenderModesButton).setOnClickListener(v -> runNative("Compare render modes", this::runAllNativeRenderModeTests));
+
+        findViewById(R.id.javaCodecStartButton).setOnClickListener(v -> runNative("Java MediaCodec Start", this::startJavaMediaCodecExperiment));
+
+        findViewById(R.id.javaCodecStatsButton).setOnClickListener(v -> runNative("Java MediaCodec Stats", javaMediaCodecExperiment::getStats));
+
+        findViewById(R.id.javaCodecStopButton).setOnClickListener(v -> runNative("Java MediaCodec Stop", javaMediaCodecExperiment::stop));
 
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
                 FFmpegNative.clearPlayerSurface(requireHandle())));
@@ -358,6 +383,136 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return FFmpegNative.setPlayerLatencyMode(handle, selectedLatencyMode());
     }
 
+    private String runAllNativeRenderModeTests() throws Exception {
+        StringBuilder out = new StringBuilder();
+        out.append(runNativeRenderModeTest("software_rgba", false));
+        out.append("\n\n").append(runNativeRenderModeTest("software_yuv_gl", false));
+        out.append("\n\n").append(runNativeRenderModeTest("mediacodec_surface", true));
+        return out.toString();
+    }
+
+    private String runNativeRenderModeTest(String renderMode, boolean hardwareDecode) throws Exception {
+        stopJavaMediaCodecExperimentQuietly();
+        String releaseResult = releaseCurrentPlayerForTest();
+
+        long handle = createFreshPlayerForTest();
+        String surfaceResult = bindSurfaceIfReady(handle);
+        String transportResult = applyRtspTransport(handle);
+        String latencyResult = applyLatencyMode(handle);
+        String audioResult = FFmpegNative.enableAudio(handle, false);
+        String hardwareResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
+        String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
+        String latencyLevelResult = FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
+        String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
+        String startResult = FFmpegNative.startPlayer(handle);
+        String firstFrameStats = waitForFirstFrameStats(handle, 2500);
+        String stats = FFmpegNative.getPlayerStats(handle);
+
+        return "mode=" + renderMode
+                + "\nreleasePrevious=" + releaseResult
+                + "\nsurface=" + surfaceResult
+                + "\ntransport=" + transportResult
+                + "\nlatency=" + latencyResult
+                + "\naudio=" + audioResult
+                + "\nhardwareDecode=" + hardwareResult
+                + "\nrenderMode=" + renderModeResult
+                + "\nultraLatencyLevel=" + latencyLevelResult
+                + "\nprepare=" + prepareResult
+                + "\nstart=" + startResult
+                + "\nfirstFrame=" + summarizeNativeRenderStats(renderMode, firstFrameStats)
+                + "\ncurrent=" + summarizeNativeRenderStats(renderMode, stats)
+                + "\nstats=" + stats;
+    }
+
+    private String waitForFirstFrameStats(long handle, long timeoutMs) throws InterruptedException {
+        long deadlineMs = System.currentTimeMillis() + timeoutMs;
+        String latestStats = "";
+        while (System.currentTimeMillis() < deadlineMs) {
+            latestStats = FFmpegNative.getPlayerStats(handle);
+            if (hasRenderedFrame(latestStats)) {
+                return latestStats;
+            }
+            Thread.sleep(40);
+        }
+        return latestStats;
+    }
+
+    private boolean hasRenderedFrame(String statsJson) {
+        try {
+            JSONObject stats = new JSONObject(statsJson);
+            return stats.optLong("renderedFrameCount", 0) > 0
+                    || stats.optLong("hardwareRenderedFrameCount", 0) > 0
+                    || stats.optLong("yuvGlRenderedFrameCount", 0) > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private String summarizeNativeRenderStats(String requestedMode, String statsJson) {
+        try {
+            JSONObject stats = new JSONObject(statsJson);
+            long startMs = stats.optLong("startPlayTimeMs", 0);
+            long renderMs = stats.optLong("lastRenderTimeMs", 0);
+            long firstFrameMs = startMs > 0 && renderMs >= startMs ? renderMs - startMs : -1;
+            return "{\"requestedMode\":\"" + requestedMode + "\","
+                    + "\"renderMode\":\"" + stats.optString("renderMode") + "\","
+                    + "\"usingHardwareDecoder\":" + stats.optBoolean("usingHardwareDecoder") + ","
+                    + "\"actualDecoderName\":\"" + escapeJson(stats.optString("actualDecoderName")) + "\","
+                    + "\"frameFormat\":\"" + escapeJson(stats.optString("frameFormat")) + "\","
+                    + "\"firstFrameRenderMs\":" + firstFrameMs + ","
+                    + "\"lastSwsScaleCostUs\":" + stats.optLong("lastSwsScaleCostUs", -1) + ","
+                    + "\"lastRenderCopyCostUs\":" + stats.optLong("lastRenderCopyCostUs", -1) + ","
+                    + "\"droppedVideoFrameCount\":" + stats.optLong("droppedVideoFrameCount", 0) + ","
+                    + "\"frameDropBeforeRenderCount\":" + stats.optLong("frameDropBeforeRenderCount", 0) + ","
+                    + "\"renderedFrameCount\":" + stats.optLong("renderedFrameCount", 0) + ","
+                    + "\"hardwareRenderedFrameCount\":" + stats.optLong("hardwareRenderedFrameCount", 0) + ","
+                    + "\"yuvGlRenderedFrameCount\":" + stats.optLong("yuvGlRenderedFrameCount", 0) + ","
+                    + "\"yuvGlFallbackFrameCount\":" + stats.optLong("yuvGlFallbackFrameCount", 0) + "}";
+        } catch (Exception e) {
+            return jsonError("failed to summarize stats: " + e.getMessage()) + "\nstats=" + statsJson;
+        }
+    }
+
+    private long createFreshPlayerForTest() {
+        synchronized (handleLock) {
+            if (destroyed) {
+                return 0;
+            }
+            playerHandle = FFmpegNative.createPlayer();
+            Log.d(TAG, "create test player handle=" + playerHandle);
+            postHandleLabel();
+            return playerHandle;
+        }
+    }
+
+    private String releaseCurrentPlayerForTest() {
+        long handle = takePlayerHandle();
+        if (handle == 0) {
+            return "{\"success\":true,\"message\":\"no previous player\"}";
+        }
+        String stop = FFmpegNative.stopPlayer(handle);
+        String clearSurface = FFmpegNative.clearPlayerSurface(handle);
+        String release = FFmpegNative.releasePlayer(handle);
+        return "stop=" + stop + "\nclearSurface=" + clearSurface + "\nrelease=" + release;
+    }
+
+    private String startJavaMediaCodecExperiment() {
+        releaseCurrentPlayerForTest();
+        Surface surface = currentSurface;
+        if (!surfaceReady || surface == null || !surface.isValid()) {
+            return jsonError("surface is not ready");
+        }
+        String start = javaMediaCodecExperiment.start(this, requireUrl(), surface);
+        return start + "\nstats=" + javaMediaCodecExperiment.getStats();
+    }
+
+    private void stopJavaMediaCodecExperimentQuietly() {
+        try {
+            javaMediaCodecExperiment.stop();
+        } catch (Throwable ignored) {
+        }
+    }
+
     private String selectedRtspTransport() {
         int checkedId = transportRadioGroup.getCheckedRadioButtonId();
         if (checkedId == R.id.udpTransportRadio) {
@@ -371,6 +526,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private String selectedLatencyMode() {
         int checkedId = latencyModeRadioGroup.getCheckedRadioButtonId();
+        if (checkedId == R.id.lowLatencyUltraRadio) {
+            return "ultra_low_latency";
+        }
         if (checkedId == R.id.lowLatencyRadio) {
             return "low_latency";
         }
@@ -450,6 +608,79 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return path;
     }
 
+    private String takePlayerSnapshotCompat(long handle, String outputPath) throws Exception {
+        String nativeResult = FFmpegNative.takePlayerSnapshot(handle, outputPath);
+        if (nativeResult != null && nativeResult.contains("\"success\":true")) {
+            return nativeResult;
+        }
+        if (nativeResult == null
+                || !nativeResult.contains("Snapshot is not supported")) {
+            return nativeResult;
+        }
+        return takeSurfaceSnapshotWithPixelCopy(outputPath, nativeResult);
+    }
+
+    private String takeSurfaceSnapshotWithPixelCopy(String outputPath, String nativeResult) throws Exception {
+        Surface surface = currentSurface;
+        if (!surfaceReady || surface == null || !surface.isValid()) {
+            return jsonError("PixelCopy snapshot failed: surface is not ready")
+                    + "\nnativeSnapshot=" + nativeResult;
+        }
+        int width = surfaceWidth;
+        int height = surfaceHeight;
+        if (width <= 0 || height <= 0) {
+            return jsonError("PixelCopy snapshot failed: surface size is not ready")
+                    + "\nnativeSnapshot=" + nativeResult;
+        }
+
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicInteger copyResult = new AtomicInteger(PixelCopy.ERROR_UNKNOWN);
+        mainHandler.post(() -> PixelCopy.request(surface, bitmap, result -> {
+            copyResult.set(result);
+            latch.countDown();
+        }, mainHandler));
+
+        if (!latch.await(1500, TimeUnit.MILLISECONDS)) {
+            bitmap.recycle();
+            return jsonError("PixelCopy snapshot timed out")
+                    + "\nnativeSnapshot=" + nativeResult;
+        }
+        if (copyResult.get() != PixelCopy.SUCCESS) {
+            bitmap.recycle();
+            return jsonError("PixelCopy snapshot failed result=" + copyResult.get())
+                    + "\nnativeSnapshot=" + nativeResult;
+        }
+
+        File outputFile = new File(outputPath);
+        Bitmap.CompressFormat format = isJpegPath(outputPath)
+                ? Bitmap.CompressFormat.JPEG
+                : Bitmap.CompressFormat.PNG;
+        try (OutputStream output = new FileOutputStream(outputFile)) {
+            if (!bitmap.compress(format, 95, output)) {
+                bitmap.recycle();
+                return jsonError("PixelCopy snapshot encode failed")
+                        + "\nnativeSnapshot=" + nativeResult;
+            }
+        } finally {
+            bitmap.recycle();
+        }
+
+        return "{\"success\":true,"
+                + "\"message\":\"snapshot saved by PixelCopy\","
+                + "\"outputPath\":\"" + escapeJson(outputFile.getAbsolutePath()) + "\","
+                + "\"width\":" + width + ","
+                + "\"height\":" + height + ","
+                + "\"format\":\"" + (format == Bitmap.CompressFormat.JPEG ? "jpg" : "png") + "\","
+                + "\"source\":\"pixelcopy\","
+                + "\"nativeSnapshot\":\"" + escapeJson(nativeResult) + "\"}";
+    }
+
+    private boolean isJpegPath(String path) {
+        String lower = path == null ? "" : path.toLowerCase(Locale.US);
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+    }
+
     private void ensureParentExists(String path) {
         File parent = new File(path).getParentFile();
         if (parent == null || !parent.exists()) {
@@ -465,12 +696,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return new File(dir, fileName).getAbsolutePath();
     }
 
-    private void releaseTextureSurfaceOnly() {
-        Surface oldSurface = textureSurface;
-        textureSurface = null;
-        if (oldSurface != null) {
-            oldSurface.release();
-        }
+    private void clearSurfaceReferenceOnly() {
+        currentSurface = null;
+        surfaceReady = false;
+        surfaceWidth = 0;
+        surfaceHeight = 0;
     }
 
     private void runNative(String title, NativeAction action) {
@@ -536,6 +766,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        stopJavaMediaCodecExperimentQuietly();
         long handle = takePlayerHandle();
         ExecutorService releaseWorker = worker;
         worker = null;
@@ -546,11 +777,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     Log.d(TAG, "onDestroy clearSurface=" + FFmpegNative.clearPlayerSurface(handle));
                     Log.d(TAG, "onDestroy release=" + FFmpegNative.releasePlayer(handle));
                 }
-                releaseTextureSurfaceOnly();
+                clearSurfaceReferenceOnly();
             });
             releaseWorker.shutdown();
         } else {
-            releaseTextureSurfaceOnly();
+            clearSurfaceReferenceOnly();
         }
         super.onDestroy();
     }

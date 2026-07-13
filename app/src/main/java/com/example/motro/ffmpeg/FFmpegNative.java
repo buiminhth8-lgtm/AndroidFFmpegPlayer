@@ -89,12 +89,33 @@ public final class FFmpegNative {
      * FFmpegNative.setPlayerOption(handle, "drop_late_frame_threshold_us", "150000");
      * FFmpegNative.preparePlayer(handle, rtspUrl, 3000000);
      * FFmpegNative.startPlayer(handle);
+     *
+     * FFmpeg MediaCodec Surface low latency example:
+     * long handle = FFmpegNative.createPlayer();
+     * FFmpegNative.setRtspTransport(handle, "udp");
+     * FFmpegNative.setPlayerLatencyMode(handle, "ultra_low_latency");
+     * FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
+     * FFmpegNative.setHardwareDecode(handle, true);
+     * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_surface");
+     * FFmpegNative.enableAudio(handle, false);
+     * FFmpegNative.setPlayerSurface(handle, holder.getSurface());
+     * FFmpegNative.preparePlayer(handle, rtspUrl, 5000);
+     * FFmpegNative.startPlayer(handle);
+     * String stats = FFmpegNative.getPlayerStats(handle);
+     *
+     * Software decode + OpenGL ES YUV render:
+     * FFmpegNative.setHardwareDecode(handle, false);
+     * FFmpegNative.setHardwareRenderMode(handle, "software_yuv_gl");
      */
     public static native String setRtspTransport(long handle, String transport);
 
     public static native String setPlayerLatencyMode(long handle, String mode);
 
     public static native String setPlayerOption(long handle, String key, String value);
+
+    public static native String setHardwareDecode(long handle, boolean enabled);
+
+    public static native String setHardwareRenderMode(long handle, String mode);
 
     public static native String getPlayerLatencyConfig(long handle);
 

@@ -74,6 +74,14 @@ bool parseBool(const std::string &value, bool &out) {
 void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
     out << "\"rtspTransport\":\"" << rtspTransportName(options.rtspTransport) << "\","
         << "\"latencyMode\":\"" << latencyModeName(options.latencyMode) << "\","
+        << "\"enableHardwareDecode\":" << (options.enableHardwareDecode ? "true" : "false") << ","
+        << "\"renderMode\":\"" << renderModeName(options.renderMode) << "\","
+        << "\"hardwareDecodeAllowFallback\":" << (options.hardwareDecodeAllowFallback ? "true" : "false") << ","
+        << "\"requestedDecoderName\":\"" << escapeJson(options.requestedDecoderName) << "\","
+        << "\"actualDecoderName\":\"" << escapeJson(options.actualDecoderName) << "\","
+        << "\"usingHardwareDecoder\":" << (options.usingHardwareDecoder ? "true" : "false") << ","
+        << "\"hardwareDecodeFallbackUsed\":" << (options.hardwareDecodeFallbackUsed ? "true" : "false") << ","
+        << "\"hardwareDecodeError\":\"" << escapeJson(options.hardwareDecodeError) << "\","
         << "\"openTimeoutUs\":" << options.openTimeoutUs << ","
         << "\"readTimeoutUs\":" << options.readTimeoutUs << ","
         << "\"probesize\":" << options.probesize << ","
@@ -167,6 +175,15 @@ std::string sourceTypeName(SourceType sourceType) {
     return "OTHER";
 }
 
+std::string renderModeName(RenderMode renderMode) {
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA: return "software_rgba";
+        case RenderMode::SOFTWARE_YUV_GL: return "software_yuv_gl";
+        case RenderMode::MEDIACODEC_SURFACE: return "mediacodec_surface";
+    }
+    return "software_rgba";
+}
+
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto) {
     if (options.rtspTransport == RtspTransport::AUTO) {
         return preferUdpInAuto ? "udp" : "tcp";
@@ -233,6 +250,23 @@ bool parseSyncMaster(const std::string &value, SyncMaster &syncMaster) {
     return false;
 }
 
+bool parseRenderMode(const std::string &value, RenderMode &renderMode) {
+    const std::string normalized = lowerTrim(value);
+    if (normalized == "software_rgba" || normalized == "software" || normalized == "rgba") {
+        renderMode = RenderMode::SOFTWARE_RGBA;
+        return true;
+    }
+    if (normalized == "software_yuv_gl" || normalized == "yuv_gl" || normalized == "opengl_yuv" || normalized == "gl_yuv") {
+        renderMode = RenderMode::SOFTWARE_YUV_GL;
+        return true;
+    }
+    if (normalized == "mediacodec_surface" || normalized == "mediacodec" || normalized == "surface") {
+        renderMode = RenderMode::MEDIACODEC_SURFACE;
+        return true;
+    }
+    return false;
+}
+
 PlayerOptions makePlayerOptions(RtspTransport transport, LatencyMode mode) {
     PlayerOptions options;
     options.rtspTransport = transport;
@@ -244,12 +278,27 @@ PlayerOptions makePlayerOptions(RtspTransport transport, LatencyMode mode) {
 void applyLatencyProfile(PlayerOptions &options) {
     const RtspTransport transport = options.rtspTransport;
     const LatencyMode mode = options.latencyMode;
+    const bool enableHardwareDecode = options.enableHardwareDecode;
+    const RenderMode renderMode = options.renderMode;
+    const bool hardwareDecodeAllowFallback = options.hardwareDecodeAllowFallback;
+    const std::string requestedDecoderName = options.requestedDecoderName;
+    const std::string actualDecoderName = options.actualDecoderName;
+    const bool usingHardwareDecoder = options.usingHardwareDecoder;
+    const bool hardwareDecodeFallbackUsed = options.hardwareDecodeFallbackUsed;
+    const std::string hardwareDecodeError = options.hardwareDecodeError;
     options = PlayerOptions{};
     options.rtspTransport = transport;
     options.latencyMode = mode;
+    options.enableHardwareDecode = enableHardwareDecode;
+    options.renderMode = renderMode;
+    options.hardwareDecodeAllowFallback = hardwareDecodeAllowFallback;
+    options.requestedDecoderName = requestedDecoderName;
+    options.actualDecoderName = actualDecoderName;
+    options.usingHardwareDecoder = usingHardwareDecoder;
+    options.hardwareDecodeFallbackUsed = hardwareDecodeFallbackUsed;
+    options.hardwareDecodeError = hardwareDecodeError;
 
     const bool udp = transport == RtspTransport::UDP || transport == RtspTransport::UDP_MULTICAST;
-    const bool ultraUdp = udp || transport == RtspTransport::AUTO;
 
     if (mode == LatencyMode::ULTRA_LOW_LATENCY) {
         options.openTimeoutUs = 3000000;
@@ -258,7 +307,7 @@ void applyLatencyProfile(PlayerOptions &options) {
         options.analyzeduration = 0;
         options.maxProbePackets = 32;
         options.maxDelayUs = 0;
-        options.reorderQueueSize = ultraUdp ? 0 : -1;
+        options.reorderQueueSize = udp ? 0 : -1;
         options.socketBufferSize = 262144;
         options.fflagsNoBuffer = true;
         options.avioDirect = true;
@@ -333,6 +382,10 @@ void applyLatencyProfile(PlayerOptions &options) {
 
 bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const std::string &value, std::string &errorMessage) {
     const std::string normalizedKey = lowerTrim(key);
+    int64_t parsedLong = 0;
+    int parsedInt = 0;
+    bool parsedBool = false;
+
     if (normalizedKey == "rtsp_transport") {
         RtspTransport transport;
         if (!parseRtspTransport(value, transport)) {
@@ -353,10 +406,59 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
         applyLatencyProfile(options);
         return true;
     }
-
-    int64_t parsedLong = 0;
-    int parsedInt = 0;
-    bool parsedBool = false;
+    if (normalizedKey == "enable_hardware_decode") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_hardware_decode must be boolean";
+            return false;
+        }
+        options.enableHardwareDecode = parsedBool;
+        if (!parsedBool) {
+            options.renderMode = RenderMode::SOFTWARE_RGBA;
+            options.usingHardwareDecoder = false;
+        }
+        return true;
+    }
+    if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
+        RenderMode renderMode;
+        if (!parseRenderMode(value, renderMode)) {
+            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface";
+            return false;
+        }
+        options.renderMode = renderMode;
+        if (renderMode != RenderMode::MEDIACODEC_SURFACE) {
+            options.usingHardwareDecoder = false;
+        }
+        return true;
+    }
+    if (normalizedKey == "hardware_decode_allow_fallback") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "hardware_decode_allow_fallback must be boolean";
+            return false;
+        }
+        options.hardwareDecodeAllowFallback = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "ultra_latency_level") {
+        const std::string normalizedValue = lowerTrim(value);
+        if (normalizedValue == "normal") {
+            return true;
+        }
+        if (normalizedValue == "aggressive") {
+            options.enableFrameDrop = true;
+            options.enablePacketDrop = true;
+            options.enableLatestFrameOnly = true;
+            options.dropLateFrameThresholdUs = 50000;
+            options.dropLatePacketThresholdUs = 50000;
+            return true;
+        }
+        if (normalizedValue == "relaxed") {
+            options.dropLateFrameThresholdUs = 150000;
+            options.dropLatePacketThresholdUs = 150000;
+            return true;
+        }
+        errorMessage = "ultra_latency_level must be normal, aggressive, or relaxed";
+        return false;
+    }
 
     if (normalizedKey == "probesize") {
         if (!parseInt64(value, parsedLong) || parsedLong < 0) {
@@ -518,7 +620,9 @@ std::string playerOptionsToJson(const PlayerOptions &options, SourceType sourceT
         << "\"sourceType\":\"" << sourceTypeName(sourceType) << "\","
         << "\"effectiveRtspTransport\":\"" << effectiveRtspTransportName(options, preferUdpInAuto) << "\",";
     appendOptionsJson(out, options);
-    out << ",\"effectiveSyncMaster\":\"" << escapeJson(effectiveSyncMaster) << "\"}";
+    out << ",\"effectiveSyncMaster\":\"" << escapeJson(effectiveSyncMaster) << "\","
+        << "\"preferredH264Decoder\":\"h264_mediacodec\","
+        << "\"preferredHevcDecoder\":\"hevc_mediacodec\"}";
     return out.str();
 }
 
@@ -551,6 +655,18 @@ std::string ultraLowLatencyHelpJson() {
 std::string latencyReportHelpJson() {
     return "{\"success\":true,"
            "\"fields\":{\"read\":\"last/avg/max av_read_frame cost in us\",\"decode\":\"send_packet and receive_frame/decode cost in us\",\"swsScale\":\"RGBA conversion cost in us\",\"render\":\"ANativeWindow lock/copy/post and total render cost in us\",\"frameProcess\":\"decode-to-render processing cost in us\",\"videoDelay\":\"estimated video delay relative to effective sync master in us\",\"drop\":\"packet/frame drop counters before decode/render\",\"clock\":\"sync master plus audio/video/wall clocks\",\"queue\":\"read packet and video frame queue sizes; zero for serial pipeline\"}}";
+}
+
+std::string hardwareDecodeHelpJson() {
+    return "{\"success\":true,"
+           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_surface\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_surface\","
+           "\"software_rgba\":\"FFmpeg software decode, sws_scale to RGBA, ANativeWindow RGBA copy, native snapshot supported\","
+           "\"software_yuv_gl\":\"FFmpeg software decode, render YUV420P/YUVJ420P frames with OpenGL ES shader, fallback to software_rgba for unsupported formats\","
+           "\"mediacodec_surface\":\"FFmpeg h264_mediacodec/hevc_mediacodec decode directly to Surface; no sws_scale and no RGBA memcpy\","
+           "\"snapshot\":\"native RGBA snapshot is not supported in mediacodec_surface or software_yuv_gl mode; the Java demo can use PixelCopy\","
+           "\"fallback\":\"hardware decoder missing, MediaCodec surface init failure, or avcodec_open2 failure falls back to software decode when hardwareDecodeAllowFallback is true\","
+           "\"hevc\":\"for low-latency HEVC preview, test RTSP UDP + ultra_low_latency + hevc_mediacodec first\","
+           "\"compatibility\":\"if MediaCodec compatibility is poor on a device, disable enableHardwareDecode and use software_rgba\"}";
 }
 
 std::string sourceInfoJson(const std::string &url) {

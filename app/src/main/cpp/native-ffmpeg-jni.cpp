@@ -324,6 +324,9 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     if (first == "-latency-report-help" || first == "-player-stats-help") {
         return toJString(env, latencyReportHelpJson());
     }
+    if (first == "-hardware-decode-help") {
+        return toJString(env, hardwareDecodeHelpJson());
+    }
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {
             return toJString(env, jsonError(-1, "-probe requires url"));
@@ -540,6 +543,34 @@ jstring nativeSetPlayerOption(JNIEnv *env, jclass, jlong handle, jstring key, js
     return toJString(env, player->setOption(keyValue, optionValue));
 }
 
+jstring nativeSetHardwareDecode(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setHardwareDecode(enabled == JNI_TRUE));
+}
+
+jstring nativeSetHardwareRenderMode(JNIEnv *env, jclass, jlong handle, jstring mode) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    if (mode == nullptr) {
+        return toJString(env, jsonError(-1, "mode is null"));
+    }
+
+    const char *chars = env->GetStringUTFChars(mode, nullptr);
+    if (chars == nullptr) {
+        return toJString(env, jsonError(-1, "failed to read mode"));
+    }
+    std::string modeValue(chars);
+    env->ReleaseStringUTFChars(mode, chars);
+    return toJString(env, player->setHardwareRenderMode(modeValue));
+}
+
 jstring nativeGetPlayerLatencyConfig(JNIEnv *env, jclass, jlong handle) {
     std::string error;
     NativePlayer *player = getPlayer(handle, error);
@@ -728,6 +759,8 @@ bool registerNativeMethods(JNIEnv *env) {
             {"setRtspTransport", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetRtspTransport)},
             {"setPlayerLatencyMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerLatencyMode)},
             {"setPlayerOption", "(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerOption)},
+            {"setHardwareDecode", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareDecode)},
+            {"setHardwareRenderMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareRenderMode)},
             {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},
@@ -758,7 +791,14 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     }
 
     avformat_network_init();
-    g_jni_initialized = av_jni_set_java_vm(vm, nullptr) >= 0;
+    NativePlayer::setJavaVm(vm);
+    const int setJavaVmResult = av_jni_set_java_vm(vm, nullptr);
+    g_jni_initialized = setJavaVmResult >= 0;
+    if (g_jni_initialized) {
+        LOGI("av_jni_set_java_vm success");
+    } else {
+        LOGE("av_jni_set_java_vm failed ret=%d", setJavaVmResult);
+    }
 
     if (!registerNativeMethods(env)) {
         return JNI_ERR;

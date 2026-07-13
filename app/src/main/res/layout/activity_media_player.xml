@@ -6,7 +6,7 @@
     android:background="#000000"
     android:orientation="vertical">
 
-    <TextureView
+    <SurfaceView
         android:id="@+id/playerPreviewView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
@@ -118,6 +118,13 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal">
 
+                <RadioButton
+                    android:id="@+id/lowLatencyUltraRadio"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="ultra_low_latency"
+                    android:textColor="@color/black" />
                 <RadioButton
                     android:id="@+id/lowLatencyRadio"
                     android:layout_width="0dp"
@@ -343,6 +350,60 @@
                 android:orientation="horizontal">
 
                 <Button
+                    android:id="@+id/testSoftwareRgbaButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Test RGBA" />
+
+                <Button
+                    android:id="@+id/testSoftwareYuvGlButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Test YUV GL" />
+
+                <Button
+                    android:id="@+id/testMediaCodecSurfaceButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Test HW" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/testAllRenderModesButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Compare 3" />
+
+                <Button
+                    android:id="@+id/javaCodecStartButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Java MC" />
+
+                <Button
+                    android:id="@+id/javaCodecStopButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="Stop MC" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
                     android:id="@+id/statsButton"
                     android:layout_width="0dp"
                     android:layout_height="44dp"
@@ -355,6 +416,20 @@
                     android:layout_height="44dp"
                     android:layout_weight="1"
                     android:text="Reconnect" />
+
+                <Button
+                    android:id="@+id/javaCodecStatsButton"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:text="MC Stats" />
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
 
                 <Button
                     android:id="@+id/clearLogButton"

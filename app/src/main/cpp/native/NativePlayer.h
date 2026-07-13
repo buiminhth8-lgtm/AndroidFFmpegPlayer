@@ -3,6 +3,7 @@
 
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
+#include "NativeYuvGlRenderer.h"
 #include "VideoRenderer.h"
 
 #include <jni.h>
@@ -35,6 +36,8 @@ enum class PlayerState {
 
 class NativePlayer {
 public:
+    static void setJavaVm(JavaVM *javaVm);
+
     NativePlayer();
     ~NativePlayer();
 
@@ -57,6 +60,8 @@ public:
     std::string getRtspTransportState();
     std::string setLatencyMode(const std::string &mode);
     std::string setOption(const std::string &key, const std::string &value);
+    std::string setHardwareDecode(bool enabled);
+    std::string setHardwareRenderMode(const std::string &mode);
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
@@ -76,6 +81,9 @@ private:
     bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
     bool renderFrame(AVFrame *frame);
+    bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
+    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
     bool shouldDropRealtimePacket(const AVPacket *packet);
     bool shouldDropRealtimeFrame(int64_t ptsUs);
     bool resolveMasterClockUs(const PlayerOptions &options, int64_t videoPtsUs, int64_t &masterClockUs, SyncMaster &effectiveMaster);
@@ -85,6 +93,7 @@ private:
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
+    void deleteSurfaceGlobalRefLocked(JNIEnv *env);
     void resetStats();
     void releaseFfmpegResources();
     void setState(PlayerState state, const std::string &errorMessage = "");
@@ -93,7 +102,9 @@ private:
     bool isReleased() const;
 
     mutable std::mutex mutex_;
+    mutable std::mutex surfaceMutex_;
     VideoRenderer renderer_;
+    NativeYuvGlRenderer yuvGlRenderer_;
     PlayerRemuxRecorder remuxRecorder_;
     std::thread playbackThread_;
     std::atomic<bool> stopRequested_{false};
@@ -133,6 +144,8 @@ private:
     AVFrame *latestFrame_ = nullptr;
     AVFrame *rgbaFrame_ = nullptr;
     std::vector<uint8_t> rgbaBuffer_;
+    jobject surfaceGlobalRef_ = nullptr;
+    bool mediaCodecContextInitialized_ = false;
 
     int videoStreamIndex_ = -1;
     int audioStreamIndex_ = -1;
@@ -148,6 +161,7 @@ private:
     double fps_ = 25.0;
     std::string videoCodec_;
     std::string audioCodec_;
+    std::string lastFrameFormatName_;
 
     mutable std::mutex lastFrameMutex_;
     std::vector<uint8_t> lastRgbaFrame_;
@@ -164,6 +178,13 @@ private:
     std::atomic<int64_t> audioFrameCount_{0};
     std::atomic<int64_t> renderedFrameCount_{0};
     std::atomic<int64_t> droppedVideoFrameCount_{0};
+    std::atomic<int64_t> hardwareDecodedFrameCount_{0};
+    std::atomic<int64_t> hardwareRenderedFrameCount_{0};
+    std::atomic<int64_t> hardwareDroppedFrameCount_{0};
+    std::atomic<int64_t> softwareDecodedFrameCount_{0};
+    std::atomic<int64_t> softwareRenderedFrameCount_{0};
+    std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
+    std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};

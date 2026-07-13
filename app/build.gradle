@@ -13,11 +13,11 @@ ksp {
 android.sourceSets.configureEach { it.java.srcDir("build/generated/ksp/${it.name}/kotlin/") }
 android {
     namespace 'com.example.motro'
-    compileSdk 36
+    compileSdk 34
     defaultConfig {
         applicationId "com.example.motro"
-        minSdk 31
-        targetSdk 36
+        minSdk 24
+        targetSdk 31
         versionCode 6
         versionName "1.0.0.6"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"

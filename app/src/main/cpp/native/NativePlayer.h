@@ -80,6 +80,8 @@ private:
     bool reconnectInput(int readErrorCode);
     bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
+    void beginStartupKeyFrameWait(const char *reason);
+    void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
@@ -125,6 +127,8 @@ private:
     int64_t realtimeStartWallUs_ = 0;
     int64_t lastRealtimeDropLogMs_ = 0;
     bool dropUntilKeyFrame_ = false;
+    bool startupKeyFrameWait_ = false;
+    int64_t startupKeyFrameWaitStartMs_ = 0;
     int64_t maxRealtimeLatencyUs_ = 250000;
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
@@ -194,6 +198,8 @@ private:
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};
+    std::atomic<bool> startupKeyFrameWaitActive_{false};
+    std::atomic<int64_t> startupKeyFrameDroppedPacketCount_{0};
     std::atomic<int64_t> lastFrameCacheUpdateCount_{0};
     std::atomic<int64_t> lastFrameCacheSkippedCount_{0};
     std::atomic<int64_t> lastFrameCacheCandidateCount_{0};

@@ -38,6 +38,7 @@ extern "C" {
 namespace {
 
 JavaVM *g_native_player_java_vm = nullptr;
+constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
@@ -918,6 +919,7 @@ std::string NativePlayer::start() {
         stopRequested_.store(false);
         pauseRequested_.store(false);
         resetRealtimeClock();
+        beginStartupKeyFrameWait("start");
         startPlayTimeMs_.store(nowMs());
         state_ = PlayerState::Playing;
         playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
@@ -1155,6 +1157,8 @@ std::string NativePlayer::getStats() {
         << "\"droppedVideoPacketCount\":" << droppedVideoPacketCount_.load() << ","
         << "\"packetDropBeforeDecodeCount\":" << packetDropBeforeDecodeCount_.load() << ","
         << "\"frameDropBeforeRenderCount\":" << frameDropBeforeRenderCount_.load() << ","
+        << "\"startupKeyFrameWaitActive\":" << (startupKeyFrameWaitActive_.load() ? "true" : "false") << ","
+        << "\"startupKeyFrameDroppedPacketCount\":" << startupKeyFrameDroppedPacketCount_.load() << ","
         << "\"lastFrameCacheUpdateCount\":" << lastFrameCacheUpdateCount_.load() << ","
         << "\"lastFrameCacheSkippedCount\":" << lastFrameCacheSkippedCount_.load() << ","
         << "\"readPacketQueueSize\":0,"
@@ -1652,6 +1656,32 @@ void NativePlayer::resetRealtimeClock() {
     realtimeStartWallUs_ = 0;
     lastRealtimeDropLogMs_ = 0;
     dropUntilKeyFrame_ = false;
+    startupKeyFrameWait_ = false;
+    startupKeyFrameWaitStartMs_ = 0;
+    startupKeyFrameWaitActive_.store(false);
+}
+
+void NativePlayer::beginStartupKeyFrameWait(const char *reason) {
+    if (!isRealtimeInput_ || videoStreamIndex_ < 0) {
+        return;
+    }
+    dropUntilKeyFrame_ = true;
+    startupKeyFrameWait_ = true;
+    startupKeyFrameWaitStartMs_ = nowMs();
+    startupKeyFrameWaitActive_.store(true);
+    LOGI("wait for first video keyframe reason=%s timeoutMs=%lld",
+         reason == nullptr ? "unknown" : reason,
+         static_cast<long long>(kStartupKeyFrameWaitTimeoutMs));
+}
+
+void NativePlayer::finishStartupKeyFrameWait(const char *reason) {
+    dropUntilKeyFrame_ = false;
+    startupKeyFrameWait_ = false;
+    startupKeyFrameWaitStartMs_ = 0;
+    startupKeyFrameWaitActive_.store(false);
+    resetRealtimeClock();
+    LOGI("finish first video keyframe wait reason=%s",
+         reason == nullptr ? "unknown" : reason);
 }
 
 SyncMaster NativePlayer::effectiveSyncMaster(const PlayerOptions &options) const {
@@ -1877,6 +1907,7 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
                 }
             }
             resetRealtimeClock();
+            beginStartupKeyFrameWait("reconnect");
             LOGI("reconnect success attempt=%d url=%s", attempt, url_.c_str());
             return true;
         }
@@ -1932,6 +1963,7 @@ bool NativePlayer::switchTransportInput() {
     }
 
     resetRealtimeClock();
+    beginStartupKeyFrameWait("transport_switch");
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
@@ -2046,17 +2078,31 @@ void NativePlayer::playbackLoop() {
         }
 
         if (isRealtimeInput_ && dropUntilKeyFrame_) {
+            const int64_t waitElapsedMs = startupKeyFrameWait_ && startupKeyFrameWaitStartMs_ > 0
+                                          ? nowMs() - startupKeyFrameWaitStartMs_
+                                          : 0;
+            if (startupKeyFrameWait_ && waitElapsedMs > kStartupKeyFrameWaitTimeoutMs) {
+                LOGE("first video keyframe wait timeout elapsedMs=%lld, allow decode from stream=%d key=%d",
+                     static_cast<long long>(waitElapsedMs), packet_->stream_index,
+                     (packet_->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
+                finishStartupKeyFrameWait("timeout");
+            }
+        }
+
+        if (isRealtimeInput_ && dropUntilKeyFrame_) {
             if (packet_->stream_index == videoStreamIndex_) {
                 if ((packet_->flags & AV_PKT_FLAG_KEY) == 0) {
                     droppedVideoPacketCount_.fetch_add(1);
                     packetDropBeforeDecodeCount_.fetch_add(1);
+                    if (startupKeyFrameWait_) {
+                        startupKeyFrameDroppedPacketCount_.fetch_add(1);
+                    }
                     av_packet_unref(packet_);
                     continue;
                 }
-                LOGI("realtime catch-up keyframe received, resume decode pts=%lld",
-                     static_cast<long long>(packet_->pts));
-                dropUntilKeyFrame_ = false;
-                resetRealtimeClock();
+                LOGI("realtime keyframe received, resume decode pts=%lld startupWait=%d",
+                     static_cast<long long>(packet_->pts), startupKeyFrameWait_ ? 1 : 0);
+                finishStartupKeyFrameWait(startupKeyFrameWait_ ? "keyframe" : "catchup");
             } else {
                 av_packet_unref(packet_);
                 continue;
@@ -2474,6 +2520,8 @@ void NativePlayer::resetStats() {
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);
+    startupKeyFrameWaitActive_.store(false);
+    startupKeyFrameDroppedPacketCount_.store(0);
     lastFrameCacheUpdateCount_.store(0);
     lastFrameCacheSkippedCount_.store(0);
     lastFrameCacheCandidateCount_.store(0);

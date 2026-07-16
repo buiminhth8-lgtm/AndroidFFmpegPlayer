@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace 'com.example.motro.ffmpeg'
-    compileSdk 34
+    compileSdk 36
 
     defaultConfig {
         minSdk 24
@@ -22,6 +22,7 @@ android {
             java {
                 srcDirs = ['../app/src/main/java']
                 exclude 'com/example/motro/MediaPlayerActivity.java'
+                exclude 'com/example/motro/MediacodecPlayerActivity.java'
             }
             jniLibs.srcDirs = ['../app/src/main/jniLibs']
         }

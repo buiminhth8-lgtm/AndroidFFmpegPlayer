@@ -165,6 +165,13 @@
                     android:textColor="@color/black" />
             </RadioGroup>
 
+            <Switch
+                android:id="@+id/hardwareDecodeSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:text="Hardware Decode"
+                android:textColor="@color/black" />
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -364,60 +371,6 @@
                 android:orientation="horizontal">
 
                 <Button
-                    android:id="@+id/testSoftwareRgbaButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Test RGBA" />
-
-                <Button
-                    android:id="@+id/testSoftwareYuvGlButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Test YUV GL" />
-
-                <Button
-                    android:id="@+id/testMediaCodecSurfaceButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Test HW" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
-                    android:id="@+id/testAllRenderModesButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Compare 3" />
-
-                <Button
-                    android:id="@+id/javaCodecStartButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Java MC" />
-
-                <Button
-                    android:id="@+id/javaCodecStopButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="Stop MC" />
-            </LinearLayout>
-
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="horizontal">
-
-                <Button
                     android:id="@+id/statsButton"
                     android:layout_width="0dp"
                     android:layout_height="44dp"
@@ -430,13 +383,6 @@
                     android:layout_height="44dp"
                     android:layout_weight="1"
                     android:text="Reconnect" />
-
-                <Button
-                    android:id="@+id/javaCodecStatsButton"
-                    android:layout_width="0dp"
-                    android:layout_height="44dp"
-                    android:layout_weight="1"
-                    android:text="MC Stats" />
 
             </LinearLayout>
 

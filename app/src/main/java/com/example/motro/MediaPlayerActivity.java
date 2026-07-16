@@ -1,6 +1,7 @@
 package com.example.motro;
 
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.Handler;
@@ -23,7 +24,6 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.example.motro.databinding.ActivityMediaPlayerBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
-import com.example.motro.ffmpeg.JavaMediaCodecExperiment;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -50,7 +50,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final JavaMediaCodecExperiment javaMediaCodecExperiment = new JavaMediaCodecExperiment();
     private final AtomicBoolean playbackInfoRequestInFlight = new AtomicBoolean(false);
     private final Runnable playbackInfoRunnable = new Runnable() {
         @Override
@@ -71,6 +70,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private EditText snapshotPathEditText;
     private Switch audioSwitch;
     private Switch reconnectSwitch;
+    private Switch hardwareDecodeSwitch;
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
     private TextView handleTextView;
@@ -95,6 +95,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        startActivity(new Intent(MediaPlayerActivity.this,MediacodecPlayerActivity.class));
+        finish();
+
         binding = ActivityMediaPlayerBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
 
@@ -118,6 +121,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         snapshotPathEditText = findViewById(R.id.snapshotPathEditText);
         audioSwitch = findViewById(R.id.audioSwitch);
         reconnectSwitch = findViewById(R.id.reconnectSwitch);
+        hardwareDecodeSwitch = findViewById(R.id.hardwareDecodeSwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
         handleTextView = findViewById(R.id.handleTextView);
@@ -130,6 +134,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
+        hardwareDecodeSwitch.setChecked(false);
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
@@ -156,7 +161,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
             @Override
             public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
-                stopJavaMediaCodecExperimentQuietly();
                 surfaceReady = false;
                 surfaceWidth = 0;
                 surfaceHeight = 0;
@@ -179,18 +183,23 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void bindActions() {
         findViewById(R.id.createButton).setOnClickListener(v -> runNative("Create Player", () -> {
+            boolean newlyCreated = getPlayerHandle() == 0;
             long handle = ensurePlayer();
             String surfaceResult = bindSurfaceIfReady(handle);
             String transportResult = applyRtspTransport(handle);
             String latencyResult = applyLatencyMode(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
+            String decodeResult = newlyCreated
+                    ? applyDecodeModeOption(handle)
+                    : "{\"success\":true,\"message\":\"player already exists, decode mode unchanged until next prepare\"}";
             return "{\"success\":true,\"handle\":" + handle + "}"
                     + "\nsurface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
-                    + "\naudio=" + audioResult;
+                    + "\naudio=" + audioResult
+                    + "\ndecode=" + decodeResult;
         }));
 
         findViewById(R.id.infoButton).setOnClickListener(v -> runNative("FFmpeg Info", () ->
@@ -209,12 +218,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String latencyResult = applyLatencyMode(handle);
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
+            String decodeResult = applyDecodeModeOption(handle);
             String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
+                    + "\ndecode=" + decodeResult
                     + "\nprepare=" + prepareResult;
         }));
 
@@ -266,23 +277,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.reconnectStateButton).setOnClickListener(v -> runNative("Reconnect/Latency State", () ->
                 FFmpegNative.getPlayerReconnectState(requireHandle())
                         + "\nlatency=" + FFmpegNative.getPlayerLatencyConfig(requireHandle())));
-
-        findViewById(R.id.testSoftwareRgbaButton).setOnClickListener(v -> runNative("Test software_rgba", () ->
-                runNativeRenderModeTest("software_rgba", false)));
-
-        findViewById(R.id.testSoftwareYuvGlButton).setOnClickListener(v -> runNative("Test software_yuv_gl", () ->
-                runNativeRenderModeTest("software_yuv_gl", false)));
-
-        findViewById(R.id.testMediaCodecSurfaceButton).setOnClickListener(v -> runNative("Test mediacodec_surface", () ->
-                runNativeRenderModeTest("mediacodec_surface", true)));
-
-        findViewById(R.id.testAllRenderModesButton).setOnClickListener(v -> runNative("Compare render modes", this::runAllNativeRenderModeTests));
-
-        findViewById(R.id.javaCodecStartButton).setOnClickListener(v -> runNative("Java MediaCodec Start", this::startJavaMediaCodecExperiment));
-
-        findViewById(R.id.javaCodecStatsButton).setOnClickListener(v -> runNative("Java MediaCodec Stats", javaMediaCodecExperiment::getStats));
-
-        findViewById(R.id.javaCodecStopButton).setOnClickListener(v -> runNative("Java MediaCodec Stop", javaMediaCodecExperiment::stop));
 
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
                 FFmpegNative.clearPlayerSurface(requireHandle())));
@@ -551,134 +545,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return FFmpegNative.setPlayerLatencyMode(handle, selectedLatencyMode());
     }
 
-    private String runAllNativeRenderModeTests() throws Exception {
-        StringBuilder out = new StringBuilder();
-        out.append(runNativeRenderModeTest("software_rgba", false));
-        out.append("\n\n").append(runNativeRenderModeTest("software_yuv_gl", false));
-        out.append("\n\n").append(runNativeRenderModeTest("mediacodec_surface", true));
-        return out.toString();
-    }
-
-    private String runNativeRenderModeTest(String renderMode, boolean hardwareDecode) throws Exception {
-        stopJavaMediaCodecExperimentQuietly();
-        String releaseResult = releaseCurrentPlayerForTest();
-
-        long handle = createFreshPlayerForTest();
-        String surfaceResult = bindSurfaceIfReady(handle);
-        String transportResult = applyRtspTransport(handle);
-        String latencyResult = applyLatencyMode(handle);
-        String audioResult = FFmpegNative.enableAudio(handle, false);
-        String hardwareResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
-        String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
-        String latencyLevelResult = FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
-        String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
-        String startResult = FFmpegNative.startPlayer(handle);
-        String firstFrameStats = waitForFirstFrameStats(handle, 2500);
-        String stats = FFmpegNative.getPlayerStats(handle);
-
-        return "mode=" + renderMode
-                + "\nreleasePrevious=" + releaseResult
-                + "\nsurface=" + surfaceResult
-                + "\ntransport=" + transportResult
-                + "\nlatency=" + latencyResult
-                + "\naudio=" + audioResult
-                + "\nhardwareDecode=" + hardwareResult
-                + "\nrenderMode=" + renderModeResult
-                + "\nultraLatencyLevel=" + latencyLevelResult
-                + "\nprepare=" + prepareResult
-                + "\nstart=" + startResult
-                + "\nfirstFrame=" + summarizeNativeRenderStats(renderMode, firstFrameStats)
-                + "\ncurrent=" + summarizeNativeRenderStats(renderMode, stats)
-                + "\nstats=" + stats;
-    }
-
-    private String waitForFirstFrameStats(long handle, long timeoutMs) throws InterruptedException {
-        long deadlineMs = System.currentTimeMillis() + timeoutMs;
-        String latestStats = "";
-        while (System.currentTimeMillis() < deadlineMs) {
-            latestStats = FFmpegNative.getPlayerStats(handle);
-            if (hasRenderedFrame(latestStats)) {
-                return latestStats;
-            }
-            Thread.sleep(40);
-        }
-        return latestStats;
-    }
-
-    private boolean hasRenderedFrame(String statsJson) {
-        try {
-            JSONObject stats = new JSONObject(statsJson);
-            return stats.optLong("renderedFrameCount", 0) > 0
-                    || stats.optLong("hardwareRenderedFrameCount", 0) > 0
-                    || stats.optLong("yuvGlRenderedFrameCount", 0) > 0;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private String summarizeNativeRenderStats(String requestedMode, String statsJson) {
-        try {
-            JSONObject stats = new JSONObject(statsJson);
-            long startMs = stats.optLong("startPlayTimeMs", 0);
-            long renderMs = stats.optLong("lastRenderTimeMs", 0);
-            long firstFrameMs = startMs > 0 && renderMs >= startMs ? renderMs - startMs : -1;
-            return "{\"requestedMode\":\"" + requestedMode + "\","
-                    + "\"renderMode\":\"" + stats.optString("renderMode") + "\","
-                    + "\"usingHardwareDecoder\":" + stats.optBoolean("usingHardwareDecoder") + ","
-                    + "\"actualDecoderName\":\"" + escapeJson(stats.optString("actualDecoderName")) + "\","
-                    + "\"frameFormat\":\"" + escapeJson(stats.optString("frameFormat")) + "\","
-                    + "\"firstFrameRenderMs\":" + firstFrameMs + ","
-                    + "\"lastSwsScaleCostUs\":" + stats.optLong("lastSwsScaleCostUs", -1) + ","
-                    + "\"lastRenderCopyCostUs\":" + stats.optLong("lastRenderCopyCostUs", -1) + ","
-                    + "\"droppedVideoFrameCount\":" + stats.optLong("droppedVideoFrameCount", 0) + ","
-                    + "\"frameDropBeforeRenderCount\":" + stats.optLong("frameDropBeforeRenderCount", 0) + ","
-                    + "\"renderedFrameCount\":" + stats.optLong("renderedFrameCount", 0) + ","
-                    + "\"hardwareRenderedFrameCount\":" + stats.optLong("hardwareRenderedFrameCount", 0) + ","
-                    + "\"yuvGlRenderedFrameCount\":" + stats.optLong("yuvGlRenderedFrameCount", 0) + ","
-                    + "\"yuvGlFallbackFrameCount\":" + stats.optLong("yuvGlFallbackFrameCount", 0) + "}";
-        } catch (Exception e) {
-            return jsonError("failed to summarize stats: " + e.getMessage()) + "\nstats=" + statsJson;
-        }
-    }
-
-    private long createFreshPlayerForTest() {
-        synchronized (handleLock) {
-            if (destroyed) {
-                return 0;
-            }
-            playerHandle = FFmpegNative.createPlayer();
-            Log.d(TAG, "create test player handle=" + playerHandle);
-            postHandleLabel();
-            return playerHandle;
-        }
-    }
-
-    private String releaseCurrentPlayerForTest() {
-        long handle = takePlayerHandle();
+    private String applyDecodeModeOption(long handle) {
         if (handle == 0) {
-            return "{\"success\":true,\"message\":\"no previous player\"}";
+            return jsonError("player handle is 0");
         }
-        String stop = FFmpegNative.stopPlayer(handle);
-        String clearSurface = FFmpegNative.clearPlayerSurface(handle);
-        String release = FFmpegNative.releasePlayer(handle);
-        return "stop=" + stop + "\nclearSurface=" + clearSurface + "\nrelease=" + release;
-    }
-
-    private String startJavaMediaCodecExperiment() {
-        releaseCurrentPlayerForTest();
-        Surface surface = currentSurface;
-        if (!surfaceReady || surface == null || !surface.isValid()) {
-            return jsonError("surface is not ready");
-        }
-        String start = javaMediaCodecExperiment.start(this, requireUrl(), surface);
-        return start + "\nstats=" + javaMediaCodecExperiment.getStats();
-    }
-
-    private void stopJavaMediaCodecExperimentQuietly() {
-        try {
-            javaMediaCodecExperiment.stop();
-        } catch (Throwable ignored) {
-        }
+        boolean hardwareDecode = hardwareDecodeSwitch.isChecked();
+        String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
+        String renderMode = hardwareDecode ? "mediacodec_surface" : "software_rgba";
+        String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
+        return "hardwareDecode=" + decodeResult
+                + "\nrenderMode=" + renderModeResult;
     }
 
     private String selectedRtspTransport() {
@@ -936,7 +812,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         destroyed = true;
         mainHandler.removeCallbacks(playbackInfoRunnable);
         playbackInfoRequestInFlight.set(false);
-        stopJavaMediaCodecExperimentQuietly();
         long handle = takePlayerHandle();
         ExecutorService releaseWorker = worker;
         worker = null;

@@ -401,10 +401,19 @@ String result = FFmpegNative.takePlayerSnapshot(handle, snapshotPath);
 
 | API | 含义 | 备注 |
 | --- | --- | --- |
-| `setPlayerReconnectOptions(long handle, boolean enabled, int maxRetryCount, int retryDelayMs)` | 设置断流重连策略。 | `maxRetryCount` 会限制在 0 到 100；`retryDelayMs` 会限制在 100 到 60000。 |
-| `getPlayerReconnectState(long handle)` | 查询重连状态。 | 包含 enabled、reconnecting、attemptCount、successCount、lastReconnectError 等。 |
+| `setPlayerReconnectOptions(long handle, boolean enabled, int maxRetryCount, int retryDelayMs)` | 设置断流重连策略。 | `maxRetryCount=-1` 表示无限重连；`retryDelayMs` 会限制在 100 到 60000。 |
+| `getPlayerReconnectState(long handle)` | 查询重连状态。 | 包含 enabled、reconnecting、waitingSource、attemptCount、successCount、lastReconnectError 等。 |
 
-当前重连是基础策略：`av_read_frame` 出错后按配置重开输入，不做复杂网络质量评估。
+当前重连策略：`av_read_frame` 返回 EOF 后进入 `DISCONNECTED/RECONNECTING`，重新打开 RTSP；如果 MediaMTX 在推流未恢复前返回 `404 Not Found`，播放器进入 `WAITING_SOURCE` 并继续等待，不释放 player handle。推流恢复后会重新打开输入、重建 decoder/sws/MediaCodec context、等待首个关键帧，再回到 `PLAYING`。
+
+可通过 `setPlayerOption` 调整：
+
+| key | value | 含义 |
+| --- | --- | --- |
+| `infinite_reconnect` | `true` / `false` | 是否无限重连，默认 `true`。 |
+| `reconnect_on_404` | `true` / `false` | RTSP open 返回 404/Not Found 时是否继续等待，默认 `true`。 |
+| `keep_waiting_when_source_missing` | `true` / `false` | 源不存在、连接拒绝、超时等 transient 错误是否保持等待，默认 `true`。 |
+| `reconnect_max_delay_ms` | int | 重连退避最大延迟，默认 `5000`。 |
 
 ### RTSP transport 和低延迟 API
 
@@ -543,3 +552,182 @@ FFmpegNative.startPlayer(handle);
 - 增强断流自动重连和状态恢复。
 - 增加录制分片索引和异常恢复。
 - 增加 MediaCodec 硬解码低延迟模式。
+## V11 FFmpeg MediaCodec Surface 硬解码
+
+V11 增加 FFmpeg `h264_mediacodec` / `hevc_mediacodec` 硬解码到 Android `Surface` 的渲染路径。默认仍然是 `software_rgba`，不会自动启用硬解码。
+
+### 开启方式
+
+```java
+long handle = FFmpegNative.createPlayer();
+
+FFmpegNative.setRtspTransport(handle, "udp");
+FFmpegNative.setPlayerLatencyMode(handle, "ultra_low_latency");
+FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
+
+FFmpegNative.setHardwareDecode(handle, true);
+FFmpegNative.setHardwareRenderMode(handle, "mediacodec_surface");
+
+// 硬解低延迟预览建议关闭音频播放
+FFmpegNative.enableAudio(handle, false);
+
+FFmpegNative.setPlayerSurface(handle, holder.getSurface());
+FFmpegNative.preparePlayer(handle, rtspUrl, 5000);
+FFmpegNative.startPlayer(handle);
+
+String stats = FFmpegNative.getPlayerStats(handle);
+```
+
+也可以使用 `setPlayerOption`：
+
+```java
+FFmpegNative.setPlayerOption(handle, "enable_hardware_decode", "true");
+FFmpegNative.setPlayerOption(handle, "hardware_render_mode", "mediacodec_surface");
+```
+
+新增 Java API：
+
+```java
+public static native String setHardwareDecode(long handle, boolean enabled);
+public static native String setHardwareRenderMode(long handle, String mode);
+```
+
+### 渲染模式
+
+| mode | 说明 |
+| --- | --- |
+| `software_rgba` | 兼容性最好。FFmpeg 软件解码后通过 `sws_scale` 转 RGBA，再用 `ANativeWindow_lock` / RGBA copy / `unlockAndPost` 渲染。支持 native RGBA snapshot。 |
+| `mediacodec_surface` | 使用 FFmpeg MediaCodec decoder 输出到 `Surface`，绕过 `sws_scale` 和 RGBA memcpy，低延迟更好。第一版不支持 native RGBA snapshot。 |
+
+支持 decoder：
+
+| 视频编码 | 优先 decoder |
+| --- | --- |
+| H.264 | `h264_mediacodec` |
+| H.265 / HEVC | `hevc_mediacodec` |
+
+硬解失败会自动 fallback 到软件解码路径，并把 `renderMode` 回到 `software_rgba`。常见 fallback 场景包括：设备没有对应 `*_mediacodec` decoder、`av_mediacodec_default_init` 失败、`avcodec_open2` 硬解失败。
+
+### 低延迟建议
+
+- RTSP 优先测试 `udp + ultra_low_latency + mediacodec_surface`。
+- HEVC 源优先测试 `hevc_mediacodec`。
+- 如果设备 MediaCodec 兼容性不好，关闭 `enableHardwareDecode` 回到 `software_rgba`。
+- 当前仍由 FFmpeg demux / remux，不是 Android `MediaPlayer`，也不接入 ExoPlayer。
+
+### 截图限制
+
+`mediacodec_surface` 模式下 native 不再持有 RGBA 帧，因此第一版 `takePlayerSnapshot` 会返回：
+
+```json
+{
+  "success": false,
+  "errorMessage": "Snapshot is not supported in mediacodec_surface mode yet. Use software_rgba mode or implement PixelCopy."
+}
+```
+
+当前 Demo 的截图按钮已经做了兼容处理：先调用 native `takePlayerSnapshot`；如果返回 `mediacodec_surface` 不支持 native RGBA snapshot，则自动使用 Java `PixelCopy` 从当前 `Surface` 复制画面并保存为 PNG/JPG。native API 本身仍保持保守，不会从 `AV_PIX_FMT_MEDIACODEC` 帧读取 YUV，也不会为了截图强制回退软件解码。
+
+### 统计字段
+
+`getPlayerStats` 增加：
+
+```json
+{
+  "enableHardwareDecode": true,
+  "renderMode": "mediacodec_surface",
+  "requestedDecoderName": "hevc_mediacodec",
+  "actualDecoderName": "hevc_mediacodec",
+  "usingHardwareDecoder": true,
+  "hardwareDecodeFallbackUsed": false,
+  "hardwareDecodeError": "",
+  "videoCodecName": "hevc",
+  "decoderName": "hevc_mediacodec",
+  "frameFormat": "mediacodec",
+  "hardwareDecodedFrameCount": 100,
+  "hardwareRenderedFrameCount": 100,
+  "hardwareDroppedFrameCount": 0,
+  "softwareDecodedFrameCount": 0,
+  "softwareRenderedFrameCount": 0,
+  "swsScaleEnabled": false,
+  "lastSwsScaleCostUs": -1,
+  "lastRenderCopyCostUs": -1,
+  "snapshotSupported": false
+}
+```
+
+`getPlayerLatencyConfig` 增加：
+
+```json
+{
+  "enableHardwareDecode": true,
+  "renderMode": "mediacodec_surface",
+  "hardwareDecodeAllowFallback": true,
+  "preferredH264Decoder": "h264_mediacodec",
+  "preferredHevcDecoder": "hevc_mediacodec"
+}
+```
+
+`runDebugCommand(new String[]{"-hardware-decode-help"})` 可查看硬解开启方式、两种渲染模式区别、fallback 行为和 snapshot 限制。
+
+## V12 OpenGL ES YUV 渲染和 Java MediaCodec 实验
+
+### software_yuv_gl 渲染模式
+
+V12 增加 `software_yuv_gl` 作为软件解码优化路径：
+
+```java
+long handle = FFmpegNative.createPlayer();
+FFmpegNative.setHardwareDecode(handle, false);
+FFmpegNative.setHardwareRenderMode(handle, "software_yuv_gl");
+FFmpegNative.setPlayerSurface(handle, holder.getSurface());
+FFmpegNative.preparePlayer(handle, url, 5000);
+FFmpegNative.startPlayer(handle);
+```
+
+也可以用 option：
+
+```java
+FFmpegNative.setPlayerOption(handle, "hardware_render_mode", "software_yuv_gl");
+```
+
+行为说明：
+
+- FFmpeg 仍负责 demux 和软件解码。
+- 对 `YUV420P` / `YUVJ420P` 帧，native 直接上传 Y/U/V 三个平面到 OpenGL ES 纹理，通过 shader 转 RGB 并渲染到同一个 `Surface`。
+- 不走 `sws_scale`，不做 RGBA frame copy。
+- 如果帧格式不是当前 GL 路径支持的 8-bit 420 planar YUV，自动 fallback 到原 `software_rgba` 渲染。
+- native RGBA snapshot 在 `software_yuv_gl` 下不支持；Demo 按钮会自动使用 Java `PixelCopy` 截图。
+
+`getPlayerStats` 新增/可观察字段：
+
+```json
+{
+  "renderMode": "software_yuv_gl",
+  "swsScaleEnabled": false,
+  "snapshotSupported": false,
+  "yuvGlRenderedFrameCount": 100,
+  "yuvGlFallbackFrameCount": 0,
+  "lastSwsScaleCostUs": -1,
+  "lastRenderCopyCostUs": 900
+}
+```
+
+### Java MediaCodec 独立解码链路实验
+
+新增 `com.example.motro.ffmpeg.JavaMediaCodecExperiment`，用于和 FFmpeg NativePlayer 做设备硬解行为对照。它使用 Android `MediaExtractor + MediaCodec + Surface`，不接入 ExoPlayer，不接入 Android `MediaPlayer`，也不影响当前 FFmpeg 播放/录制主链路。
+
+示例：
+
+```java
+JavaMediaCodecExperiment experiment = new JavaMediaCodecExperiment();
+String start = experiment.start(context, videoUrlOrFileUri, holder.getSurface());
+String stats = experiment.getStats();
+String stop = experiment.stop();
+```
+
+限制：
+
+- 这是实验链路，不提供 remux 录制、RTSP 低延迟参数、packet drop/frame drop、AudioTrack 封装。
+- 输入源支持取决于 Android `MediaExtractor`，RTSP 兼容性不作为主链路保证。
+- 用途是快速验证设备 Java MediaCodec decoder、Surface 渲染和基础耗时/计数。

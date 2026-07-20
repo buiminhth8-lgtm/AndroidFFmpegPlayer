@@ -8,10 +8,18 @@
 
 struct ANativeWindow;
 
+struct RenderStats {
+    int64_t totalCostUs = 0;
+    int64_t lockCostUs = 0;
+    int64_t copyCostUs = 0;
+    int64_t postCostUs = 0;
+};
+
 struct RenderResult {
     bool success;
     int errorCode;
     std::string errorMessage;
+    RenderStats stats;
 };
 
 class VideoRenderer {

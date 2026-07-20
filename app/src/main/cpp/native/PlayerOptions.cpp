@@ -74,6 +74,21 @@ bool parseBool(const std::string &value, bool &out) {
 void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
     out << "\"rtspTransport\":\"" << rtspTransportName(options.rtspTransport) << "\","
         << "\"latencyMode\":\"" << latencyModeName(options.latencyMode) << "\","
+        << "\"enableHardwareDecode\":" << (options.enableHardwareDecode ? "true" : "false") << ","
+        << "\"renderMode\":\"" << renderModeName(options.renderMode) << "\","
+        << "\"hardwareDecodeAllowFallback\":" << (options.hardwareDecodeAllowFallback ? "true" : "false") << ","
+        << "\"infiniteReconnect\":" << (options.infiniteReconnect ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (options.reconnectOnEof ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (options.reconnectOn404 ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (options.keepWaitingWhenSourceMissing ? "true" : "false") << ","
+        << "\"reconnectInitialDelayMs\":" << options.reconnectInitialDelayMs << ","
+        << "\"reconnectMaxDelayMs\":" << options.reconnectMaxDelayMs << ","
+        << "\"reconnectMaxRetry\":" << options.reconnectMaxRetry << ","
+        << "\"requestedDecoderName\":\"" << escapeJson(options.requestedDecoderName) << "\","
+        << "\"actualDecoderName\":\"" << escapeJson(options.actualDecoderName) << "\","
+        << "\"usingHardwareDecoder\":" << (options.usingHardwareDecoder ? "true" : "false") << ","
+        << "\"hardwareDecodeFallbackUsed\":" << (options.hardwareDecodeFallbackUsed ? "true" : "false") << ","
+        << "\"hardwareDecodeError\":\"" << escapeJson(options.hardwareDecodeError) << "\","
         << "\"openTimeoutUs\":" << options.openTimeoutUs << ","
         << "\"readTimeoutUs\":" << options.readTimeoutUs << ","
         << "\"probesize\":" << options.probesize << ","
@@ -89,7 +104,12 @@ void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
         << "\"decoderThreadCount\":" << options.decoderThreadCount << ","
         << "\"enableFrameDrop\":" << (options.enableFrameDrop ? "true" : "false") << ","
         << "\"dropLateFrameThresholdUs\":" << options.dropLateFrameThresholdUs << ","
-        << "\"skipNonRef\":" << (options.skipNonRef ? "true" : "false");
+        << "\"enablePacketDrop\":" << (options.enablePacketDrop ? "true" : "false") << ","
+        << "\"dropLatePacketThresholdUs\":" << options.dropLatePacketThresholdUs << ","
+        << "\"enableLatestFrameOnly\":" << (options.enableLatestFrameOnly ? "true" : "false") << ","
+        << "\"syncMaster\":\"" << syncMasterName(options.syncMaster) << "\","
+        << "\"skipNonRef\":" << (options.skipNonRef ? "true" : "false") << ","
+        << "\"cacheLastFrameEveryN\":" << options.cacheLastFrameEveryN;
 }
 
 } // namespace
@@ -134,10 +154,20 @@ std::string rtspTransportName(RtspTransport transport) {
 std::string latencyModeName(LatencyMode mode) {
     switch (mode) {
         case LatencyMode::LOW_LATENCY: return "low_latency";
+        case LatencyMode::ULTRA_LOW_LATENCY: return "ultra_low_latency";
         case LatencyMode::BALANCED: return "balanced";
         case LatencyMode::STABLE: return "stable";
     }
     return "balanced";
+}
+
+std::string syncMasterName(SyncMaster syncMaster) {
+    switch (syncMaster) {
+        case SyncMaster::AUDIO: return "audio";
+        case SyncMaster::VIDEO: return "video";
+        case SyncMaster::WALL_CLOCK: return "wall_clock";
+    }
+    return "audio";
 }
 
 std::string sourceTypeName(SourceType sourceType) {
@@ -150,6 +180,15 @@ std::string sourceTypeName(SourceType sourceType) {
         case SourceType::OTHER: return "OTHER";
     }
     return "OTHER";
+}
+
+std::string renderModeName(RenderMode renderMode) {
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA: return "software_rgba";
+        case RenderMode::SOFTWARE_YUV_GL: return "software_yuv_gl";
+        case RenderMode::MEDIACODEC_SURFACE: return "mediacodec_surface";
+    }
+    return "software_rgba";
 }
 
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto) {
@@ -186,12 +225,50 @@ bool parseLatencyMode(const std::string &value, LatencyMode &mode) {
         mode = LatencyMode::LOW_LATENCY;
         return true;
     }
+    if (normalized == "ultra_low_latency" || normalized == "ultra" || normalized == "ull") {
+        mode = LatencyMode::ULTRA_LOW_LATENCY;
+        return true;
+    }
     if (normalized == "balanced" || normalized == "balance") {
         mode = LatencyMode::BALANCED;
         return true;
     }
     if (normalized == "stable" || normalized == "stability") {
         mode = LatencyMode::STABLE;
+        return true;
+    }
+    return false;
+}
+
+bool parseSyncMaster(const std::string &value, SyncMaster &syncMaster) {
+    const std::string normalized = lowerTrim(value);
+    if (normalized == "audio") {
+        syncMaster = SyncMaster::AUDIO;
+        return true;
+    }
+    if (normalized == "video") {
+        syncMaster = SyncMaster::VIDEO;
+        return true;
+    }
+    if (normalized == "wall_clock" || normalized == "wallclock" || normalized == "clock") {
+        syncMaster = SyncMaster::WALL_CLOCK;
+        return true;
+    }
+    return false;
+}
+
+bool parseRenderMode(const std::string &value, RenderMode &renderMode) {
+    const std::string normalized = lowerTrim(value);
+    if (normalized == "software_rgba" || normalized == "software" || normalized == "rgba") {
+        renderMode = RenderMode::SOFTWARE_RGBA;
+        return true;
+    }
+    if (normalized == "software_yuv_gl" || normalized == "yuv_gl" || normalized == "opengl_yuv" || normalized == "gl_yuv") {
+        renderMode = RenderMode::SOFTWARE_YUV_GL;
+        return true;
+    }
+    if (normalized == "mediacodec_surface" || normalized == "mediacodec" || normalized == "surface") {
+        renderMode = RenderMode::MEDIACODEC_SURFACE;
         return true;
     }
     return false;
@@ -208,11 +285,66 @@ PlayerOptions makePlayerOptions(RtspTransport transport, LatencyMode mode) {
 void applyLatencyProfile(PlayerOptions &options) {
     const RtspTransport transport = options.rtspTransport;
     const LatencyMode mode = options.latencyMode;
+    const bool enableHardwareDecode = options.enableHardwareDecode;
+    const RenderMode renderMode = options.renderMode;
+    const bool hardwareDecodeAllowFallback = options.hardwareDecodeAllowFallback;
+    const std::string requestedDecoderName = options.requestedDecoderName;
+    const std::string actualDecoderName = options.actualDecoderName;
+    const bool usingHardwareDecoder = options.usingHardwareDecoder;
+    const bool hardwareDecodeFallbackUsed = options.hardwareDecodeFallbackUsed;
+    const std::string hardwareDecodeError = options.hardwareDecodeError;
+    const bool infiniteReconnect = options.infiniteReconnect;
+    const bool reconnectOnEof = options.reconnectOnEof;
+    const bool reconnectOn404 = options.reconnectOn404;
+    const bool keepWaitingWhenSourceMissing = options.keepWaitingWhenSourceMissing;
+    const int reconnectInitialDelayMs = options.reconnectInitialDelayMs;
+    const int reconnectMaxDelayMs = options.reconnectMaxDelayMs;
+    const int reconnectMaxRetry = options.reconnectMaxRetry;
     options = PlayerOptions{};
     options.rtspTransport = transport;
     options.latencyMode = mode;
+    options.enableHardwareDecode = enableHardwareDecode;
+    options.renderMode = renderMode;
+    options.hardwareDecodeAllowFallback = hardwareDecodeAllowFallback;
+    options.requestedDecoderName = requestedDecoderName;
+    options.actualDecoderName = actualDecoderName;
+    options.usingHardwareDecoder = usingHardwareDecoder;
+    options.hardwareDecodeFallbackUsed = hardwareDecodeFallbackUsed;
+    options.hardwareDecodeError = hardwareDecodeError;
+    options.infiniteReconnect = infiniteReconnect;
+    options.reconnectOnEof = reconnectOnEof;
+    options.reconnectOn404 = reconnectOn404;
+    options.keepWaitingWhenSourceMissing = keepWaitingWhenSourceMissing;
+    options.reconnectInitialDelayMs = reconnectInitialDelayMs;
+    options.reconnectMaxDelayMs = reconnectMaxDelayMs;
+    options.reconnectMaxRetry = reconnectMaxRetry;
 
     const bool udp = transport == RtspTransport::UDP || transport == RtspTransport::UDP_MULTICAST;
+
+    if (mode == LatencyMode::ULTRA_LOW_LATENCY) {
+        options.openTimeoutUs = 3000000;
+        options.readTimeoutUs = 3000000;
+        options.probesize = 32768;
+        options.analyzeduration = 0;
+        options.maxProbePackets = 32;
+        options.maxDelayUs = 0;
+        options.reorderQueueSize = udp ? 0 : -1;
+        options.socketBufferSize = 262144;
+        options.fflagsNoBuffer = true;
+        options.avioDirect = true;
+        options.lowDelayDecode = true;
+        options.tcpNoDelay = true;
+        options.enableFrameDrop = true;
+        options.enablePacketDrop = true;
+        options.enableLatestFrameOnly = true;
+        options.decoderThreadCount = 1;
+        options.dropLateFrameThresholdUs = 80000;
+        options.dropLatePacketThresholdUs = 80000;
+        options.syncMaster = SyncMaster::VIDEO;
+        options.skipNonRef = false;
+        options.cacheLastFrameEveryN = 1;
+        return;
+    }
 
     if (mode == LatencyMode::LOW_LATENCY) {
         options.openTimeoutUs = 3000000;
@@ -271,6 +403,10 @@ void applyLatencyProfile(PlayerOptions &options) {
 
 bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const std::string &value, std::string &errorMessage) {
     const std::string normalizedKey = lowerTrim(key);
+    int64_t parsedLong = 0;
+    int parsedInt = 0;
+    bool parsedBool = false;
+
     if (normalizedKey == "rtsp_transport") {
         RtspTransport transport;
         if (!parseRtspTransport(value, transport)) {
@@ -291,10 +427,119 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
         applyLatencyProfile(options);
         return true;
     }
-
-    int64_t parsedLong = 0;
-    int parsedInt = 0;
-    bool parsedBool = false;
+    if (normalizedKey == "enable_hardware_decode") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_hardware_decode must be boolean";
+            return false;
+        }
+        options.enableHardwareDecode = parsedBool;
+        if (!parsedBool) {
+            options.renderMode = RenderMode::SOFTWARE_RGBA;
+            options.usingHardwareDecoder = false;
+        }
+        return true;
+    }
+    if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
+        RenderMode renderMode;
+        if (!parseRenderMode(value, renderMode)) {
+            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface";
+            return false;
+        }
+        options.renderMode = renderMode;
+        if (renderMode != RenderMode::MEDIACODEC_SURFACE) {
+            options.usingHardwareDecoder = false;
+        }
+        return true;
+    }
+    if (normalizedKey == "hardware_decode_allow_fallback") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "hardware_decode_allow_fallback must be boolean";
+            return false;
+        }
+        options.hardwareDecodeAllowFallback = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "infinite_reconnect") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "infinite_reconnect must be boolean";
+            return false;
+        }
+        options.infiniteReconnect = parsedBool;
+        if (parsedBool) {
+            options.reconnectMaxRetry = -1;
+        }
+        return true;
+    }
+    if (normalizedKey == "reconnect_on_eof") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "reconnect_on_eof must be boolean";
+            return false;
+        }
+        options.reconnectOnEof = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "reconnect_on_404") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "reconnect_on_404 must be boolean";
+            return false;
+        }
+        options.reconnectOn404 = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "keep_waiting_when_source_missing") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "keep_waiting_when_source_missing must be boolean";
+            return false;
+        }
+        options.keepWaitingWhenSourceMissing = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "reconnect_initial_delay_ms") {
+        if (!parseInt(value, parsedInt) || parsedInt < 100) {
+            errorMessage = "reconnect_initial_delay_ms must be an integer >= 100";
+            return false;
+        }
+        options.reconnectInitialDelayMs = parsedInt;
+        return true;
+    }
+    if (normalizedKey == "reconnect_max_delay_ms") {
+        if (!parseInt(value, parsedInt) || parsedInt < 100) {
+            errorMessage = "reconnect_max_delay_ms must be an integer >= 100";
+            return false;
+        }
+        options.reconnectMaxDelayMs = parsedInt;
+        return true;
+    }
+    if (normalizedKey == "reconnect_max_retry") {
+        if (!parseInt(value, parsedInt) || parsedInt < -1) {
+            errorMessage = "reconnect_max_retry must be -1 or a non-negative integer";
+            return false;
+        }
+        options.reconnectMaxRetry = parsedInt;
+        options.infiniteReconnect = parsedInt < 0;
+        return true;
+    }
+    if (normalizedKey == "ultra_latency_level") {
+        const std::string normalizedValue = lowerTrim(value);
+        if (normalizedValue == "normal") {
+            return true;
+        }
+        if (normalizedValue == "aggressive") {
+            options.enableFrameDrop = true;
+            options.enablePacketDrop = true;
+            options.enableLatestFrameOnly = true;
+            options.dropLateFrameThresholdUs = 50000;
+            options.dropLatePacketThresholdUs = 50000;
+            return true;
+        }
+        if (normalizedValue == "relaxed") {
+            options.dropLateFrameThresholdUs = 150000;
+            options.dropLatePacketThresholdUs = 150000;
+            return true;
+        }
+        errorMessage = "ultra_latency_level must be normal, aggressive, or relaxed";
+        return false;
+    }
 
     if (normalizedKey == "probesize") {
         if (!parseInt64(value, parsedLong) || parsedLong < 0) {
@@ -380,6 +625,47 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
         options.dropLateFrameThresholdUs = parsedLong;
         return true;
     }
+    if (normalizedKey == "enable_packet_drop") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_packet_drop must be boolean";
+            return false;
+        }
+        options.enablePacketDrop = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "drop_late_packet_threshold_us") {
+        if (!parseInt64(value, parsedLong) || parsedLong < 0) {
+            errorMessage = "drop_late_packet_threshold_us must be a non-negative integer";
+            return false;
+        }
+        options.dropLatePacketThresholdUs = parsedLong;
+        return true;
+    }
+    if (normalizedKey == "enable_latest_frame_only") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_latest_frame_only must be boolean";
+            return false;
+        }
+        options.enableLatestFrameOnly = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "sync_master") {
+        SyncMaster syncMaster;
+        if (!parseSyncMaster(value, syncMaster)) {
+            errorMessage = "sync_master must be audio, video, or wall_clock";
+            return false;
+        }
+        options.syncMaster = syncMaster;
+        return true;
+    }
+    if (normalizedKey == "cache_last_frame_every_n") {
+        if (!parseInt(value, parsedInt) || parsedInt <= 0) {
+            errorMessage = "cache_last_frame_every_n must be greater than 0";
+            return false;
+        }
+        options.cacheLastFrameEveryN = parsedInt;
+        return true;
+    }
     if (normalizedKey == "fflags_nobuffer") {
         if (!parseBool(value, parsedBool)) {
             errorMessage = "fflags_nobuffer must be boolean";
@@ -409,13 +695,15 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
     return false;
 }
 
-std::string playerOptionsToJson(const PlayerOptions &options, SourceType sourceType, bool preferUdpInAuto) {
+std::string playerOptionsToJson(const PlayerOptions &options, SourceType sourceType, bool preferUdpInAuto, const std::string &effectiveSyncMaster) {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"sourceType\":\"" << sourceTypeName(sourceType) << "\","
         << "\"effectiveRtspTransport\":\"" << effectiveRtspTransportName(options, preferUdpInAuto) << "\",";
     appendOptionsJson(out, options);
-    out << "}";
+    out << ",\"effectiveSyncMaster\":\"" << escapeJson(effectiveSyncMaster) << "\","
+        << "\"preferredH264Decoder\":\"h264_mediacodec\","
+        << "\"preferredHevcDecoder\":\"hevc_mediacodec\"}";
     return out.str();
 }
 
@@ -423,6 +711,7 @@ std::string latencyProfilesJson() {
     std::ostringstream out;
     out << "{\"success\":true,\"profiles\":{"
         << "\"low_latency\":{\"description\":\"minimum latency for LAN preview; UDP may lose packets or show artifacts\"},"
+        << "\"ultra_low_latency\":{\"description\":\"aggressive realtime preview with packet/frame drop, video master, and latest-frame-only behavior\"},"
         << "\"balanced\":{\"description\":\"default compromise between latency and stability\"},"
         << "\"stable\":{\"description\":\"larger buffers for WAN/Wi-Fi jitter and recording-first workflows\"}"
         << "}}";
@@ -433,7 +722,32 @@ std::string rtspLowLatencyHelpJson() {
     return "{\"success\":true,"
            "\"tcp\":\"tcp is stable and ordered but retransmission can add latency; low_latency uses tcp_nodelay and smaller buffers\","
            "\"udp\":\"udp has lower latency and avoids TCP head-of-line blocking, but packet loss can cause artifacts\","
-           "\"modes\":\"use udp+low_latency for LAN control preview, tcp+stable for WAN or recording-first sessions\"}";
+           "\"modes\":\"use udp+low_latency for LAN control preview, udp+ultra_low_latency for most aggressive realtime preview, tcp+stable for WAN or recording-first sessions\"}";
+}
+
+std::string ultraLowLatencyHelpJson() {
+    return "{\"success\":true,"
+           "\"mode\":\"ultra_low_latency\","
+           "\"purpose\":\"aggressive realtime preview; allows artifacts, dropped packets, dropped frames, and discontinuous video\","
+           "\"defaults\":{\"rtspTransportWhenAuto\":\"udp\",\"openTimeoutUs\":3000000,\"readTimeoutUs\":3000000,\"probesize\":32768,\"analyzeduration\":0,\"maxProbePackets\":32,\"maxDelayUs\":0,\"reorderQueueSize\":0,\"socketBufferSize\":262144,\"fflagsNoBuffer\":true,\"avioDirect\":true,\"lowDelayDecode\":true,\"tcpNoDelay\":true,\"enableFrameDrop\":true,\"enablePacketDrop\":true,\"enableLatestFrameOnly\":true,\"decoderThreadCount\":1,\"dropLateFrameThresholdUs\":80000,\"dropLatePacketThresholdUs\":80000,\"syncMaster\":\"video\",\"skipNonRef\":false,\"cacheLastFrameEveryN\":1},"
+           "\"recording\":\"remux recording receives packets before playback packet/frame drop\"}";
+}
+
+std::string latencyReportHelpJson() {
+    return "{\"success\":true,"
+           "\"fields\":{\"read\":\"last/avg/max av_read_frame cost in us\",\"decode\":\"send_packet and receive_frame/decode cost in us\",\"swsScale\":\"RGBA conversion cost in us\",\"render\":\"ANativeWindow lock/copy/post and total render cost in us\",\"frameProcess\":\"decode-to-render processing cost in us\",\"videoDelay\":\"estimated video delay relative to effective sync master in us\",\"drop\":\"packet/frame drop counters before decode/render\",\"clock\":\"sync master plus audio/video/wall clocks\",\"queue\":\"read packet and video frame queue sizes; zero for serial pipeline\"}}";
+}
+
+std::string hardwareDecodeHelpJson() {
+    return "{\"success\":true,"
+           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_surface\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_surface\","
+           "\"software_rgba\":\"FFmpeg software decode, sws_scale to RGBA, ANativeWindow RGBA copy, native snapshot supported\","
+           "\"software_yuv_gl\":\"FFmpeg software decode, render YUV420P/YUVJ420P frames with OpenGL ES shader, fallback to software_rgba for unsupported formats\","
+           "\"mediacodec_surface\":\"FFmpeg h264_mediacodec/hevc_mediacodec decode directly to Surface; no sws_scale and no RGBA memcpy\","
+           "\"snapshot\":\"native RGBA snapshot is not supported in mediacodec_surface or software_yuv_gl mode; the Java demo can use PixelCopy\","
+           "\"fallback\":\"hardware decoder missing, MediaCodec surface init failure, or avcodec_open2 failure falls back to software decode when hardwareDecodeAllowFallback is true\","
+           "\"hevc\":\"for low-latency HEVC preview, test RTSP UDP + ultra_low_latency + hevc_mediacodec first\","
+           "\"compatibility\":\"if MediaCodec compatibility is poor on a device, disable enableHardwareDecode and use software_rgba\"}";
 }
 
 std::string sourceInfoJson(const std::string &url) {
@@ -445,8 +759,8 @@ std::string sourceInfoJson(const std::string &url) {
         << "\"isRtsp\":" << (isRtspSource(sourceType) ? "true" : "false") << ",";
     if (isRtspSource(sourceType)) {
         out << "\"recommendedTransport\":\"udp\","
-            << "\"recommendedLatencyMode\":\"balanced\","
-            << "\"message\":\"try udp low_latency on LAN; use tcp stable if packet loss or artifacts are visible\"";
+            << "\"recommendedLatencyMode\":\"ultra_low_latency\","
+            << "\"message\":\"try udp ultra_low_latency for lowest preview latency; use balanced or stable if packet loss or artifacts are visible\"";
     } else {
         out << "\"recommendedTransport\":\"none\","
             << "\"recommendedLatencyMode\":\"balanced\","

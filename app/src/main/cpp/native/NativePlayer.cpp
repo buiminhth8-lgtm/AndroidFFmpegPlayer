@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -15,11 +16,15 @@
 
 extern "C" {
 #include "libavcodec/avcodec.h"
+#include "libavcodec/mediacodec.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
+#include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/rational.h"
 #include "libavutil/samplefmt.h"
@@ -32,6 +37,9 @@ extern "C" {
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+JavaVM *g_native_player_java_vm = nullptr;
+constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
@@ -84,13 +92,35 @@ const char *stateName(PlayerState state) {
         case PlayerState::Prepared: return "prepared";
         case PlayerState::Playing: return "playing";
         case PlayerState::Paused: return "paused";
+        case PlayerState::Disconnected: return "disconnected";
+        case PlayerState::WaitingSource: return "waiting_source";
         case PlayerState::Reconnecting: return "reconnecting";
+        case PlayerState::Reconnected: return "reconnected";
         case PlayerState::Stopping: return "stopping";
         case PlayerState::Stopped: return "stopped";
         case PlayerState::Error: return "error";
         case PlayerState::Released: return "released";
     }
     return "unknown";
+}
+
+const char *playerStateName(PlayerState state) {
+    switch (state) {
+        case PlayerState::Idle: return "IDLE";
+        case PlayerState::Preparing: return "PREPARING";
+        case PlayerState::Prepared: return "PREPARED";
+        case PlayerState::Playing: return "PLAYING";
+        case PlayerState::Paused: return "PAUSED";
+        case PlayerState::Disconnected: return "DISCONNECTED";
+        case PlayerState::WaitingSource: return "WAITING_SOURCE";
+        case PlayerState::Reconnecting: return "RECONNECTING";
+        case PlayerState::Reconnected: return "RECONNECTED";
+        case PlayerState::Stopping: return "STOPPING";
+        case PlayerState::Stopped: return "STOPPED";
+        case PlayerState::Error: return "ERROR";
+        case PlayerState::Released: return "RELEASED";
+    }
+    return "UNKNOWN";
 }
 
 std::string codecName(AVCodecID codecId) {
@@ -108,6 +138,53 @@ double rationalToDouble(AVRational rational) {
 int64_t nowMs() {
     return av_gettime_relative() / 1000;
 }
+
+int64_t steadyNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int64_t averageUs(int64_t totalUs, int64_t sampleCount) {
+    return sampleCount <= 0 ? 0 : totalUs / sampleCount;
+}
+
+void updateMax(std::atomic<int64_t> &maxValue, int64_t value) {
+    int64_t current = maxValue.load();
+    while (value > current && !maxValue.compare_exchange_weak(current, value)) {
+    }
+}
+
+void recordCost(std::atomic<int64_t> &last,
+                std::atomic<int64_t> &total,
+                std::atomic<int64_t> &samples,
+                std::atomic<int64_t> &maxValue,
+                int64_t costUs) {
+    last.store(costUs);
+    total.fetch_add(costUs);
+    samples.fetch_add(1);
+    updateMax(maxValue, costUs);
+}
+
+bool shouldPreferUdpTransport(const PlayerOptions &options) {
+    if (options.rtspTransport == RtspTransport::UDP || options.rtspTransport == RtspTransport::UDP_MULTICAST) {
+        return true;
+    }
+    return options.rtspTransport == RtspTransport::AUTO
+           && options.latencyMode == LatencyMode::ULTRA_LOW_LATENCY;
+}
+
+bool isKeyPacket(const AVPacket *packet) {
+    return packet != nullptr && (packet->flags & AV_PKT_FLAG_KEY) != 0;
+}
+
+bool isValidPts(int64_t ptsUs) {
+    return ptsUs != AV_NOPTS_VALUE && ptsUs >= 0;
+}
+
+bool isAudioPlaybackMasterAvailable(bool sourceHasAudio, bool audioEnabled, bool audioPlayable, int64_t audioClockUs) {
+    return sourceHasAudio && audioEnabled && audioPlayable && audioClockUs > 0;
+}
+
 bool isNetworkUrl(const std::string &url) {
     std::string lower = url;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
@@ -122,7 +199,101 @@ bool isNetworkUrl(const std::string &url) {
            || lower.rfind("udp://", 0) == 0;
 }
 
+std::string lowerTrimCopy(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }), value.end());
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+JNIEnv *getJniEnvForCurrentThread(bool &attached) {
+    attached = false;
+    if (g_native_player_java_vm == nullptr) {
+        return nullptr;
+    }
+    JNIEnv *env = nullptr;
+    const jint getEnvResult = g_native_player_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    if (getEnvResult == JNI_OK) {
+        return env;
+    }
+    if (getEnvResult == JNI_EDETACHED) {
+        if (g_native_player_java_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            attached = true;
+            return env;
+        }
+    }
+    return nullptr;
+}
+
+void detachCurrentThreadIfNeeded(bool attached) {
+    if (attached && g_native_player_java_vm != nullptr) {
+        g_native_player_java_vm->DetachCurrentThread();
+    }
+}
+
+const char *preferredHardwareDecoderName(AVCodecID codecId) {
+    if (codecId == AV_CODEC_ID_H264) {
+        return "h264_mediacodec";
+    }
+    if (codecId == AV_CODEC_ID_HEVC) {
+        return "hevc_mediacodec";
+    }
+    return nullptr;
+}
+
+bool isMediaCodecDecoderName(const std::string &name) {
+    return name == "h264_mediacodec" || name == "hevc_mediacodec";
+}
+
+std::string decoderName(const AVCodec *codec) {
+    return codec != nullptr && codec->name != nullptr ? codec->name : "";
+}
+
+bool parseBoolOption(const std::string &value, bool &out) {
+    const std::string normalized = lowerTrimCopy(value);
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        out = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool parseIntOption(const std::string &value, int &out) {
+    char *end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0'
+        || parsed < std::numeric_limits<int>::min()
+        || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+bool containsInsensitive(const std::string &value, const char *needle) {
+    std::string lowerValue = value;
+    std::string lowerNeedle = needle == nullptr ? "" : needle;
+    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(lowerNeedle.begin(), lowerNeedle.end(), lowerNeedle.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return !lowerNeedle.empty() && lowerValue.find(lowerNeedle) != std::string::npos;
+}
+
 } // namespace
+
+void NativePlayer::setJavaVm(JavaVM *javaVm) {
+    g_native_player_java_vm = javaVm;
+}
 
 NativePlayer::NativePlayer() {
     LOGI("createPlayer NativePlayer=%p", this);
@@ -136,6 +307,12 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
     if (isReleased()) {
         return jsonError(-1, "player is released");
     }
+    if (env == nullptr) {
+        return jsonError(-1, "JNIEnv is null");
+    }
+    if (surface == nullptr) {
+        return jsonError(-1, "Surface is null");
+    }
 
     int width = 0;
     int height = 0;
@@ -145,8 +322,27 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
         height = videoHeight_;
     }
 
+    jobject newSurfaceRef = env->NewGlobalRef(surface);
+    if (newSurfaceRef == nullptr) {
+        return jsonError(-1, "NewGlobalRef Surface failed");
+    }
+
+    {
+        std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+        deleteSurfaceGlobalRefLocked(env);
+        surfaceGlobalRef_ = newSurfaceRef;
+    }
+
     LOGI("setSurface player=%p width=%d height=%d", this, width, height);
-    return renderer_.setSurface(env, surface, width, height);
+    const std::string rgbaResult = renderer_.setSurface(env, surface, width, height);
+    const std::string glResult = yuvGlRenderer_.setSurface(env, surface, width, height);
+    if (rgbaResult.find("\"success\":true") == std::string::npos) {
+        return rgbaResult;
+    }
+    if (glResult.find("\"success\":true") == std::string::npos) {
+        LOGE("setSurface GL YUV renderer failed: %s", glResult.c_str());
+    }
+    return rgbaResult;
 }
 
 std::string NativePlayer::clearSurface() {
@@ -155,6 +351,17 @@ std::string NativePlayer::clearSurface() {
     }
     LOGI("clearPlayerSurface player=%p", this);
     renderer_.release();
+    yuvGlRenderer_.release();
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        return jsonError(-1, "JNIEnv is not available for clearing Surface");
+    }
+    {
+        std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+        deleteSurfaceGlobalRefLocked(env);
+    }
+    detachCurrentThreadIfNeeded(attached);
     return jsonSuccess("surface cleared");
 }
 
@@ -176,8 +383,12 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         audioDecodeOpened_.store(false);
         audioPlayable_.store(false);
         fps_ = 25.0;
+        streamBitRate_.store(0);
+        videoBitRate_.store(0);
+        audioBitRate_.store(0);
         videoCodec_.clear();
         audioCodec_.clear();
+        lastFrameFormatName_.clear();
         swsSourceFormat_ = -1;
     }
 
@@ -272,6 +483,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         releaseFfmpegResources();
         return result;
     }
+    streamBitRate_.store(std::max<int64_t>(0, formatContext_->bit_rate));
 
     for (unsigned int i = 0; i < formatContext_->nb_streams; ++i) {
         AVStream *stream = formatContext_->streams[i];
@@ -284,6 +496,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
             videoWidth_ = params->width;
             videoHeight_ = params->height;
             videoCodec_ = codecName(params->codec_id);
+            videoBitRate_.store(std::max<int64_t>(0, params->bit_rate));
             sourceHasVideo_.store(true);
             fps_ = rationalToDouble(stream->avg_frame_rate.num != 0 ? stream->avg_frame_rate : stream->r_frame_rate);
             if (fps_ <= 1.0 || std::isnan(fps_) || std::isinf(fps_)) {
@@ -292,6 +505,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         } else if (params->codec_type == AVMEDIA_TYPE_AUDIO && audioStreamIndex_ < 0) {
             audioStreamIndex_ = static_cast<int>(i);
             audioCodec_ = codecName(params->codec_id);
+            audioBitRate_.store(std::max<int64_t>(0, params->bit_rate));
             audioSampleRate_ = params->sample_rate;
             audioChannels_ = params->ch_layout.nb_channels;
             audioSampleFormat_ = params->format;
@@ -308,66 +522,207 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     }
 
     AVStream *videoStream = formatContext_->streams[videoStreamIndex_];
-    const AVCodec *decoder = avcodec_find_decoder(videoStream->codecpar->codec_id);
-    if (decoder == nullptr) {
-        errorMessage = "decoder not found for codec " + videoCodec_;
-        LOGE("%s", errorMessage.c_str());
-        releaseFfmpegResources();
-        return -1;
-    }
+    const AVCodecID videoCodecId = videoStream->codecpar->codec_id;
+    const char *hardwareDecoderName = preferredHardwareDecoderName(videoCodecId);
+    const bool hardwareModeRequested = optionsSnapshot.enableHardwareDecode
+                                       && optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                       && hardwareDecoderName != nullptr;
+    const std::string requestedDecoderName = hardwareModeRequested ? hardwareDecoderName : codecName(videoCodecId);
 
-    videoCodecContext_ = avcodec_alloc_context3(decoder);
-    if (videoCodecContext_ == nullptr) {
-        errorMessage = "avcodec_alloc_context3 failed";
-        releaseFfmpegResources();
-        return -1;
-    }
-
-    result = avcodec_parameters_to_context(videoCodecContext_, videoStream->codecpar);
-    if (result < 0) {
-        errorMessage = ffmpegErrorToString(result);
-        LOGE("avcodec_parameters_to_context failed: %s", errorMessage.c_str());
-        releaseFfmpegResources();
-        return result;
-    }
-
-    {
+    auto setDecoderState = [&](const std::string &requested,
+                               const std::string &actual,
+                               bool usingHardware,
+                               bool fallbackUsed,
+                               const std::string &hardwareError,
+                               RenderMode renderMode) {
         std::lock_guard<std::mutex> lock(mutex_);
-        optionsSnapshot = playerOptions_;
-    }
-    if (optionsSnapshot.lowDelayDecode) {
-        videoCodecContext_->flags |= AV_CODEC_FLAG_LOW_DELAY;
-        videoCodecContext_->flags2 |= AV_CODEC_FLAG2_FAST;
-    }
-    if (optionsSnapshot.decoderThreadCount > 0) {
-        videoCodecContext_->thread_count = optionsSnapshot.decoderThreadCount;
-        if (optionsSnapshot.lowDelayDecode) {
-            videoCodecContext_->thread_type = FF_THREAD_SLICE;
-        }
-    } else {
-        videoCodecContext_->thread_count = 0;
-    }
-    if (optionsSnapshot.skipNonRef) {
-        videoCodecContext_->skip_frame = AVDISCARD_NONREF;
-    }
-    LOGI("video decoder options lowDelay=%d threadCount=%d threadType=%d skipNonRef=%d frameDrop=%d thresholdUs=%lld",
-         optionsSnapshot.lowDelayDecode ? 1 : 0, videoCodecContext_->thread_count,
-         videoCodecContext_->thread_type, optionsSnapshot.skipNonRef ? 1 : 0,
-         optionsSnapshot.enableFrameDrop ? 1 : 0,
-         static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
+        playerOptions_.requestedDecoderName = requested;
+        playerOptions_.actualDecoderName = actual;
+        playerOptions_.usingHardwareDecoder = usingHardware;
+        playerOptions_.hardwareDecodeFallbackUsed = fallbackUsed;
+        playerOptions_.hardwareDecodeError = hardwareError;
+        playerOptions_.renderMode = renderMode;
+    };
 
-    result = avcodec_open2(videoCodecContext_, decoder, nullptr);
-    if (result < 0) {
-        errorMessage = ffmpegErrorToString(result);
-        LOGE("decoder open failed: %s", errorMessage.c_str());
-        releaseFfmpegResources();
-        return result;
+    auto configureVideoDecoderContext = [&](AVCodecContext *context) {
+        if (optionsSnapshot.lowDelayDecode) {
+            context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+            context->flags2 |= AV_CODEC_FLAG2_FAST;
+        }
+        if (optionsSnapshot.decoderThreadCount > 0) {
+            context->thread_count = optionsSnapshot.decoderThreadCount;
+            if (optionsSnapshot.lowDelayDecode) {
+                context->thread_type = FF_THREAD_SLICE;
+            }
+        } else {
+            context->thread_count = 0;
+        }
+        if (optionsSnapshot.skipNonRef) {
+            context->skip_frame = AVDISCARD_NONREF;
+        }
+    };
+
+    auto closeCurrentVideoDecoder = [&]() {
+        if (videoCodecContext_ != nullptr) {
+            if (mediaCodecContextInitialized_) {
+                av_mediacodec_default_free(videoCodecContext_);
+                mediaCodecContextInitialized_ = false;
+            }
+            avcodec_free_context(&videoCodecContext_);
+        }
+    };
+
+    auto openDecoder = [&](const AVCodec *decoder, bool useHardware, std::string &openError) -> int {
+        if (decoder == nullptr) {
+            openError = "decoder not found for codec " + videoCodec_;
+            return -1;
+        }
+
+        closeCurrentVideoDecoder();
+        videoCodecContext_ = avcodec_alloc_context3(decoder);
+        if (videoCodecContext_ == nullptr) {
+            openError = "avcodec_alloc_context3 failed";
+            return -1;
+        }
+
+        int openResult = avcodec_parameters_to_context(videoCodecContext_, videoStream->codecpar);
+        if (openResult < 0) {
+            openError = ffmpegErrorToString(openResult);
+            LOGE("avcodec_parameters_to_context failed: %s", openError.c_str());
+            closeCurrentVideoDecoder();
+            return openResult;
+        }
+
+        configureVideoDecoderContext(videoCodecContext_);
+        LOGI("video decoder options lowDelay=%d threadCount=%d threadType=%d skipNonRef=%d frameDrop=%d thresholdUs=%lld",
+             optionsSnapshot.lowDelayDecode ? 1 : 0, videoCodecContext_->thread_count,
+             videoCodecContext_->thread_type, optionsSnapshot.skipNonRef ? 1 : 0,
+             optionsSnapshot.enableFrameDrop ? 1 : 0,
+             static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
+
+        if (useHardware) {
+            LOGI("try hardware decoder name=%s", decoderName(decoder).c_str());
+            AVMediaCodecContext *mediaCodecCtx = av_mediacodec_alloc_context();
+            if (mediaCodecCtx == nullptr) {
+                openError = "av_mediacodec_alloc_context failed";
+                closeCurrentVideoDecoder();
+                return -1;
+            }
+            {
+                std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+                if (surfaceGlobalRef_ == nullptr) {
+                    openError = "mediacodec_surface requires valid Surface before prepare";
+                    av_free(mediaCodecCtx);
+                    closeCurrentVideoDecoder();
+                    return -1;
+                }
+                openResult = av_mediacodec_default_init(videoCodecContext_, mediaCodecCtx, surfaceGlobalRef_);
+            }
+            if (openResult < 0) {
+                openError = "MediaCodec surface init failed: " + ffmpegErrorToString(openResult);
+                LOGE("MediaCodec surface init failed ret=%d", openResult);
+                av_mediacodec_default_free(videoCodecContext_);
+                closeCurrentVideoDecoder();
+                return openResult;
+            }
+            mediaCodecContextInitialized_ = true;
+            LOGI("MediaCodec surface init success");
+        }
+
+        openResult = avcodec_open2(videoCodecContext_, decoder, nullptr);
+        if (openResult < 0) {
+            openError = ffmpegErrorToString(openResult);
+            if (useHardware) {
+                LOGE("avcodec_open2 hardware failed decoder=%s error=%s", decoderName(decoder).c_str(), openError.c_str());
+            } else {
+                LOGE("decoder open failed: %s", openError.c_str());
+            }
+            closeCurrentVideoDecoder();
+            return openResult;
+        }
+
+        if (useHardware) {
+            LOGI("avcodec_open2 hardware success decoder=%s", decoderName(decoder).c_str());
+        }
+        return 0;
+    };
+
+    std::string decoderError;
+    int decoderOpenResult = -1;
+    bool fallbackUsed = false;
+    std::string fallbackError;
+    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE && optionsSnapshot.enableHardwareDecode) {
+        bool hasSurfaceRef = false;
+        {
+            std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+            hasSurfaceRef = surfaceGlobalRef_ != nullptr;
+        }
+        if (!hasSurfaceRef) {
+            errorMessage = "mediacodec_surface requires valid Surface before prepare";
+            LOGE("%s", errorMessage.c_str());
+            releaseFfmpegResources();
+            return -1;
+        }
+    }
+
+    LOGI("enableHardwareDecode=%d renderMode=%s",
+         optionsSnapshot.enableHardwareDecode ? 1 : 0,
+         renderModeName(optionsSnapshot.renderMode).c_str());
+    LOGI("select decoder codecId=%s requested=%s",
+         codecName(videoCodecId).c_str(), requestedDecoderName.c_str());
+
+    if (hardwareModeRequested) {
+        const AVCodec *hardwareDecoder = avcodec_find_decoder_by_name(hardwareDecoderName);
+        if (hardwareDecoder == nullptr) {
+            fallbackError = std::string("hardware decoder not found: ") + hardwareDecoderName;
+            LOGE("hardware decoder failed fallback software reason=%s", fallbackError.c_str());
+        } else {
+            decoderOpenResult = openDecoder(hardwareDecoder, true, decoderError);
+            if (decoderOpenResult < 0) {
+                fallbackError = decoderError;
+                LOGE("hardware decoder failed fallback software reason=%s", fallbackError.c_str());
+            }
+        }
+        if (decoderOpenResult < 0) {
+            if (!optionsSnapshot.hardwareDecodeAllowFallback) {
+                errorMessage = fallbackError.empty() ? "hardware decoder failed" : fallbackError;
+                releaseFfmpegResources();
+                return decoderOpenResult;
+            }
+            fallbackUsed = true;
+            LOGI("fallback to software decoder");
+        }
+    }
+
+    if (!hardwareModeRequested || decoderOpenResult < 0) {
+        const AVCodec *softwareDecoder = avcodec_find_decoder(videoCodecId);
+        decoderError.clear();
+        decoderOpenResult = openDecoder(softwareDecoder, false, decoderError);
+        if (decoderOpenResult < 0) {
+            errorMessage = decoderError.empty() ? ("decoder not found for codec " + videoCodec_) : decoderError;
+            LOGE("%s", errorMessage.c_str());
+            releaseFfmpegResources();
+            return decoderOpenResult;
+        }
+        const RenderMode softwareRenderMode = (!fallbackUsed && optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL)
+                                             ? RenderMode::SOFTWARE_YUV_GL
+                                             : RenderMode::SOFTWARE_RGBA;
+        setDecoderState(requestedDecoderName, decoderName(softwareDecoder), false, fallbackUsed,
+                        fallbackUsed ? fallbackError : "", softwareRenderMode);
+    } else {
+        setDecoderState(requestedDecoderName, decoderName(videoCodecContext_->codec), true, false, "",
+                        RenderMode::MEDIACODEC_SURFACE);
+        lastSwsScaleCostUs_.store(-1);
+        lastRenderLockCostUs_.store(-1);
+        lastRenderCopyCostUs_.store(-1);
+        lastRenderPostCostUs_.store(-1);
     }
 
     packet_ = av_packet_alloc();
     decodedFrame_ = av_frame_alloc();
+    latestFrame_ = av_frame_alloc();
     rgbaFrame_ = av_frame_alloc();
-    if (packet_ == nullptr || decodedFrame_ == nullptr || rgbaFrame_ == nullptr) {
+    if (packet_ == nullptr || decodedFrame_ == nullptr || latestFrame_ == nullptr || rgbaFrame_ == nullptr) {
         errorMessage = "failed to allocate packet/frame";
         releaseFfmpegResources();
         return -1;
@@ -517,8 +872,8 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     pauseRequested_.store(false);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
-                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
+        preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
     }
     transportSwitchRequested_.store(false);
     resetStats();
@@ -533,6 +888,11 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         sourceType_ = detectSourceType(url);
         errorMessage_.clear();
         lastReconnectError_.clear();
+        playerOptions_.requestedDecoderName.clear();
+        playerOptions_.actualDecoderName.clear();
+        playerOptions_.usingHardwareDecoder = false;
+        playerOptions_.hardwareDecodeFallbackUsed = false;
+        playerOptions_.hardwareDecodeError.clear();
     }
 
     LOGI("prepare url=%s timeoutMs=%d realtimeInput=%d", url.c_str(), timeoutMs, isNetworkUrl(url) ? 1 : 0);
@@ -550,6 +910,13 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     out << "{\"success\":true,\"message\":\"player prepared\","
         << "\"videoStreamIndex\":" << videoStreamIndex_ << ","
         << "\"videoCodec\":\"" << escapeJson(videoCodec_) << "\","
+        << "\"enableHardwareDecode\":" << (playerOptions_.enableHardwareDecode ? "true" : "false") << ","
+        << "\"renderMode\":\"" << renderModeName(playerOptions_.renderMode) << "\","
+        << "\"requestedDecoderName\":\"" << escapeJson(playerOptions_.requestedDecoderName) << "\","
+        << "\"actualDecoderName\":\"" << escapeJson(playerOptions_.actualDecoderName) << "\","
+        << "\"usingHardwareDecoder\":" << (playerOptions_.usingHardwareDecoder ? "true" : "false") << ","
+        << "\"hardwareDecodeFallbackUsed\":" << (playerOptions_.hardwareDecodeFallbackUsed ? "true" : "false") << ","
+        << "\"hardwareDecodeError\":\"" << escapeJson(playerOptions_.hardwareDecodeError) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
         << "\"videoStreamIndex\":" << videoStreamIndex_ << ","
@@ -562,6 +929,11 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnectMaxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
         << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
         << "\"sourceType\":\"" << sourceTypeName(sourceType_) << "\","
         << "\"latencyMode\":\"" << latencyModeName(playerOptions_.latencyMode) << "\","
         << "\"rtspTransport\":\"" << rtspTransportName(playerOptions_.rtspTransport) << "\"}";
@@ -613,6 +985,7 @@ std::string NativePlayer::start() {
         stopRequested_.store(false);
         pauseRequested_.store(false);
         resetRealtimeClock();
+        beginStartupKeyFrameWait("start");
         startPlayTimeMs_.store(nowMs());
         state_ = PlayerState::Playing;
         playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
@@ -691,6 +1064,7 @@ std::string NativePlayer::getStats() {
     std::string lastError;
     std::string reconnectError;
     std::string rtspTransportMode;
+    std::string frameFormatName;
     PlayerOptions optionsSnapshot;
     SourceType sourceType;
     bool preferUdpInAuto = false;
@@ -702,6 +1076,7 @@ std::string NativePlayer::getStats() {
         reconnectError = lastReconnectError_;
         rtspTransportMode = rtspTransportMode_;
         optionsSnapshot = playerOptions_;
+        frameFormatName = lastFrameFormatName_;
         sourceType = sourceType_;
         preferUdpInAuto = preferUdpTransport_.load();
     }
@@ -716,16 +1091,50 @@ std::string NativePlayer::getStats() {
         frameHeight = lastFrameHeight_;
     }
 
+    wallClockUs_.store(steadyNowUs());
+    const std::string effectiveSyncMasterValue = effectiveSyncMasterName(optionsSnapshot);
+    const int64_t avgReadFrameCostUs = averageUs(totalReadFrameCostUs_.load(), readFrameCostSampleCount_.load());
+    const int64_t avgDecodeCostUs = averageUs(totalDecodeCostUs_.load(), decodeCostSampleCount_.load());
+    const int64_t avgSwsScaleCostUs = averageUs(totalSwsScaleCostUs_.load(), swsScaleCostSampleCount_.load());
+    const int64_t avgRenderCostUs = averageUs(totalRenderCostUs_.load(), renderCostSampleCount_.load());
+    const int64_t avgFrameProcessCostUs = averageUs(totalFrameProcessCostUs_.load(), frameProcessCostSampleCount_.load());
+    const int64_t avgVideoDelayUs = averageUs(totalVideoDelayUs_.load(), videoDelaySampleCount_.load());
+    const bool swsScaleEnabled = optionsSnapshot.renderMode == RenderMode::SOFTWARE_RGBA
+                                 || (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                     && !optionsSnapshot.usingHardwareDecoder);
+    const bool snapshotSupported = swsScaleEnabled;
+
     LOGI("getPlayerStats player=%p", this);
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\","
+        << "\"playerState\":\"" << playerStateName(state) << "\","
         << "\"url\":\"" << escapeJson(url) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
         << "\"videoStreamIndex\":" << videoStreamIndex_ << ","
         << "\"audioStreamIndex\":" << audioStreamIndex_ << ","
         << "\"videoCodec\":\"" << escapeJson(videoCodec_) << "\","
+        << "\"videoCodecName\":\"" << escapeJson(videoCodec_) << "\","
+        << "\"decoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
+        << "\"frameFormat\":\"" << escapeJson(frameFormatName.empty() ? (swsScaleEnabled ? "unknown" : "mediacodec") : frameFormatName) << "\","
+        << "\"enableHardwareDecode\":" << (optionsSnapshot.enableHardwareDecode ? "true" : "false") << ","
+        << "\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\","
+        << "\"hardwareDecodeAllowFallback\":" << (optionsSnapshot.hardwareDecodeAllowFallback ? "true" : "false") << ","
+        << "\"requestedDecoderName\":\"" << escapeJson(optionsSnapshot.requestedDecoderName) << "\","
+        << "\"actualDecoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
+        << "\"usingHardwareDecoder\":" << (optionsSnapshot.usingHardwareDecoder ? "true" : "false") << ","
+        << "\"hardwareDecodeFallbackUsed\":" << (optionsSnapshot.hardwareDecodeFallbackUsed ? "true" : "false") << ","
+        << "\"hardwareDecodeError\":\"" << escapeJson(optionsSnapshot.hardwareDecodeError) << "\","
+        << "\"hardwareDecodedFrameCount\":" << hardwareDecodedFrameCount_.load() << ","
+        << "\"hardwareRenderedFrameCount\":" << hardwareRenderedFrameCount_.load() << ","
+        << "\"hardwareDroppedFrameCount\":" << hardwareDroppedFrameCount_.load() << ","
+        << "\"softwareDecodedFrameCount\":" << softwareDecodedFrameCount_.load() << ","
+        << "\"softwareRenderedFrameCount\":" << softwareRenderedFrameCount_.load() << ","
+        << "\"yuvGlRenderedFrameCount\":" << yuvGlRenderedFrameCount_.load() << ","
+        << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
+        << "\"swsScaleEnabled\":" << (swsScaleEnabled ? "true" : "false") << ","
+        << "\"snapshotSupported\":" << (snapshotSupported ? "true" : "false") << ","
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
         << "\"audioSampleRate\":" << audioSampleRate_ << ","
         << "\"audioChannels\":" << audioChannels_ << ","
@@ -733,6 +1142,15 @@ std::string NativePlayer::getStats() {
         << "\"readPacketCount\":" << readPacketCount_.load() << ","
         << "\"videoPacketCount\":" << videoPacketCount_.load() << ","
         << "\"audioPacketCount\":" << audioPacketCount_.load() << ","
+        << "\"inputPacketBytes\":" << inputPacketBytes_.load() << ","
+        << "\"videoPacketBytes\":" << videoPacketBytes_.load() << ","
+        << "\"audioPacketBytes\":" << audioPacketBytes_.load() << ","
+        << "\"streamBitRate\":" << streamBitRate_.load() << ","
+        << "\"videoBitRate\":" << videoBitRate_.load() << ","
+        << "\"audioBitRate\":" << audioBitRate_.load() << ","
+        << "\"fps\":" << fps_ << ","
+        << "\"videoWidth\":" << videoWidth_ << ","
+        << "\"videoHeight\":" << videoHeight_ << ","
         << "\"videoFrameCount\":" << videoFrameCount_.load() << ","
         << "\"audioFrameCount\":" << audioFrameCount_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
@@ -746,8 +1164,10 @@ std::string NativePlayer::getStats() {
         << "\"lastFrameWidth\":" << frameWidth << ","
         << "\"lastFrameHeight\":" << frameHeight << ","
         << "\"audioEnabled\":" << (audioEnabled_.load() ? "true" : "false") << ","
+        << "\"audioPlayable\":" << (audioPlayable_.load() ? "true" : "false") << ","
         << "\"audioClockUs\":" << audioClockUs_.load() << ","
         << "\"videoClockUs\":" << videoClockUs_.load() << ","
+        << "\"wallClockUs\":" << wallClockUs_.load() << ","
         << "\"lastReadPacketTimeMs\":" << lastReadPacketTimeMs_.load() << ","
         << "\"lastVideoFrameTimeMs\":" << lastVideoFrameTimeMs_.load() << ","
         << "\"lastAudioFrameTimeMs\":" << lastAudioFrameTimeMs_.load() << ","
@@ -759,6 +1179,8 @@ std::string NativePlayer::getStats() {
         << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
         << "\"rtspTransport\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\","
         << "\"effectiveRtspTransport\":\"" << effectiveRtspTransportName(optionsSnapshot, preferUdpInAuto) << "\","
+        << "\"syncMaster\":\"" << syncMasterName(optionsSnapshot.syncMaster) << "\","
+        << "\"effectiveSyncMaster\":\"" << effectiveSyncMasterValue << "\","
         << "\"maxDelayUs\":" << optionsSnapshot.maxDelayUs << ","
         << "\"reorderQueueSize\":" << optionsSnapshot.reorderQueueSize << ","
         << "\"socketBufferSize\":" << optionsSnapshot.socketBufferSize << ","
@@ -772,7 +1194,40 @@ std::string NativePlayer::getStats() {
         << "\"decoderThreadCount\":" << optionsSnapshot.decoderThreadCount << ","
         << "\"enableFrameDrop\":" << (optionsSnapshot.enableFrameDrop ? "true" : "false") << ","
         << "\"dropLateFrameThresholdUs\":" << optionsSnapshot.dropLateFrameThresholdUs << ","
+        << "\"enablePacketDrop\":" << (optionsSnapshot.enablePacketDrop ? "true" : "false") << ","
+        << "\"dropLatePacketThresholdUs\":" << optionsSnapshot.dropLatePacketThresholdUs << ","
+        << "\"enableLatestFrameOnly\":" << (optionsSnapshot.enableLatestFrameOnly ? "true" : "false") << ","
+        << "\"skipNonRef\":" << (optionsSnapshot.skipNonRef ? "true" : "false") << ","
+        << "\"cacheLastFrameEveryN\":" << optionsSnapshot.cacheLastFrameEveryN << ","
+        << "\"lastReadFrameCostUs\":" << lastReadFrameCostUs_.load() << ","
+        << "\"avgReadFrameCostUs\":" << avgReadFrameCostUs << ","
+        << "\"maxReadFrameCostUs\":" << maxReadFrameCostUs_.load() << ","
+        << "\"lastSendPacketCostUs\":" << lastSendPacketCostUs_.load() << ","
+        << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
+        << "\"avgDecodeCostUs\":" << avgDecodeCostUs << ","
+        << "\"maxDecodeCostUs\":" << maxDecodeCostUs_.load() << ","
+        << "\"lastSwsScaleCostUs\":" << lastSwsScaleCostUs_.load() << ","
+        << "\"avgSwsScaleCostUs\":" << avgSwsScaleCostUs << ","
+        << "\"maxSwsScaleCostUs\":" << maxSwsScaleCostUs_.load() << ","
+        << "\"lastRenderCostUs\":" << lastRenderCostUs_.load() << ","
+        << "\"lastRenderLockCostUs\":" << lastRenderLockCostUs_.load() << ","
+        << "\"lastRenderCopyCostUs\":" << lastRenderCopyCostUs_.load() << ","
+        << "\"lastRenderPostCostUs\":" << lastRenderPostCostUs_.load() << ","
+        << "\"avgRenderCostUs\":" << avgRenderCostUs << ","
+        << "\"maxRenderCostUs\":" << maxRenderCostUs_.load() << ","
+        << "\"lastFrameProcessCostUs\":" << lastFrameProcessCostUs_.load() << ","
+        << "\"avgFrameProcessCostUs\":" << avgFrameProcessCostUs << ","
+        << "\"maxFrameProcessCostUs\":" << maxFrameProcessCostUs_.load() << ","
         << "\"lastVideoDelayUs\":" << lastVideoDelayUs_.load() << ","
+        << "\"avgVideoDelayUs\":" << avgVideoDelayUs << ","
+        << "\"maxVideoDelayUs\":" << maxVideoDelayUs_.load() << ","
+        << "\"droppedVideoPacketCount\":" << droppedVideoPacketCount_.load() << ","
+        << "\"packetDropBeforeDecodeCount\":" << packetDropBeforeDecodeCount_.load() << ","
+        << "\"frameDropBeforeRenderCount\":" << frameDropBeforeRenderCount_.load() << ","
+        << "\"startupKeyFrameWaitActive\":" << (startupKeyFrameWaitActive_.load() ? "true" : "false") << ","
+        << "\"startupKeyFrameDroppedPacketCount\":" << startupKeyFrameDroppedPacketCount_.load() << ","
+        << "\"lastFrameCacheUpdateCount\":" << lastFrameCacheUpdateCount_.load() << ","
+        << "\"lastFrameCacheSkippedCount\":" << lastFrameCacheSkippedCount_.load() << ","
         << "\"readPacketQueueSize\":0,"
         << "\"videoFrameQueueSize\":0,"
         << "\"rtspTransportMode\":\"" << escapeJson(rtspTransportMode) << "\","
@@ -780,11 +1235,25 @@ std::string NativePlayer::getStats() {
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectMaxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
+        << "\"reconnectMaxRetry\":" << reconnectMaxRetryCount_.load() << ","
         << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"reconnectInitialDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
         << "\"reconnectAttemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectSuccessCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectTimeMs\":" << lastReconnectTimeMs_.load() << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"reconnectLastError\":\"" << escapeJson(reconnectError) << "\","
         << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\"}";
     return out.str();
 }
@@ -795,18 +1264,32 @@ std::string NativePlayer::setReconnectOptions(bool enabled, int maxRetryCount, i
         return jsonError(-1, "player is released");
     }
 
-    const int safeMaxRetryCount = std::clamp(maxRetryCount, 0, 100);
+    const int safeMaxRetryCount = maxRetryCount < 0 ? -1 : std::clamp(maxRetryCount, 0, 100000);
     const int safeRetryDelayMs = std::clamp(retryDelayMs, 100, 60000);
     reconnectEnabled_.store(enabled);
     reconnectMaxRetryCount_.store(safeMaxRetryCount);
     reconnectRetryDelayMs_.store(safeRetryDelayMs);
+    infiniteReconnect_.store(safeMaxRetryCount < 0);
+    reconnectExhausted_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        playerOptions_.infiniteReconnect = safeMaxRetryCount < 0;
+        playerOptions_.reconnectMaxRetry = safeMaxRetryCount;
+        playerOptions_.reconnectInitialDelayMs = safeRetryDelayMs;
+        if (playerOptions_.reconnectMaxDelayMs < safeRetryDelayMs) {
+            playerOptions_.reconnectMaxDelayMs = safeRetryDelayMs;
+        }
+        syncReconnectPolicyFromOptionsLocked();
+    }
     LOGI("setPlayerReconnectOptions enabled=%d maxRetry=%d retryDelayMs=%d", enabled ? 1 : 0, safeMaxRetryCount, safeRetryDelayMs);
 
     std::ostringstream out;
     out << "{\"success\":true,\"message\":\"reconnect options updated\","
         << "\"enabled\":" << (enabled ? "true" : "false") << ","
         << "\"maxRetryCount\":" << safeMaxRetryCount << ","
-        << "\"retryDelayMs\":" << safeRetryDelayMs << "}";
+        << "\"retryDelayMs\":" << safeRetryDelayMs << ","
+        << "\"infiniteReconnect\":" << (safeMaxRetryCount < 0 ? "true" : "false") << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << "}";
     return out.str();
 }
 
@@ -846,8 +1329,8 @@ std::string NativePlayer::setRtspTransport(const std::string &transport) {
         playerOptions_.rtspTransport = parsedTransport;
         applyLatencyProfile(playerOptions_);
         rtspTransportMode_ = rtspTransportName(parsedTransport);
-        preferUdpTransport_.store(parsedTransport == RtspTransport::UDP
-                                  || parsedTransport == RtspTransport::UDP_MULTICAST);
+        preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
         requestSwitch = active && sourceIsRtsp;
     }
@@ -909,8 +1392,8 @@ std::string NativePlayer::setLatencyMode(const std::string &mode) {
         playerOptions_.latencyMode = parsedMode;
         applyLatencyProfile(playerOptions_);
         rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
-        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
-                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
+        preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
     }
 
@@ -926,11 +1409,107 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
     if (isReleased()) {
         return jsonError(-1, "player is released");
     }
-    if (key == "rtsp_transport") {
+    const std::string normalizedKey = lowerTrimCopy(key);
+    if (normalizedKey == "rtsp_transport") {
         return setRtspTransport(value);
     }
-    if (key == "latency_mode") {
+    if (normalizedKey == "latency_mode") {
         return setLatencyMode(value);
+    }
+    if (normalizedKey == "enable_hardware_decode") {
+        bool enabled = false;
+        const std::string normalizedValue = lowerTrimCopy(value);
+        if (normalizedValue == "1" || normalizedValue == "true" || normalizedValue == "yes" || normalizedValue == "on") {
+            enabled = true;
+        } else if (normalizedValue == "0" || normalizedValue == "false" || normalizedValue == "no" || normalizedValue == "off") {
+            enabled = false;
+        } else {
+            return jsonError(-1, "enable_hardware_decode must be boolean");
+        }
+        return setHardwareDecode(enabled);
+    }
+    if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
+        return setHardwareRenderMode(value);
+    }
+    if (normalizedKey == "infinite_reconnect"
+        || normalizedKey == "reconnect_on_eof"
+        || normalizedKey == "reconnect_on_404"
+        || normalizedKey == "keep_waiting_when_source_missing") {
+        bool parsed = false;
+        if (!parseBoolOption(value, parsed)) {
+            return jsonError(-1, normalizedKey + " must be boolean");
+        }
+        PlayerOptions optionsSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (normalizedKey == "infinite_reconnect") {
+                playerOptions_.infiniteReconnect = parsed;
+                if (parsed) {
+                    playerOptions_.reconnectMaxRetry = -1;
+                } else if (playerOptions_.reconnectMaxRetry < 0) {
+                    playerOptions_.reconnectMaxRetry = 3;
+                }
+            } else if (normalizedKey == "reconnect_on_eof") {
+                playerOptions_.reconnectOnEof = parsed;
+            } else if (normalizedKey == "reconnect_on_404") {
+                playerOptions_.reconnectOn404 = parsed;
+            } else {
+                playerOptions_.keepWaitingWhenSourceMissing = parsed;
+            }
+            syncReconnectPolicyFromOptionsLocked();
+            optionsSnapshot = playerOptions_;
+        }
+        LOGI("setPlayerOption key=%s value=%s", key.c_str(), value.c_str());
+        std::ostringstream out;
+        out << "{\"success\":true,\"message\":\"reconnect option updated\","
+            << "\"key\":\"" << escapeJson(key) << "\","
+            << "\"value\":\"" << escapeJson(value) << "\","
+            << "\"infiniteReconnect\":" << (optionsSnapshot.infiniteReconnect ? "true" : "false") << ","
+            << "\"reconnectOnEof\":" << (optionsSnapshot.reconnectOnEof ? "true" : "false") << ","
+            << "\"reconnectOn404\":" << (optionsSnapshot.reconnectOn404 ? "true" : "false") << ","
+            << "\"keepWaitingWhenSourceMissing\":" << (optionsSnapshot.keepWaitingWhenSourceMissing ? "true" : "false") << ","
+            << "\"reconnectMaxRetry\":" << optionsSnapshot.reconnectMaxRetry << ","
+            << "\"reconnectInitialDelayMs\":" << optionsSnapshot.reconnectInitialDelayMs << ","
+            << "\"reconnectMaxDelayMs\":" << optionsSnapshot.reconnectMaxDelayMs << "}";
+        return out.str();
+    }
+    if (normalizedKey == "reconnect_initial_delay_ms"
+        || normalizedKey == "reconnect_max_delay_ms"
+        || normalizedKey == "reconnect_max_retry") {
+        int parsed = 0;
+        if (!parseIntOption(value, parsed)) {
+            return jsonError(-1, normalizedKey + " must be an integer");
+        }
+        if ((normalizedKey == "reconnect_initial_delay_ms" || normalizedKey == "reconnect_max_delay_ms") && parsed < 100) {
+            return jsonError(-1, normalizedKey + " must be >= 100");
+        }
+        if (normalizedKey == "reconnect_max_retry" && parsed < -1) {
+            return jsonError(-1, "reconnect_max_retry must be -1 or a non-negative integer");
+        }
+        PlayerOptions optionsSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (normalizedKey == "reconnect_initial_delay_ms") {
+                playerOptions_.reconnectInitialDelayMs = parsed;
+            } else if (normalizedKey == "reconnect_max_delay_ms") {
+                playerOptions_.reconnectMaxDelayMs = parsed;
+            } else {
+                playerOptions_.reconnectMaxRetry = parsed;
+                playerOptions_.infiniteReconnect = parsed < 0;
+            }
+            syncReconnectPolicyFromOptionsLocked();
+            optionsSnapshot = playerOptions_;
+        }
+        LOGI("setPlayerOption key=%s value=%s", key.c_str(), value.c_str());
+        std::ostringstream out;
+        out << "{\"success\":true,\"message\":\"reconnect option updated\","
+            << "\"key\":\"" << escapeJson(key) << "\","
+            << "\"value\":\"" << escapeJson(value) << "\","
+            << "\"infiniteReconnect\":" << (optionsSnapshot.infiniteReconnect ? "true" : "false") << ","
+            << "\"reconnectMaxRetry\":" << optionsSnapshot.reconnectMaxRetry << ","
+            << "\"reconnectInitialDelayMs\":" << optionsSnapshot.reconnectInitialDelayMs << ","
+            << "\"reconnectMaxDelayMs\":" << optionsSnapshot.reconnectMaxDelayMs << "}";
+        return out.str();
     }
 
     PlayerOptions optionsSnapshot;
@@ -945,8 +1524,8 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
             return jsonError(-1, error);
         }
         rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
-        preferUdpTransport_.store(playerOptions_.rtspTransport == RtspTransport::UDP
-                                  || playerOptions_.rtspTransport == RtspTransport::UDP_MULTICAST);
+        preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
     }
 
@@ -957,6 +1536,74 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
         << "\"value\":\"" << escapeJson(value) << "\","
         << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
         << "\"rtspTransport\":\"" << rtspTransportName(optionsSnapshot.rtspTransport) << "\"}";
+    return out.str();
+}
+
+std::string NativePlayer::setHardwareDecode(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Preparing || state_ == PlayerState::Prepared
+            || state_ == PlayerState::Playing || state_ == PlayerState::Paused
+            || state_ == PlayerState::Reconnecting) {
+            return jsonError(-1, "hardware decode mode can only be changed before prepare");
+        }
+        playerOptions_.enableHardwareDecode = enabled;
+        if (!enabled) {
+            playerOptions_.renderMode = RenderMode::SOFTWARE_RGBA;
+            playerOptions_.usingHardwareDecoder = false;
+        }
+        playerOptions_.requestedDecoderName.clear();
+        playerOptions_.actualDecoderName.clear();
+        playerOptions_.hardwareDecodeFallbackUsed = false;
+        playerOptions_.hardwareDecodeError.clear();
+        optionsSnapshot = playerOptions_;
+    }
+
+    LOGI("setHardwareDecode enableHardwareDecode=%d renderMode=%s",
+         enabled ? 1 : 0, renderModeName(optionsSnapshot.renderMode).c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"enableHardwareDecode\":" << (enabled ? "true" : "false") << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+
+    RenderMode parsedMode;
+    if (!parseRenderMode(mode, parsedMode)) {
+        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface");
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Preparing || state_ == PlayerState::Prepared
+            || state_ == PlayerState::Playing || state_ == PlayerState::Paused
+            || state_ == PlayerState::Reconnecting) {
+            return jsonError(-1, "hardware decode mode can only be changed before prepare");
+        }
+        playerOptions_.renderMode = parsedMode;
+        if (parsedMode != RenderMode::MEDIACODEC_SURFACE) {
+            playerOptions_.usingHardwareDecoder = false;
+        }
+        playerOptions_.requestedDecoderName.clear();
+        playerOptions_.actualDecoderName.clear();
+        playerOptions_.hardwareDecodeFallbackUsed = false;
+        playerOptions_.hardwareDecodeError.clear();
+        optionsSnapshot = playerOptions_;
+    }
+
+    LOGI("setHardwareRenderMode enableHardwareDecode=%d renderMode=%s",
+         optionsSnapshot.enableHardwareDecode ? 1 : 0, renderModeName(optionsSnapshot.renderMode).c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\"}";
     return out.str();
 }
 
@@ -973,12 +1620,23 @@ std::string NativePlayer::getLatencyConfig() {
         sourceType = sourceType_;
         preferUdp = preferUdpTransport_.load();
     }
-    return playerOptionsToJson(optionsSnapshot, sourceType, preferUdp);
+    return playerOptionsToJson(optionsSnapshot, sourceType, preferUdp, effectiveSyncMasterName(optionsSnapshot));
 }
 
 std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
     if (isReleased()) {
         return jsonError(-1, "player is released");
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (playerOptions_.renderMode == RenderMode::MEDIACODEC_SURFACE && playerOptions_.usingHardwareDecoder) {
+            LOGE("snapshot unsupported in mediacodec_surface");
+            return jsonError(-1, "Snapshot is not supported in mediacodec_surface mode yet. Use software_rgba mode or implement PixelCopy.");
+        }
+        if (playerOptions_.renderMode == RenderMode::SOFTWARE_YUV_GL) {
+            LOGE("snapshot unsupported in software_yuv_gl");
+            return jsonError(-1, "Snapshot is not supported in software_yuv_gl mode yet. Use software_rgba mode or PixelCopy.");
+        }
     }
 
     std::vector<uint8_t> frameCopy;
@@ -1110,6 +1768,16 @@ std::string NativePlayer::release() {
     stop();
     remuxRecorder_.release();
     renderer_.release();
+    yuvGlRenderer_.release();
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env != nullptr) {
+        std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+        deleteSurfaceGlobalRefLocked(env);
+    } else {
+        LOGE("releasePlayer could not get JNIEnv to delete Surface global ref");
+    }
+    detachCurrentThreadIfNeeded(attached);
     clearLastFrame();
     releaseFfmpegResources();
 
@@ -1166,6 +1834,150 @@ void NativePlayer::resetRealtimeClock() {
     realtimeStartWallUs_ = 0;
     lastRealtimeDropLogMs_ = 0;
     dropUntilKeyFrame_ = false;
+    startupKeyFrameWait_ = false;
+    startupKeyFrameWaitStartMs_ = 0;
+    startupKeyFrameWaitActive_.store(false);
+}
+
+void NativePlayer::beginStartupKeyFrameWait(const char *reason) {
+    if (!isRealtimeInput_ || videoStreamIndex_ < 0) {
+        return;
+    }
+    dropUntilKeyFrame_ = true;
+    startupKeyFrameWait_ = true;
+    startupKeyFrameWaitStartMs_ = nowMs();
+    startupKeyFrameWaitActive_.store(true);
+    LOGI("wait first keyframe reason=%s timeoutMs=%lld",
+         reason == nullptr ? "unknown" : reason,
+         static_cast<long long>(kStartupKeyFrameWaitTimeoutMs));
+}
+
+void NativePlayer::finishStartupKeyFrameWait(const char *reason) {
+    dropUntilKeyFrame_ = false;
+    startupKeyFrameWait_ = false;
+    startupKeyFrameWaitStartMs_ = 0;
+    startupKeyFrameWaitActive_.store(false);
+    resetRealtimeClock();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Reconnected && !pauseRequested_.load()) {
+            state_ = PlayerState::Playing;
+        }
+    }
+    LOGI("finish first video keyframe wait reason=%s",
+         reason == nullptr ? "unknown" : reason);
+}
+
+SyncMaster NativePlayer::effectiveSyncMaster(const PlayerOptions &options) const {
+    if (options.syncMaster == SyncMaster::AUDIO) {
+        if (isAudioPlaybackMasterAvailable(sourceHasAudio_.load(), audioEnabled_.load(), audioPlayable_.load(), audioClockUs_.load())) {
+            return SyncMaster::AUDIO;
+        }
+        return SyncMaster::VIDEO;
+    }
+    return options.syncMaster;
+}
+
+std::string NativePlayer::effectiveSyncMasterName(const PlayerOptions &options) const {
+    return syncMasterName(effectiveSyncMaster(options));
+}
+
+bool NativePlayer::resolveMasterClockUs(const PlayerOptions &options, int64_t videoPtsUs, int64_t &masterClockUs, SyncMaster &effectiveMaster) {
+    const int64_t nowUs = steadyNowUs();
+    wallClockUs_.store(nowUs);
+    effectiveMaster = effectiveSyncMaster(options);
+
+    if (effectiveMaster == SyncMaster::AUDIO) {
+        const int64_t audioClockUs = audioClockUs_.load();
+        if (audioClockUs <= 0) {
+            return false;
+        }
+        masterClockUs = audioClockUs;
+        return true;
+    }
+
+    if (!realtimeClockInitialized_) {
+        if (!isValidPts(videoPtsUs)) {
+            return false;
+        }
+        realtimeClockInitialized_ = true;
+        realtimeFirstPtsUs_ = videoPtsUs;
+        realtimeStartWallUs_ = nowUs;
+        masterClockUs = videoPtsUs;
+        return true;
+    }
+
+    const int64_t wallElapsedUs = nowUs - realtimeStartWallUs_;
+    if (wallElapsedUs < 0) {
+        resetRealtimeClock();
+        return false;
+    }
+
+    masterClockUs = realtimeFirstPtsUs_ + wallElapsedUs;
+    return masterClockUs >= 0;
+}
+
+void NativePlayer::updateVideoDelayStats(int64_t delayUs) {
+    const int64_t safeDelayUs = std::max<int64_t>(0, delayUs);
+    lastVideoDelayUs_.store(safeDelayUs);
+    totalVideoDelayUs_.fetch_add(safeDelayUs);
+    videoDelaySampleCount_.fetch_add(1);
+    updateMax(maxVideoDelayUs_, safeDelayUs);
+}
+
+bool NativePlayer::shouldDropRealtimePacket(const AVPacket *packet) {
+    if (packet == nullptr || packet->stream_index != videoStreamIndex_) {
+        return false;
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+
+    if (!isRealtimeInput_ || !optionsSnapshot.enablePacketDrop || packet->pts == AV_NOPTS_VALUE) {
+        return false;
+    }
+    if (isKeyPacket(packet)) {
+        return false;
+    }
+    if (formatContext_ == nullptr || videoStreamIndex_ < 0 || formatContext_->streams[videoStreamIndex_] == nullptr) {
+        return false;
+    }
+
+    const int64_t packetPtsUs = av_rescale_q(packet->pts, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
+    if (!isValidPts(packetPtsUs)) {
+        return false;
+    }
+
+    int64_t masterClockUs = 0;
+    SyncMaster effectiveMaster = SyncMaster::VIDEO;
+    if (!resolveMasterClockUs(optionsSnapshot, packetPtsUs, masterClockUs, effectiveMaster)) {
+        return false;
+    }
+
+    const int64_t delayUs = masterClockUs - packetPtsUs;
+    if (delayUs <= 0) {
+        return false;
+    }
+    updateVideoDelayStats(delayUs);
+    if (delayUs <= optionsSnapshot.dropLatePacketThresholdUs) {
+        return false;
+    }
+
+    droppedVideoPacketCount_.fetch_add(1);
+    packetDropBeforeDecodeCount_.fetch_add(1);
+    const int64_t nowMsValue = nowMs();
+    if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
+        LOGE("drop realtime video packet before decode delayUs=%lld ptsUs=%lld masterClockUs=%lld thresholdUs=%lld master=%s",
+             static_cast<long long>(delayUs), static_cast<long long>(packetPtsUs),
+             static_cast<long long>(masterClockUs),
+             static_cast<long long>(optionsSnapshot.dropLatePacketThresholdUs),
+             syncMasterName(effectiveMaster).c_str());
+        lastRealtimeDropLogMs_ = nowMsValue;
+    }
+    return true;
 }
 
 bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
@@ -1175,96 +1987,45 @@ bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
         optionsSnapshot = playerOptions_;
     }
 
-    if (!isRealtimeInput_ || !optionsSnapshot.enableFrameDrop || ptsUs < 0) {
-        lastVideoDelayUs_.store(0);
+    if (!isRealtimeInput_ || !optionsSnapshot.enableFrameDrop || !isValidPts(ptsUs)) {
         return false;
     }
 
-    const int64_t nowUs = av_gettime_relative();
-    const int64_t audioClockUs = audioClockUs_.load();
-    const bool useAudioMaster = sourceHasAudio_.load()
-                                && audioEnabled_.load()
-                                && audioPlayable_.load()
-                                && audioClockUs > 0;
-    if (!useAudioMaster && sourceHasAudio_.load() && audioClockUs > 0 && audioEnabled_.load()) {
-        const int64_t nowMsValue = nowMs();
-        if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
-            LOGI("frame drop uses wall clock because audio master is not playable audioEnabled=%d audioPlayable=%d audioClockUs=%lld",
-                 audioEnabled_.load() ? 1 : 0, audioPlayable_.load() ? 1 : 0,
-                 static_cast<long long>(audioClockUs));
-            lastRealtimeDropLogMs_ = nowMsValue;
-        }
-    }
-    if (useAudioMaster) {
-        const int64_t diffUs = ptsUs - audioClockUs;
-        lastVideoDelayUs_.store(diffUs);
-        if (diffUs >= -optionsSnapshot.dropLateFrameThresholdUs) {
-            return false;
-        }
-
-        droppedVideoFrameCount_.fetch_add(1);
-        const int64_t nowMsValue = nowMs();
-        if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
-            LOGE("drop realtime frame by audio clock diffUs=%lld ptsUs=%lld audioClockUs=%lld thresholdUs=%lld",
-                 static_cast<long long>(diffUs), static_cast<long long>(ptsUs),
-                 static_cast<long long>(audioClockUs),
-                 static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
-            lastRealtimeDropLogMs_ = nowMsValue;
-        }
-        if (-diffUs > keyFrameCatchupLatencyUs_) {
-            dropUntilKeyFrame_ = true;
-            if (videoCodecContext_ != nullptr) {
-                avcodec_flush_buffers(videoCodecContext_);
-            }
-            LOGE("realtime audio/video delay too high, skip packets until next keyframe diffUs=%lld",
-                 static_cast<long long>(diffUs));
-        }
-        return true;
-    }
-
-    if (!realtimeClockInitialized_ || ptsUs <= realtimeFirstPtsUs_) {
-        realtimeClockInitialized_ = true;
-        realtimeFirstPtsUs_ = ptsUs;
-        realtimeStartWallUs_ = nowUs;
-        lastVideoDelayUs_.store(0);
+    int64_t masterClockUs = 0;
+    SyncMaster effectiveMaster = SyncMaster::VIDEO;
+    if (!resolveMasterClockUs(optionsSnapshot, ptsUs, masterClockUs, effectiveMaster)) {
         return false;
     }
 
-    const int64_t streamElapsedUs = ptsUs - realtimeFirstPtsUs_;
-    const int64_t wallElapsedUs = nowUs - realtimeStartWallUs_;
-    if (streamElapsedUs < 0 || wallElapsedUs < 0) {
-        resetRealtimeClock();
-        lastVideoDelayUs_.store(0);
+    const int64_t delayUs = masterClockUs - ptsUs;
+    if (delayUs <= 0) {
+        updateVideoDelayStats(0);
         return false;
     }
-    if (streamElapsedUs < 100000) {
-        lastVideoDelayUs_.store(0);
-        return false;
-    }
-
-    const int64_t diffUs = streamElapsedUs - wallElapsedUs;
-    lastVideoDelayUs_.store(diffUs);
-    if (diffUs >= -optionsSnapshot.dropLateFrameThresholdUs) {
+    updateVideoDelayStats(delayUs);
+    if (delayUs <= optionsSnapshot.dropLateFrameThresholdUs) {
         return false;
     }
 
     droppedVideoFrameCount_.fetch_add(1);
+    frameDropBeforeRenderCount_.fetch_add(1);
     const int64_t nowMsValue = nowMs();
     if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
-        LOGE("drop realtime frame diffUs=%lld ptsUs=%lld streamElapsedUs=%lld wallElapsedUs=%lld thresholdUs=%lld",
-             static_cast<long long>(diffUs), static_cast<long long>(ptsUs),
-             static_cast<long long>(streamElapsedUs), static_cast<long long>(wallElapsedUs),
-             static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs));
+        LOGE("drop realtime frame before render delayUs=%lld ptsUs=%lld masterClockUs=%lld thresholdUs=%lld master=%s",
+             static_cast<long long>(delayUs), static_cast<long long>(ptsUs),
+             static_cast<long long>(masterClockUs),
+             static_cast<long long>(optionsSnapshot.dropLateFrameThresholdUs),
+             syncMasterName(effectiveMaster).c_str());
         lastRealtimeDropLogMs_ = nowMsValue;
     }
 
-    if (-diffUs > keyFrameCatchupLatencyUs_) {
+    if (delayUs > keyFrameCatchupLatencyUs_) {
         dropUntilKeyFrame_ = true;
-        if (videoCodecContext_ != nullptr) {
+        if (videoCodecContext_ != nullptr && !optionsSnapshot.usingHardwareDecoder) {
             avcodec_flush_buffers(videoCodecContext_);
         }
-        LOGE("realtime latency too high, skip packets until next keyframe diffUs=%lld",
-             static_cast<long long>(diffUs));
+        LOGE("realtime latency too high, skip packets until next keyframe delayUs=%lld",
+             static_cast<long long>(delayUs));
     }
     return true;
 }
@@ -1280,69 +2041,178 @@ bool NativePlayer::waitForReconnectDelay(int delayMs) {
     return !stopRequested_.load();
 }
 
+int NativePlayer::reconnectDelayForAttempt(int attempt) const {
+    const int initialDelayMs = std::max(100, reconnectRetryDelayMs_.load());
+    const int maxDelayMs = std::max(initialDelayMs, reconnectMaxDelayMs_.load());
+    int64_t delayMs = initialDelayMs;
+    for (int i = 1; i < attempt && delayMs < maxDelayMs; ++i) {
+        delayMs = std::min<int64_t>(delayMs * 2, maxDelayMs);
+    }
+    return static_cast<int>(std::clamp<int64_t>(delayMs, 100, maxDelayMs));
+}
+
+bool NativePlayer::shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const {
+    const bool is404 = containsInsensitive(errorMessage, "404")
+                       || containsInsensitive(errorMessage, "not found");
+    if (is404 && !reconnectOn404_.load()) {
+        return false;
+    }
+    if (containsInsensitive(errorMessage, "end of file") && !reconnectOnEof_.load()) {
+        return false;
+    }
+    return is404
+           || containsInsensitive(errorMessage, "end of file")
+           || containsInsensitive(errorMessage, "connection refused")
+           || containsInsensitive(errorMessage, "timed out")
+           || containsInsensitive(errorMessage, "network is unreachable");
+}
+
+void NativePlayer::syncReconnectPolicyFromOptionsLocked() {
+    infiniteReconnect_.store(playerOptions_.infiniteReconnect);
+    reconnectOnEof_.store(playerOptions_.reconnectOnEof);
+    reconnectOn404_.store(playerOptions_.reconnectOn404);
+    keepWaitingWhenSourceMissing_.store(playerOptions_.keepWaitingWhenSourceMissing);
+    reconnectRetryDelayMs_.store(std::clamp(playerOptions_.reconnectInitialDelayMs, 100, 60000));
+    reconnectMaxDelayMs_.store(std::clamp(playerOptions_.reconnectMaxDelayMs,
+                                         reconnectRetryDelayMs_.load(),
+                                         60000));
+    reconnectMaxRetryCount_.store(playerOptions_.infiniteReconnect ? -1 : std::max(0, playerOptions_.reconnectMaxRetry));
+}
+
 bool NativePlayer::reconnectInput(int readErrorCode) {
     if (!reconnectEnabled_.load() || !isNetworkUrl(url_)) {
         return false;
     }
 
-    const int maxRetryCount = reconnectMaxRetryCount_.load();
-    if (maxRetryCount <= 0) {
+    if (readErrorCode == AVERROR_EOF && !reconnectOnEof_.load()) {
         return false;
     }
 
+    const bool infiniteRetry = infiniteReconnect_.load() || reconnectMaxRetryCount_.load() < 0;
+    const int maxRetryCount = reconnectMaxRetryCount_.load();
+    if (!infiniteRetry && maxRetryCount <= 0) {
+        return false;
+    }
+
+    reconnectExhausted_.store(false);
     const std::string readError = ffmpegErrorToString(readErrorCode);
+    const int64_t disconnectTimeMs = nowMs();
+    lastDisconnectTimeMs_.store(disconnectTimeMs);
+    lastReconnectErrorCode_.store(readErrorCode);
+    reconnecting_.store(true);
+    waitingSource_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+            state_ = PlayerState::Disconnected;
+            errorMessage_ = readError;
+            lastReconnectError_ = readError;
+        }
+    }
     LOGE("playback disconnected url=%s error=%s, start reconnect", url_.c_str(), readError.c_str());
     if (remuxRecorder_.isRecording()) {
         LOGI("reconnect while recorder active; remux recorder keeps output context and resumes when packets return");
     }
 
-    for (int attempt = 1; attempt <= maxRetryCount && !stopRequested_.load(); ++attempt) {
-        reconnecting_.store(true);
+    releaseFfmpegResources();
+    resetRealtimeClock();
+
+    int localAttempt = 0;
+    while (!stopRequested_.load()) {
+        ++localAttempt;
+        const bool finiteRetryExhaustedBeforeAttempt = !infiniteRetry && localAttempt > maxRetryCount;
+        if (finiteRetryExhaustedBeforeAttempt) {
+            break;
+        }
+
+        const int retryDelayMs = reconnectDelayForAttempt(localAttempt);
         lastReconnectTimeMs_.store(nowMs());
         reconnectAttemptCount_.fetch_add(1);
-        {
+        if (!waitingSource_.load()) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
                 state_ = PlayerState::Reconnecting;
                 errorMessage_ = readError;
-                lastReconnectError_ = readError;
             }
         }
 
-        const int retryDelayMs = reconnectRetryDelayMs_.load();
-        LOGI("reconnect attempt %d/%d delayMs=%d url=%s", attempt, maxRetryCount, retryDelayMs, url_.c_str());
+        LOGI("reconnect attempt %d/%d delayMs=%d url=%s",
+             localAttempt, infiniteRetry ? -1 : maxRetryCount, retryDelayMs, url_.c_str());
         if (!waitForReconnectDelay(retryDelayMs)) {
             break;
         }
 
-        releaseFfmpegResources();
+        waitingSource_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+                state_ = PlayerState::Reconnecting;
+            }
+        }
+
         std::string error;
         const int result = openInput(url_, timeoutMs_, true, error);
         if (result >= 0) {
             reconnectSuccessCount_.fetch_add(1);
             reconnecting_.store(false);
+            waitingSource_.store(false);
+            reconnectExhausted_.store(false);
+            lastReconnectErrorCode_.store(0);
+            const int64_t successTimeMs = nowMs();
+            lastReconnectSuccessTimeMs_.store(successTimeMs);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
-                    state_ = pauseRequested_.load() ? PlayerState::Paused : PlayerState::Playing;
+                    state_ = pauseRequested_.load() ? PlayerState::Paused : PlayerState::Reconnected;
                     errorMessage_.clear();
                     lastReconnectError_.clear();
                 }
             }
             resetRealtimeClock();
-            LOGI("reconnect success attempt=%d url=%s", attempt, url_.c_str());
+            beginStartupKeyFrameWait("reconnect");
+            if (!startupKeyFrameWaitActive_.load()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (state_ == PlayerState::Reconnected && !pauseRequested_.load()) {
+                    state_ = PlayerState::Playing;
+                }
+            }
+            LOGI("RTSP open success url=%s", url_.c_str());
+            LOGI("reconnect success attempt=%d url=%s", localAttempt, url_.c_str());
             return true;
         }
 
+        lastReconnectErrorCode_.store(result);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             lastReconnectError_ = error;
             errorMessage_ = error;
         }
-        LOGE("reconnect failed attempt=%d/%d url=%s error=%s", attempt, maxRetryCount, url_.c_str(), error.c_str());
+        LOGE("reconnect failed attempt=%d/%d url=%s error=%s",
+             localAttempt, infiniteRetry ? -1 : maxRetryCount, url_.c_str(), error.c_str());
+
+        const bool sourceMissing = shouldTreatOpenErrorAsSourceMissing(error);
+        if (sourceMissing && keepWaitingWhenSourceMissing_.load()) {
+            waitingSource_.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+                    state_ = PlayerState::WaitingSource;
+                    lastReconnectError_ = error;
+                    errorMessage_ = error;
+                }
+            }
+            LOGI("playerState=WAITING_SOURCE reconnect attempt=%d lastError=%s", localAttempt, error.c_str());
+            LOGI("keep waiting for source url=%s", url_.c_str());
+            continue;
+        }
+
+        if (!infiniteRetry && localAttempt >= maxRetryCount) {
+            break;
+        }
     }
 
     reconnecting_.store(false);
+    waitingSource_.store(false);
     std::string finalError;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1351,6 +2221,7 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
     if (stopRequested_.load()) {
         return false;
     }
+    reconnectExhausted_.store(true);
     setState(PlayerState::Error, finalError);
     LOGE("reconnect exhausted url=%s error=%s", url_.c_str(), finalError.c_str());
     return false;
@@ -1385,6 +2256,7 @@ bool NativePlayer::switchTransportInput() {
     }
 
     resetRealtimeClock();
+    beginStartupKeyFrameWait("transport_switch");
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
@@ -1417,7 +2289,10 @@ void NativePlayer::playbackLoop() {
             continue;
         }
 
+        const int64_t readStartUs = steadyNowUs();
         const int readResult = av_read_frame(formatContext_, packet_);
+        recordCost(lastReadFrameCostUs_, totalReadFrameCostUs_, readFrameCostSampleCount_, maxReadFrameCostUs_,
+                   steadyNowUs() - readStartUs);
         lastReadPacketTimeMs_.store(nowMs());
         if (readResult < 0) {
             if (transportSwitchRequested_.exchange(false)) {
@@ -1428,7 +2303,10 @@ void NativePlayer::playbackLoop() {
                 continue;
             }
 
-            const bool shouldReconnectEof = readResult == AVERROR_EOF && reconnectEnabled_.load() && isNetworkUrl(url_);
+            const bool shouldReconnectEof = readResult == AVERROR_EOF
+                                            && reconnectEnabled_.load()
+                                            && reconnectOnEof_.load()
+                                            && isNetworkUrl(url_);
             if (stopRequested_.load() || (readResult == AVERROR_EOF && !shouldReconnectEof)) {
                 break;
             }
@@ -1456,6 +2334,8 @@ void NativePlayer::playbackLoop() {
         }
 
         const int64_t packetCount = readPacketCount_.fetch_add(1) + 1;
+        const int packetSize = std::max(packet_->size, 0);
+        inputPacketBytes_.fetch_add(packetSize);
         ++sessionReadPacketCount;
         if (packetCount == 1 || packetCount % 250 == 0) {
             LOGI("read packet count=%lld stream=%d size=%d pts=%lld dts=%lld flags=0x%x",
@@ -1464,6 +2344,7 @@ void NativePlayer::playbackLoop() {
         }
         if (packet_->stream_index == videoStreamIndex_) {
             const int64_t videoPackets = videoPacketCount_.fetch_add(1) + 1;
+            videoPacketBytes_.fetch_add(packetSize);
             if (videoPackets == 1 || videoPackets % 100 == 0) {
                 LOGI("video packet count=%lld size=%d pts=%lld key=%d",
                      static_cast<long long>(videoPackets), packet_->size,
@@ -1471,6 +2352,7 @@ void NativePlayer::playbackLoop() {
             }
         } else if (packet_->stream_index == audioStreamIndex_) {
             const int64_t audioPackets = audioPacketCount_.fetch_add(1) + 1;
+            audioPacketBytes_.fetch_add(packetSize);
             if (audioPackets == 1 || audioPackets % 100 == 0) {
                 LOGI("audio packet count=%lld size=%d pts=%lld",
                      static_cast<long long>(audioPackets), packet_->size,
@@ -1486,16 +2368,38 @@ void NativePlayer::playbackLoop() {
             remuxRecorder_.onPacket(packet_, formatContext_);
         }
 
+        if (shouldDropRealtimePacket(packet_)) {
+            av_packet_unref(packet_);
+            continue;
+        }
+
+        if (isRealtimeInput_ && dropUntilKeyFrame_) {
+            const int64_t waitElapsedMs = startupKeyFrameWait_ && startupKeyFrameWaitStartMs_ > 0
+                                          ? nowMs() - startupKeyFrameWaitStartMs_
+                                          : 0;
+            if (startupKeyFrameWait_ && waitElapsedMs > kStartupKeyFrameWaitTimeoutMs) {
+                LOGE("first video keyframe wait timeout elapsedMs=%lld, allow decode from stream=%d key=%d",
+                     static_cast<long long>(waitElapsedMs), packet_->stream_index,
+                     (packet_->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
+                finishStartupKeyFrameWait("timeout");
+            }
+        }
+
         if (isRealtimeInput_ && dropUntilKeyFrame_) {
             if (packet_->stream_index == videoStreamIndex_) {
                 if ((packet_->flags & AV_PKT_FLAG_KEY) == 0) {
+                    droppedVideoPacketCount_.fetch_add(1);
+                    packetDropBeforeDecodeCount_.fetch_add(1);
+                    if (startupKeyFrameWait_) {
+                        startupKeyFrameDroppedPacketCount_.fetch_add(1);
+                    }
                     av_packet_unref(packet_);
                     continue;
                 }
-                LOGI("realtime catch-up keyframe received, resume decode pts=%lld",
-                     static_cast<long long>(packet_->pts));
-                dropUntilKeyFrame_ = false;
-                resetRealtimeClock();
+                LOGI("realtime keyframe received, resume decode pts=%lld startupWait=%d",
+                     static_cast<long long>(packet_->pts), startupKeyFrameWait_ ? 1 : 0);
+                LOGI("first keyframe received pts=%lld", static_cast<long long>(packet_->pts));
+                finishStartupKeyFrameWait(startupKeyFrameWait_ ? "keyframe" : "catchup");
             } else {
                 av_packet_unref(packet_);
                 continue;
@@ -1503,7 +2407,9 @@ void NativePlayer::playbackLoop() {
         }
 
         if (packet_->stream_index == videoStreamIndex_) {
+            const int64_t sendStartUs = steadyNowUs();
             int result = avcodec_send_packet(videoCodecContext_, packet_);
+            lastSendPacketCostUs_.store(steadyNowUs() - sendStartUs);
             if (result < 0) {
                 const std::string error = ffmpegErrorToString(result);
                 LOGE("avcodec_send_packet error: %s", error.c_str());
@@ -1511,8 +2417,36 @@ void NativePlayer::playbackLoop() {
                 continue;
             }
 
+            PlayerOptions optionsSnapshot;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                optionsSnapshot = playerOptions_;
+            }
+            const bool latestFrameOnly = isRealtimeInput_ && optionsSnapshot.enableLatestFrameOnly && latestFrame_ != nullptr;
+            bool hasLatestFrame = false;
+
+            auto processDecodedVideoFrame = [&](AVFrame *frame, int64_t frameProcessStartUs) {
+                if (renderFrame(frame)) {
+                    int64_t ptsUs = 0;
+                    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
+                    }
+                    recordCost(lastFrameProcessCostUs_, totalFrameProcessCostUs_, frameProcessCostSampleCount_, maxFrameProcessCostUs_,
+                               steadyNowUs() - frameProcessStartUs);
+                    const int64_t frames = videoFrameCount_.fetch_add(1) + 1;
+                    if (frames == 1 || frames % 100 == 0) {
+                        LOGI("decoded video frame count=%lld width=%d height=%d format=%d ptsUs=%lld",
+                             static_cast<long long>(frames), frame->width, frame->height,
+                             frame->format, static_cast<long long>(ptsUs));
+                    }
+                }
+            };
+
             while (!stopRequested_.load()) {
+                const int64_t receiveStartUs = steadyNowUs();
                 result = avcodec_receive_frame(videoCodecContext_, decodedFrame_);
+                const int64_t receiveCostUs = steadyNowUs() - receiveStartUs;
+                lastReceiveFrameCostUs_.store(receiveCostUs);
                 if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
                     break;
                 }
@@ -1521,23 +2455,31 @@ void NativePlayer::playbackLoop() {
                     LOGE("avcodec_receive_frame error: %s", error.c_str());
                     break;
                 }
+                recordCost(lastReceiveFrameCostUs_, totalDecodeCostUs_, decodeCostSampleCount_, maxDecodeCostUs_, receiveCostUs);
 
-                if (renderFrame(decodedFrame_)) {
-                    int64_t ptsUs = 0;
-                    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && decodedFrame_->best_effort_timestamp != AV_NOPTS_VALUE) {
-                        ptsUs = av_rescale_q(decodedFrame_->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
+                if (latestFrameOnly && decodedFrame_->format != AV_PIX_FMT_MEDIACODEC) {
+                    if (hasLatestFrame) {
+                        droppedVideoFrameCount_.fetch_add(1);
+                        frameDropBeforeRenderCount_.fetch_add(1);
                     }
-                    const int64_t frames = videoFrameCount_.fetch_add(1) + 1;
-                    if (frames == 1 || frames % 100 == 0) {
-                        LOGI("decoded video frame count=%lld width=%d height=%d format=%d ptsUs=%lld",
-                             static_cast<long long>(frames), decodedFrame_->width, decodedFrame_->height,
-                             decodedFrame_->format, static_cast<long long>(ptsUs));
-                    }
+                    av_frame_unref(latestFrame_);
+                    av_frame_move_ref(latestFrame_, decodedFrame_);
+                    hasLatestFrame = true;
+                    continue;
                 }
+
+                processDecodedVideoFrame(decodedFrame_, receiveStartUs);
                 av_frame_unref(decodedFrame_);
                 if (frameDelayMs > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(frameDelayMs));
                 }
+            }
+
+            if (latestFrameOnly) {
+                if (hasLatestFrame && !stopRequested_.load()) {
+                    processDecodedVideoFrame(latestFrame_, steadyNowUs());
+                }
+                av_frame_unref(latestFrame_);
             }
         }
 
@@ -1549,6 +2491,128 @@ void NativePlayer::playbackLoop() {
         state_ = PlayerState::Stopped;
     }
     LOGI("playback thread ended player=%p", this);
+}
+
+bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
+    if (frame == nullptr) {
+        return false;
+    }
+
+    hardwareDecodedFrameCount_.fetch_add(1);
+    lastSwsScaleCostUs_.store(-1);
+    lastRenderLockCostUs_.store(-1);
+    lastRenderCopyCostUs_.store(-1);
+    lastRenderPostCostUs_.store(-1);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFrameFormatName_ = "mediacodec";
+    }
+
+    AVMediaCodecBuffer *buffer = reinterpret_cast<AVMediaCodecBuffer *>(frame->data[3]);
+    if (buffer == nullptr) {
+        const std::string error = "AV_PIX_FMT_MEDIACODEC frame has null buffer";
+        LOGE("%s", error.c_str());
+        std::lock_guard<std::mutex> lock(mutex_);
+        playerOptions_.hardwareDecodeError = error;
+        return true;
+    }
+
+    const bool drop = shouldDropRealtimeFrame(ptsUs);
+    const int64_t releaseStartUs = steadyNowUs();
+    const int releaseResult = av_mediacodec_release_buffer(buffer, drop ? 0 : 1);
+    const int64_t releaseCostUs = steadyNowUs() - releaseStartUs;
+    lastRenderCostUs_.store(drop ? -1 : releaseCostUs);
+    if (!drop && releaseCostUs > 0) {
+        totalRenderCostUs_.fetch_add(releaseCostUs);
+        renderCostSampleCount_.fetch_add(1);
+        updateMax(maxRenderCostUs_, releaseCostUs);
+    }
+    if (releaseResult < 0) {
+        const std::string error = "av_mediacodec_release_buffer failed: " + ffmpegErrorToString(releaseResult);
+        LOGE("%s", error.c_str());
+        if (!drop) {
+            droppedVideoFrameCount_.fetch_add(1);
+            frameDropBeforeRenderCount_.fetch_add(1);
+        }
+        hardwareDroppedFrameCount_.fetch_add(1);
+        std::lock_guard<std::mutex> lock(mutex_);
+        playerOptions_.hardwareDecodeError = error;
+        return true;
+    }
+
+    if (drop) {
+        const int64_t dropped = hardwareDroppedFrameCount_.fetch_add(1) + 1;
+        if (dropped == 1 || dropped % 100 == 0) {
+            LOGI("release mediacodec buffer render=0 drop reason=late count=%lld",
+                 static_cast<long long>(dropped));
+        }
+        return true;
+    }
+
+    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    const int64_t hardwareRendered = hardwareRenderedFrameCount_.fetch_add(1) + 1;
+    if (hardwareRendered == 1 || hardwareRendered % 100 == 0) {
+        LOGI("receive AV_PIX_FMT_MEDIACODEC frame count=%lld ptsUs=%lld",
+             static_cast<long long>(hardwareRenderedFrameCount_.load()),
+             static_cast<long long>(ptsUs));
+        LOGI("release mediacodec buffer render=1 count=%lld renderedFrameCount=%lld",
+             static_cast<long long>(hardwareRendered),
+             static_cast<long long>(renderedFrames));
+    }
+    lastRenderTimeMs_.store(nowMs());
+    return true;
+}
+
+bool NativePlayer::isSoftwareYuvGlFrameSupported(int frameFormat) const {
+    return frameFormat == AV_PIX_FMT_YUV420P || frameFormat == AV_PIX_FMT_YUVJ420P;
+}
+
+bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
+    if (frame == nullptr || !isSoftwareYuvGlFrameSupported(frame->format)) {
+        return false;
+    }
+    if (!yuvGlRenderer_.hasSurface()) {
+        LOGE("GL YUV render skipped: surface not attached");
+        return false;
+    }
+
+    const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],
+                                                          frame->data[1], frame->linesize[1],
+                                                          frame->data[2], frame->linesize[2],
+                                                          frameWidth, frameHeight);
+    lastSwsScaleCostUs_.store(-1);
+    lastRenderCostUs_.store(result.stats.totalCostUs);
+    lastRenderLockCostUs_.store(-1);
+    lastRenderCopyCostUs_.store(result.stats.copyCostUs);
+    lastRenderPostCostUs_.store(result.stats.postCostUs);
+    if (result.stats.totalCostUs > 0) {
+        totalRenderCostUs_.fetch_add(result.stats.totalCostUs);
+        renderCostSampleCount_.fetch_add(1);
+        updateMax(maxRenderCostUs_, result.stats.totalCostUs);
+    }
+    if (!result.success) {
+        const int64_t fallbackCount = yuvGlFallbackFrameCount_.fetch_add(1) + 1;
+        if (fallbackCount == 1 || fallbackCount % 100 == 0) {
+            LOGE("GL YUV render failed, fallback RGBA count=%lld error=%s",
+                 static_cast<long long>(fallbackCount), result.errorMessage.c_str());
+        }
+        return false;
+    }
+
+    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    softwareRenderedFrameCount_.fetch_add(1);
+    const int64_t yuvGlRendered = yuvGlRenderedFrameCount_.fetch_add(1) + 1;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFrameFormatName_ = "yuv420p_gl";
+    }
+    if (yuvGlRendered == 1 || yuvGlRendered % 100 == 0) {
+        LOGI("GL YUV render success count=%lld renderedFrameCount=%lld width=%d height=%d ptsUs=%lld",
+             static_cast<long long>(yuvGlRendered), static_cast<long long>(renderedFrames),
+             frameWidth, frameHeight, static_cast<long long>(ptsUs));
+    }
+    lastRenderTimeMs_.store(nowMs());
+    return true;
 }
 
 bool NativePlayer::renderFrame(AVFrame *frame) {
@@ -1565,14 +2629,44 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         return false;
     }
 
-    int64_t ptsUs = 0;
+    int64_t ptsUs = AV_NOPTS_VALUE;
     if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
         ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
     }
-    videoClockUs_.store(ptsUs);
+    if (isValidPts(ptsUs)) {
+        videoClockUs_.store(ptsUs);
+    }
     lastVideoFrameTimeMs_.store(nowMs());
+    if (sourceFormat == AV_PIX_FMT_MEDIACODEC) {
+        return renderMediaCodecFrame(frame, ptsUs);
+    }
+
+    softwareDecodedFrameCount_.fetch_add(1);
+    const char *formatName = av_get_pix_fmt_name(sourceFormat);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        lastFrameFormatName_ = formatName == nullptr ? "unknown" : formatName;
+    }
     if (shouldDropRealtimeFrame(ptsUs)) {
         return true;
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+    if (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL) {
+        if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+            return true;
+        }
+        if (!isSoftwareYuvGlFrameSupported(frame->format)) {
+            const int64_t fallbackCount = yuvGlFallbackFrameCount_.fetch_add(1) + 1;
+            if (fallbackCount == 1 || fallbackCount % 100 == 0) {
+                LOGI("GL YUV unsupported frame format=%d fallback RGBA count=%lld",
+                     frame->format, static_cast<long long>(fallbackCount));
+            }
+        }
     }
 
     if (swsContext_ == nullptr || swsSourceFormat_ != frame->format || videoWidth_ != frameWidth || videoHeight_ != frameHeight) {
@@ -1610,10 +2704,13 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
              frameWidth, frameHeight, frame->format, frame->linesize[0], rgbaFrame_->linesize[0]);
     }
 
+    const int64_t swsStartUs = steadyNowUs();
     sws_scale(swsContext_, frame->data, frame->linesize, 0, frameHeight,
               rgbaFrame_->data, rgbaFrame_->linesize);
+    recordCost(lastSwsScaleCostUs_, totalSwsScaleCostUs_, swsScaleCostSampleCount_, maxSwsScaleCostUs_,
+               steadyNowUs() - swsStartUs);
 
-    saveLastFrame(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight, ptsUs);
+    saveLastFrame(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight, isValidPts(ptsUs) ? ptsUs : 0);
 
     if (!renderer_.hasSurface()) {
         if (renderedFrameCount_.load() == 0 && droppedVideoFrameCount_.load() == 0) {
@@ -1623,12 +2720,23 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     }
 
     const RenderResult result = renderer_.renderRgba(rgbaFrame_->data[0], rgbaFrame_->linesize[0], frameWidth, frameHeight);
+    lastRenderCostUs_.store(result.stats.totalCostUs);
+    lastRenderLockCostUs_.store(result.stats.lockCostUs);
+    lastRenderCopyCostUs_.store(result.stats.copyCostUs);
+    lastRenderPostCostUs_.store(result.stats.postCostUs);
+    if (result.stats.totalCostUs > 0) {
+        totalRenderCostUs_.fetch_add(result.stats.totalCostUs);
+        renderCostSampleCount_.fetch_add(1);
+        updateMax(maxRenderCostUs_, result.stats.totalCostUs);
+    }
     if (!result.success) {
         LOGE("renderRgba failed: %s (%d)", result.errorMessage.c_str(), result.errorCode);
         droppedVideoFrameCount_.fetch_add(1);
+        frameDropBeforeRenderCount_.fetch_add(1);
         return true;
     }
     const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    softwareRenderedFrameCount_.fetch_add(1);
     if (renderedFrames == 1 || renderedFrames % 100 == 0) {
         LOGI("render success count=%lld width=%d height=%d rgbaLineSize=%d ptsUs=%lld",
              static_cast<long long>(renderedFrames), frameWidth, frameHeight,
@@ -1640,6 +2748,18 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
 
 void NativePlayer::saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs) {
     if (rgbaData == nullptr || lineSize <= 0 || width <= 0 || height <= 0) {
+        return;
+    }
+
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+    const int cacheEveryN = std::max(1, optionsSnapshot.cacheLastFrameEveryN);
+    const int64_t candidate = lastFrameCacheCandidateCount_.fetch_add(1) + 1;
+    if ((candidate - 1) % cacheEveryN != 0) {
+        lastFrameCacheSkippedCount_.fetch_add(1);
         return;
     }
 
@@ -1656,6 +2776,7 @@ void NativePlayer::saveLastFrame(const uint8_t *rgbaData, int lineSize, int widt
     lastFrameStride_ = targetStride;
     lastFramePtsUs_ = ptsUs;
     hasLastFrame_ = true;
+    lastFrameCacheUpdateCount_.fetch_add(1);
 }
 
 void NativePlayer::clearLastFrame() {
@@ -1668,14 +2789,39 @@ void NativePlayer::clearLastFrame() {
     hasLastFrame_ = false;
 }
 
+void NativePlayer::deleteSurfaceGlobalRefLocked(JNIEnv *env) {
+    if (surfaceGlobalRef_ != nullptr && env != nullptr) {
+        env->DeleteGlobalRef(surfaceGlobalRef_);
+        surfaceGlobalRef_ = nullptr;
+    }
+}
+
 void NativePlayer::resetStats() {
     readPacketCount_.store(0);
     videoPacketCount_.store(0);
     audioPacketCount_.store(0);
+    inputPacketBytes_.store(0);
+    videoPacketBytes_.store(0);
+    audioPacketBytes_.store(0);
     videoFrameCount_.store(0);
     audioFrameCount_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
+    hardwareDecodedFrameCount_.store(0);
+    hardwareRenderedFrameCount_.store(0);
+    hardwareDroppedFrameCount_.store(0);
+    softwareDecodedFrameCount_.store(0);
+    softwareRenderedFrameCount_.store(0);
+    yuvGlRenderedFrameCount_.store(0);
+    yuvGlFallbackFrameCount_.store(0);
+    droppedVideoPacketCount_.store(0);
+    packetDropBeforeDecodeCount_.store(0);
+    frameDropBeforeRenderCount_.store(0);
+    startupKeyFrameWaitActive_.store(false);
+    startupKeyFrameDroppedPacketCount_.store(0);
+    lastFrameCacheUpdateCount_.store(0);
+    lastFrameCacheSkippedCount_.store(0);
+    lastFrameCacheCandidateCount_.store(0);
     lastReadPacketTimeMs_.store(0);
     lastVideoFrameTimeMs_.store(0);
     lastAudioFrameTimeMs_.store(0);
@@ -1684,12 +2830,46 @@ void NativePlayer::resetStats() {
     startPlayTimeMs_.store(0);
     audioClockUs_.store(0);
     videoClockUs_.store(0);
+    wallClockUs_.store(0);
     lastVideoDelayUs_.store(0);
+    totalVideoDelayUs_.store(0);
+    videoDelaySampleCount_.store(0);
+    maxVideoDelayUs_.store(0);
+    lastReadFrameCostUs_.store(0);
+    totalReadFrameCostUs_.store(0);
+    readFrameCostSampleCount_.store(0);
+    maxReadFrameCostUs_.store(0);
+    lastSendPacketCostUs_.store(0);
+    lastReceiveFrameCostUs_.store(0);
+    totalDecodeCostUs_.store(0);
+    decodeCostSampleCount_.store(0);
+    maxDecodeCostUs_.store(0);
+    lastSwsScaleCostUs_.store(0);
+    totalSwsScaleCostUs_.store(0);
+    swsScaleCostSampleCount_.store(0);
+    maxSwsScaleCostUs_.store(0);
+    lastRenderCostUs_.store(0);
+    lastRenderLockCostUs_.store(0);
+    lastRenderCopyCostUs_.store(0);
+    lastRenderPostCostUs_.store(0);
+    totalRenderCostUs_.store(0);
+    renderCostSampleCount_.store(0);
+    maxRenderCostUs_.store(0);
+    lastFrameProcessCostUs_.store(0);
+    totalFrameProcessCostUs_.store(0);
+    frameProcessCostSampleCount_.store(0);
+    maxFrameProcessCostUs_.store(0);
     reconnecting_.store(false);
+    waitingSource_.store(false);
+    reconnectExhausted_.store(false);
     reconnectAttemptCount_.store(0);
     reconnectSuccessCount_.store(0);
     lastReconnectTimeMs_.store(0);
+    lastDisconnectTimeMs_.store(0);
+    lastReconnectSuccessTimeMs_.store(0);
+    lastReconnectErrorCode_.store(0);
     lastReconnectError_.clear();
+    lastFrameFormatName_.clear();
 }
 
 void NativePlayer::releaseFfmpegResources() {
@@ -1703,13 +2883,21 @@ void NativePlayer::releaseFfmpegResources() {
     if (decodedFrame_ != nullptr) {
         av_frame_free(&decodedFrame_);
     }
+    if (latestFrame_ != nullptr) {
+        av_frame_free(&latestFrame_);
+    }
     if (rgbaFrame_ != nullptr) {
         av_frame_free(&rgbaFrame_);
     }
     rgbaBuffer_.clear();
     if (videoCodecContext_ != nullptr) {
+        if (mediaCodecContextInitialized_) {
+            av_mediacodec_default_free(videoCodecContext_);
+            mediaCodecContextInitialized_ = false;
+        }
         avcodec_free_context(&videoCodecContext_);
     }
+    mediaCodecContextInitialized_ = false;
     if (audioCodecContext_ != nullptr) {
         avcodec_free_context(&audioCodecContext_);
     }
@@ -1741,6 +2929,7 @@ std::string NativePlayer::buildStateJsonLocked() const {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state_) << "\","
+        << "\"playerState\":\"" << playerStateName(state_) << "\","
         << "\"url\":\"" << escapeJson(url_) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
@@ -1760,6 +2949,13 @@ std::string NativePlayer::buildStateJsonLocked() const {
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
+        << "\"reconnectLastError\":\"" << escapeJson(lastReconnectError_) << "\","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
         << "\"reconnectAttemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectSuccessCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectError\":\"" << escapeJson(lastReconnectError_) << "\"}";
@@ -1781,16 +2977,32 @@ std::string NativePlayer::buildReconnectJson() const {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\"," 
+        << "\"playerState\":\"" << playerStateName(state) << "\","
         << "\"rtspTransportMode\":\"" << escapeJson(rtspTransportMode) << "\","
         << "\"currentRtspTransport\":\"" << (preferUdpTransport_.load() ? "udp" : "tcp") << "\","
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"enabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
         << "\"maxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
+        << "\"maxRetry\":" << reconnectMaxRetryCount_.load() << ","
         << "\"retryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"initialDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"maxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
         << "\"attemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"successCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectTimeMs\":" << lastReconnectTimeMs_.load() << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
+        << "\"lastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"reconnectLastError\":\"" << escapeJson(lastError) << "\","
         << "\"lastError\":\"" << escapeJson(lastError) << "\"}";
     return out.str();
 }

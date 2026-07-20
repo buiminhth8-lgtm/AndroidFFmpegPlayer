@@ -6,10 +6,24 @@
     android:background="#000000"
     android:orientation="vertical">
 
-    <TextureView
+    <SurfaceView
         android:id="@+id/playerPreviewView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
+
+    <TextView
+        android:id="@+id/playbackInfoTextView"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:background="#99000000"
+        android:fontFamily="monospace"
+        android:padding="8dp"
+        android:text="等待播放"
+        android:textColor="#FFFFFFFF"
+        android:textSize="12sp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
     <ScrollView
         android:layout_width="match_parent"
@@ -119,6 +133,13 @@
                 android:orientation="horizontal">
 
                 <RadioButton
+                    android:id="@+id/lowLatencyUltraRadio"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="ultra_low_latency"
+                    android:textColor="@color/black" />
+                <RadioButton
                     android:id="@+id/lowLatencyRadio"
                     android:layout_width="0dp"
                     android:layout_height="match_parent"
@@ -143,6 +164,13 @@
                     android:text="Stable"
                     android:textColor="@color/black" />
             </RadioGroup>
+
+            <Switch
+                android:id="@+id/hardwareDecodeSwitch"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:text="Hardware Decode"
+                android:textColor="@color/black" />
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -355,6 +383,13 @@
                     android:layout_height="44dp"
                     android:layout_weight="1"
                     android:text="Reconnect" />
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
 
                 <Button
                     android:id="@+id/clearLogButton"

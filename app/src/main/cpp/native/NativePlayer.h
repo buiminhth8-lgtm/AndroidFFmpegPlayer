@@ -3,6 +3,7 @@
 
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
+#include "NativeYuvGlRenderer.h"
 #include "VideoRenderer.h"
 
 #include <jni.h>
@@ -26,7 +27,10 @@ enum class PlayerState {
     Prepared,
     Playing,
     Paused,
+    Disconnected,
+    WaitingSource,
     Reconnecting,
+    Reconnected,
     Stopping,
     Stopped,
     Error,
@@ -35,6 +39,8 @@ enum class PlayerState {
 
 class NativePlayer {
 public:
+    static void setJavaVm(JavaVM *javaVm);
+
     NativePlayer();
     ~NativePlayer();
 
@@ -57,6 +63,8 @@ public:
     std::string getRtspTransportState();
     std::string setLatencyMode(const std::string &mode);
     std::string setOption(const std::string &key, const std::string &value);
+    std::string setHardwareDecode(bool enabled);
+    std::string setHardwareRenderMode(const std::string &mode);
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
@@ -75,11 +83,25 @@ private:
     bool reconnectInput(int readErrorCode);
     bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
+    int reconnectDelayForAttempt(int attempt) const;
+    bool shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const;
+    void syncReconnectPolicyFromOptionsLocked();
+    void beginStartupKeyFrameWait(const char *reason);
+    void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
+    bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
+    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
+    bool shouldDropRealtimePacket(const AVPacket *packet);
     bool shouldDropRealtimeFrame(int64_t ptsUs);
+    bool resolveMasterClockUs(const PlayerOptions &options, int64_t videoPtsUs, int64_t &masterClockUs, SyncMaster &effectiveMaster);
+    SyncMaster effectiveSyncMaster(const PlayerOptions &options) const;
+    std::string effectiveSyncMasterName(const PlayerOptions &options) const;
+    void updateVideoDelayStats(int64_t delayUs);
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
+    void deleteSurfaceGlobalRefLocked(JNIEnv *env);
     void resetStats();
     void releaseFfmpegResources();
     void setState(PlayerState state, const std::string &errorMessage = "");
@@ -88,7 +110,9 @@ private:
     bool isReleased() const;
 
     mutable std::mutex mutex_;
+    mutable std::mutex surfaceMutex_;
     VideoRenderer renderer_;
+    NativeYuvGlRenderer yuvGlRenderer_;
     PlayerRemuxRecorder remuxRecorder_;
     std::thread playbackThread_;
     std::atomic<bool> stopRequested_{false};
@@ -109,11 +133,17 @@ private:
     int64_t realtimeStartWallUs_ = 0;
     int64_t lastRealtimeDropLogMs_ = 0;
     bool dropUntilKeyFrame_ = false;
+    bool startupKeyFrameWait_ = false;
+    int64_t startupKeyFrameWaitStartMs_ = 0;
     int64_t maxRealtimeLatencyUs_ = 250000;
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
     std::atomic<bool> transportSwitchRequested_{false};
     std::atomic<int64_t> lastVideoDelayUs_{0};
+    std::atomic<int64_t> totalVideoDelayUs_{0};
+    std::atomic<int64_t> videoDelaySampleCount_{0};
+    std::atomic<int64_t> maxVideoDelayUs_{0};
+    std::atomic<int64_t> wallClockUs_{0};
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;
@@ -121,8 +151,11 @@ private:
     SwsContext *swsContext_ = nullptr;
     AVPacket *packet_ = nullptr;
     AVFrame *decodedFrame_ = nullptr;
+    AVFrame *latestFrame_ = nullptr;
     AVFrame *rgbaFrame_ = nullptr;
     std::vector<uint8_t> rgbaBuffer_;
+    jobject surfaceGlobalRef_ = nullptr;
+    bool mediaCodecContextInitialized_ = false;
 
     int videoStreamIndex_ = -1;
     int audioStreamIndex_ = -1;
@@ -138,6 +171,7 @@ private:
     double fps_ = 25.0;
     std::string videoCodec_;
     std::string audioCodec_;
+    std::string lastFrameFormatName_;
 
     mutable std::mutex lastFrameMutex_;
     std::vector<uint8_t> lastRgbaFrame_;
@@ -150,15 +184,60 @@ private:
     std::atomic<int64_t> readPacketCount_{0};
     std::atomic<int64_t> videoPacketCount_{0};
     std::atomic<int64_t> audioPacketCount_{0};
+    std::atomic<int64_t> inputPacketBytes_{0};
+    std::atomic<int64_t> videoPacketBytes_{0};
+    std::atomic<int64_t> audioPacketBytes_{0};
+    std::atomic<int64_t> streamBitRate_{0};
+    std::atomic<int64_t> videoBitRate_{0};
+    std::atomic<int64_t> audioBitRate_{0};
     std::atomic<int64_t> videoFrameCount_{0};
     std::atomic<int64_t> audioFrameCount_{0};
     std::atomic<int64_t> renderedFrameCount_{0};
     std::atomic<int64_t> droppedVideoFrameCount_{0};
+    std::atomic<int64_t> hardwareDecodedFrameCount_{0};
+    std::atomic<int64_t> hardwareRenderedFrameCount_{0};
+    std::atomic<int64_t> hardwareDroppedFrameCount_{0};
+    std::atomic<int64_t> softwareDecodedFrameCount_{0};
+    std::atomic<int64_t> softwareRenderedFrameCount_{0};
+    std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
+    std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
+    std::atomic<int64_t> droppedVideoPacketCount_{0};
+    std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
+    std::atomic<int64_t> frameDropBeforeRenderCount_{0};
+    std::atomic<bool> startupKeyFrameWaitActive_{false};
+    std::atomic<int64_t> startupKeyFrameDroppedPacketCount_{0};
+    std::atomic<int64_t> lastFrameCacheUpdateCount_{0};
+    std::atomic<int64_t> lastFrameCacheSkippedCount_{0};
+    std::atomic<int64_t> lastFrameCacheCandidateCount_{0};
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};
+    std::atomic<int64_t> lastReadFrameCostUs_{0};
+    std::atomic<int64_t> totalReadFrameCostUs_{0};
+    std::atomic<int64_t> readFrameCostSampleCount_{0};
+    std::atomic<int64_t> maxReadFrameCostUs_{0};
+    std::atomic<int64_t> lastSendPacketCostUs_{0};
+    std::atomic<int64_t> lastReceiveFrameCostUs_{0};
+    std::atomic<int64_t> totalDecodeCostUs_{0};
+    std::atomic<int64_t> decodeCostSampleCount_{0};
+    std::atomic<int64_t> maxDecodeCostUs_{0};
+    std::atomic<int64_t> lastSwsScaleCostUs_{0};
+    std::atomic<int64_t> totalSwsScaleCostUs_{0};
+    std::atomic<int64_t> swsScaleCostSampleCount_{0};
+    std::atomic<int64_t> maxSwsScaleCostUs_{0};
+    std::atomic<int64_t> lastRenderCostUs_{0};
+    std::atomic<int64_t> lastRenderLockCostUs_{0};
+    std::atomic<int64_t> lastRenderCopyCostUs_{0};
+    std::atomic<int64_t> lastRenderPostCostUs_{0};
+    std::atomic<int64_t> totalRenderCostUs_{0};
+    std::atomic<int64_t> renderCostSampleCount_{0};
+    std::atomic<int64_t> maxRenderCostUs_{0};
+    std::atomic<int64_t> lastFrameProcessCostUs_{0};
+    std::atomic<int64_t> totalFrameProcessCostUs_{0};
+    std::atomic<int64_t> frameProcessCostSampleCount_{0};
+    std::atomic<int64_t> maxFrameProcessCostUs_{0};
     std::atomic<int64_t> startPlayTimeMs_{0};
     std::atomic<int64_t> audioClockUs_{0};
     std::atomic<int64_t> videoClockUs_{0};
@@ -170,11 +249,21 @@ private:
     std::atomic<bool> audioCallbackSet_{false};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
-    std::atomic<int> reconnectMaxRetryCount_{3};
+    std::atomic<bool> infiniteReconnect_{true};
+    std::atomic<bool> reconnectOnEof_{true};
+    std::atomic<bool> reconnectOn404_{true};
+    std::atomic<bool> keepWaitingWhenSourceMissing_{true};
+    std::atomic<int> reconnectMaxRetryCount_{-1};
     std::atomic<int> reconnectRetryDelayMs_{1000};
+    std::atomic<int> reconnectMaxDelayMs_{5000};
     std::atomic<int64_t> reconnectAttemptCount_{0};
     std::atomic<int64_t> reconnectSuccessCount_{0};
     std::atomic<int64_t> lastReconnectTimeMs_{0};
+    std::atomic<int> lastReconnectErrorCode_{0};
+    std::atomic<bool> reconnectExhausted_{false};
+    std::atomic<bool> waitingSource_{false};
+    std::atomic<int64_t> lastDisconnectTimeMs_{0};
+    std::atomic<int64_t> lastReconnectSuccessTimeMs_{0};
 };
 
 #endif // MOTRO_NATIVE_PLAYER_H

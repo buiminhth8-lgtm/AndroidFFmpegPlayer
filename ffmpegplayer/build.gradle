@@ -8,8 +8,8 @@ android {
     compileSdk 36
 
     defaultConfig {
-        minSdk 31
-        targetSdk 36
+        minSdk 24
+        targetSdk 31
         consumerProguardFiles 'consumer-rules.pro'
 
         ndk {
@@ -22,6 +22,9 @@ android {
             java {
                 srcDirs = ['../app/src/main/java']
                 exclude 'com/example/motro/MediaPlayerActivity.java'
+                exclude 'com/example/motro/MediacodecPlayerActivity.java'
+                exclude 'com/example/motro/ExoplayerPlayerActivity.java'
+                exclude 'com/example/motro/PlayerLauncherActivity.java'
             }
             jniLibs.srcDirs = ['../app/src/main/jniLibs']
         }
@@ -39,10 +42,10 @@ android {
         }
     }
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
+//    compileOptions {
+//        sourceCompatibility = JavaVersion.VERSION_17
+//        targetCompatibility = JavaVersion.VERSION_17
+//    }
 
     publishing {
         singleVariant("release") {

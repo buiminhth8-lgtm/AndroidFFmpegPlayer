@@ -16,8 +16,8 @@ android {
     compileSdk 36
     defaultConfig {
         applicationId "com.example.motro"
-        minSdk 31
-        targetSdk 36
+        minSdk 24
+        targetSdk 31
         versionCode 6
         versionName "1.0.0.6"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -81,6 +81,7 @@ android {
 
     buildFeatures {
         viewBinding true
+        dataBinding true
     }
 
 

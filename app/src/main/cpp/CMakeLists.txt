@@ -14,6 +14,7 @@ add_library(native-ffmpeg SHARED
         native-ffmpeg-jni.cpp
         native/NativePlayer.cpp
         native/VideoRenderer.cpp
+        native/NativeYuvGlRenderer.cpp
         native/PlayerOptions.cpp
         native/PlayerRemuxRecorder.cpp
         native/SnapshotManager.cpp)
@@ -49,6 +50,8 @@ set_target_properties(avdevice PROPERTIES
 
 find_library(log-lib log)
 find_library(android-lib android)
+find_library(egl-lib EGL)
+find_library(glesv2-lib GLESv2)
 
 target_link_libraries(native-ffmpeg
         avformat
@@ -57,4 +60,6 @@ target_link_libraries(native-ffmpeg
         swresample
         swscale
         ${log-lib}
-        ${android-lib})
+        ${android-lib}
+        ${egl-lib}
+        ${glesv2-lib})

@@ -20,7 +20,13 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_java_vm = vm;
 
     // 使用 FFmpeg MediaCodec 时建议设置 JavaVM
-    av_jni_set_java_vm(vm, nullptr);
+    avformat_network_init();
+    const int result = av_jni_set_java_vm(vm, nullptr);
+    if (result >= 0) {
+        LOGI("av_jni_set_java_vm success");
+    } else {
+        LOGE("av_jni_set_java_vm failed ret=%d", result);
+    }
 
     return JNI_VERSION_1_6;
 }

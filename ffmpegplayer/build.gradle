@@ -23,6 +23,8 @@ android {
                 srcDirs = ['../app/src/main/java']
                 exclude 'com/example/motro/MediaPlayerActivity.java'
                 exclude 'com/example/motro/MediacodecPlayerActivity.java'
+                exclude 'com/example/motro/ExoplayerPlayerActivity.java'
+                exclude 'com/example/motro/PlayerLauncherActivity.java'
             }
             jniLibs.srcDirs = ['../app/src/main/jniLibs']
         }

@@ -401,10 +401,19 @@ String result = FFmpegNative.takePlayerSnapshot(handle, snapshotPath);
 
 | API | 含义 | 备注 |
 | --- | --- | --- |
-| `setPlayerReconnectOptions(long handle, boolean enabled, int maxRetryCount, int retryDelayMs)` | 设置断流重连策略。 | `maxRetryCount` 会限制在 0 到 100；`retryDelayMs` 会限制在 100 到 60000。 |
-| `getPlayerReconnectState(long handle)` | 查询重连状态。 | 包含 enabled、reconnecting、attemptCount、successCount、lastReconnectError 等。 |
+| `setPlayerReconnectOptions(long handle, boolean enabled, int maxRetryCount, int retryDelayMs)` | 设置断流重连策略。 | `maxRetryCount=-1` 表示无限重连；`retryDelayMs` 会限制在 100 到 60000。 |
+| `getPlayerReconnectState(long handle)` | 查询重连状态。 | 包含 enabled、reconnecting、waitingSource、attemptCount、successCount、lastReconnectError 等。 |
 
-当前重连是基础策略：`av_read_frame` 出错后按配置重开输入，不做复杂网络质量评估。
+当前重连策略：`av_read_frame` 返回 EOF 后进入 `DISCONNECTED/RECONNECTING`，重新打开 RTSP；如果 MediaMTX 在推流未恢复前返回 `404 Not Found`，播放器进入 `WAITING_SOURCE` 并继续等待，不释放 player handle。推流恢复后会重新打开输入、重建 decoder/sws/MediaCodec context、等待首个关键帧，再回到 `PLAYING`。
+
+可通过 `setPlayerOption` 调整：
+
+| key | value | 含义 |
+| --- | --- | --- |
+| `infinite_reconnect` | `true` / `false` | 是否无限重连，默认 `true`。 |
+| `reconnect_on_404` | `true` / `false` | RTSP open 返回 404/Not Found 时是否继续等待，默认 `true`。 |
+| `keep_waiting_when_source_missing` | `true` / `false` | 源不存在、连接拒绝、超时等 transient 错误是否保持等待，默认 `true`。 |
+| `reconnect_max_delay_ms` | int | 重连退避最大延迟，默认 `5000`。 |
 
 ### RTSP transport 和低延迟 API
 

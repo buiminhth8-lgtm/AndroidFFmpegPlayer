@@ -15,7 +15,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Motro">
         <activity
-            android:name=".MediaPlayerActivity"
+            android:name=".PlayerLauncherActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.Motro"
@@ -28,10 +28,22 @@
         </activity>
 
         <activity
+            android:name=".MediaPlayerActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.Motro"
+            android:windowSoftInputMode="stateHidden|adjustPan" />
+
+        <activity
             android:name=".MediacodecPlayerActivity"
             android:exported="true"
             android:windowSoftInputMode="stateHidden|adjustPan">
         </activity>
+
+        <activity
+            android:name=".ExoplayerPlayerActivity"
+            android:exported="true"
+            android:windowSoftInputMode="stateHidden|adjustPan" />
     </application>
 
 </manifest>

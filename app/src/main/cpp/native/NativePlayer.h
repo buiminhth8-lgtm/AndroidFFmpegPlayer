@@ -27,7 +27,10 @@ enum class PlayerState {
     Prepared,
     Playing,
     Paused,
+    Disconnected,
+    WaitingSource,
     Reconnecting,
+    Reconnected,
     Stopping,
     Stopped,
     Error,
@@ -80,6 +83,9 @@ private:
     bool reconnectInput(int readErrorCode);
     bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
+    int reconnectDelayForAttempt(int attempt) const;
+    bool shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const;
+    void syncReconnectPolicyFromOptionsLocked();
     void beginStartupKeyFrameWait(const char *reason);
     void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
@@ -243,11 +249,21 @@ private:
     std::atomic<bool> audioCallbackSet_{false};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
-    std::atomic<int> reconnectMaxRetryCount_{3};
+    std::atomic<bool> infiniteReconnect_{true};
+    std::atomic<bool> reconnectOnEof_{true};
+    std::atomic<bool> reconnectOn404_{true};
+    std::atomic<bool> keepWaitingWhenSourceMissing_{true};
+    std::atomic<int> reconnectMaxRetryCount_{-1};
     std::atomic<int> reconnectRetryDelayMs_{1000};
+    std::atomic<int> reconnectMaxDelayMs_{5000};
     std::atomic<int64_t> reconnectAttemptCount_{0};
     std::atomic<int64_t> reconnectSuccessCount_{0};
     std::atomic<int64_t> lastReconnectTimeMs_{0};
+    std::atomic<int> lastReconnectErrorCode_{0};
+    std::atomic<bool> reconnectExhausted_{false};
+    std::atomic<bool> waitingSource_{false};
+    std::atomic<int64_t> lastDisconnectTimeMs_{0};
+    std::atomic<int64_t> lastReconnectSuccessTimeMs_{0};
 };
 
 #endif // MOTRO_NATIVE_PLAYER_H

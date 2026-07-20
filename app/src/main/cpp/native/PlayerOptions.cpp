@@ -77,6 +77,13 @@ void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
         << "\"enableHardwareDecode\":" << (options.enableHardwareDecode ? "true" : "false") << ","
         << "\"renderMode\":\"" << renderModeName(options.renderMode) << "\","
         << "\"hardwareDecodeAllowFallback\":" << (options.hardwareDecodeAllowFallback ? "true" : "false") << ","
+        << "\"infiniteReconnect\":" << (options.infiniteReconnect ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (options.reconnectOnEof ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (options.reconnectOn404 ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (options.keepWaitingWhenSourceMissing ? "true" : "false") << ","
+        << "\"reconnectInitialDelayMs\":" << options.reconnectInitialDelayMs << ","
+        << "\"reconnectMaxDelayMs\":" << options.reconnectMaxDelayMs << ","
+        << "\"reconnectMaxRetry\":" << options.reconnectMaxRetry << ","
         << "\"requestedDecoderName\":\"" << escapeJson(options.requestedDecoderName) << "\","
         << "\"actualDecoderName\":\"" << escapeJson(options.actualDecoderName) << "\","
         << "\"usingHardwareDecoder\":" << (options.usingHardwareDecoder ? "true" : "false") << ","
@@ -286,6 +293,13 @@ void applyLatencyProfile(PlayerOptions &options) {
     const bool usingHardwareDecoder = options.usingHardwareDecoder;
     const bool hardwareDecodeFallbackUsed = options.hardwareDecodeFallbackUsed;
     const std::string hardwareDecodeError = options.hardwareDecodeError;
+    const bool infiniteReconnect = options.infiniteReconnect;
+    const bool reconnectOnEof = options.reconnectOnEof;
+    const bool reconnectOn404 = options.reconnectOn404;
+    const bool keepWaitingWhenSourceMissing = options.keepWaitingWhenSourceMissing;
+    const int reconnectInitialDelayMs = options.reconnectInitialDelayMs;
+    const int reconnectMaxDelayMs = options.reconnectMaxDelayMs;
+    const int reconnectMaxRetry = options.reconnectMaxRetry;
     options = PlayerOptions{};
     options.rtspTransport = transport;
     options.latencyMode = mode;
@@ -297,6 +311,13 @@ void applyLatencyProfile(PlayerOptions &options) {
     options.usingHardwareDecoder = usingHardwareDecoder;
     options.hardwareDecodeFallbackUsed = hardwareDecodeFallbackUsed;
     options.hardwareDecodeError = hardwareDecodeError;
+    options.infiniteReconnect = infiniteReconnect;
+    options.reconnectOnEof = reconnectOnEof;
+    options.reconnectOn404 = reconnectOn404;
+    options.keepWaitingWhenSourceMissing = keepWaitingWhenSourceMissing;
+    options.reconnectInitialDelayMs = reconnectInitialDelayMs;
+    options.reconnectMaxDelayMs = reconnectMaxDelayMs;
+    options.reconnectMaxRetry = reconnectMaxRetry;
 
     const bool udp = transport == RtspTransport::UDP || transport == RtspTransport::UDP_MULTICAST;
 
@@ -436,6 +457,66 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
             return false;
         }
         options.hardwareDecodeAllowFallback = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "infinite_reconnect") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "infinite_reconnect must be boolean";
+            return false;
+        }
+        options.infiniteReconnect = parsedBool;
+        if (parsedBool) {
+            options.reconnectMaxRetry = -1;
+        }
+        return true;
+    }
+    if (normalizedKey == "reconnect_on_eof") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "reconnect_on_eof must be boolean";
+            return false;
+        }
+        options.reconnectOnEof = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "reconnect_on_404") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "reconnect_on_404 must be boolean";
+            return false;
+        }
+        options.reconnectOn404 = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "keep_waiting_when_source_missing") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "keep_waiting_when_source_missing must be boolean";
+            return false;
+        }
+        options.keepWaitingWhenSourceMissing = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "reconnect_initial_delay_ms") {
+        if (!parseInt(value, parsedInt) || parsedInt < 100) {
+            errorMessage = "reconnect_initial_delay_ms must be an integer >= 100";
+            return false;
+        }
+        options.reconnectInitialDelayMs = parsedInt;
+        return true;
+    }
+    if (normalizedKey == "reconnect_max_delay_ms") {
+        if (!parseInt(value, parsedInt) || parsedInt < 100) {
+            errorMessage = "reconnect_max_delay_ms must be an integer >= 100";
+            return false;
+        }
+        options.reconnectMaxDelayMs = parsedInt;
+        return true;
+    }
+    if (normalizedKey == "reconnect_max_retry") {
+        if (!parseInt(value, parsedInt) || parsedInt < -1) {
+            errorMessage = "reconnect_max_retry must be -1 or a non-negative integer";
+            return false;
+        }
+        options.reconnectMaxRetry = parsedInt;
+        options.infiniteReconnect = parsedInt < 0;
         return true;
     }
     if (normalizedKey == "ultra_latency_level") {

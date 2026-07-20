@@ -46,6 +46,14 @@ struct PlayerOptions {
     RenderMode renderMode = RenderMode::SOFTWARE_RGBA;
     bool hardwareDecodeAllowFallback = true;
 
+    bool infiniteReconnect = true;
+    bool reconnectOnEof = true;
+    bool reconnectOn404 = true;
+    bool keepWaitingWhenSourceMissing = true;
+    int reconnectInitialDelayMs = 1000;
+    int reconnectMaxDelayMs = 5000;
+    int reconnectMaxRetry = -1;
+
     std::string requestedDecoderName;
     std::string actualDecoderName;
     bool usingHardwareDecoder = false;

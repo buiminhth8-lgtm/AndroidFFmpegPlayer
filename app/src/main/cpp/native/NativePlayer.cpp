@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -91,13 +92,35 @@ const char *stateName(PlayerState state) {
         case PlayerState::Prepared: return "prepared";
         case PlayerState::Playing: return "playing";
         case PlayerState::Paused: return "paused";
+        case PlayerState::Disconnected: return "disconnected";
+        case PlayerState::WaitingSource: return "waiting_source";
         case PlayerState::Reconnecting: return "reconnecting";
+        case PlayerState::Reconnected: return "reconnected";
         case PlayerState::Stopping: return "stopping";
         case PlayerState::Stopped: return "stopped";
         case PlayerState::Error: return "error";
         case PlayerState::Released: return "released";
     }
     return "unknown";
+}
+
+const char *playerStateName(PlayerState state) {
+    switch (state) {
+        case PlayerState::Idle: return "IDLE";
+        case PlayerState::Preparing: return "PREPARING";
+        case PlayerState::Prepared: return "PREPARED";
+        case PlayerState::Playing: return "PLAYING";
+        case PlayerState::Paused: return "PAUSED";
+        case PlayerState::Disconnected: return "DISCONNECTED";
+        case PlayerState::WaitingSource: return "WAITING_SOURCE";
+        case PlayerState::Reconnecting: return "RECONNECTING";
+        case PlayerState::Reconnected: return "RECONNECTED";
+        case PlayerState::Stopping: return "STOPPING";
+        case PlayerState::Stopped: return "STOPPED";
+        case PlayerState::Error: return "ERROR";
+        case PlayerState::Released: return "RELEASED";
+    }
+    return "UNKNOWN";
 }
 
 std::string codecName(AVCodecID codecId) {
@@ -227,6 +250,43 @@ bool isMediaCodecDecoderName(const std::string &name) {
 
 std::string decoderName(const AVCodec *codec) {
     return codec != nullptr && codec->name != nullptr ? codec->name : "";
+}
+
+bool parseBoolOption(const std::string &value, bool &out) {
+    const std::string normalized = lowerTrimCopy(value);
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        out = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool parseIntOption(const std::string &value, int &out) {
+    char *end = nullptr;
+    const long parsed = std::strtol(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0'
+        || parsed < std::numeric_limits<int>::min()
+        || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+bool containsInsensitive(const std::string &value, const char *needle) {
+    std::string lowerValue = value;
+    std::string lowerNeedle = needle == nullptr ? "" : needle;
+    std::transform(lowerValue.begin(), lowerValue.end(), lowerValue.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(lowerNeedle.begin(), lowerNeedle.end(), lowerNeedle.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return !lowerNeedle.empty() && lowerValue.find(lowerNeedle) != std::string::npos;
 }
 
 } // namespace
@@ -813,6 +873,7 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
     }
     transportSwitchRequested_.store(false);
     resetStats();
@@ -868,6 +929,11 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnectMaxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
         << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
         << "\"sourceType\":\"" << sourceTypeName(sourceType_) << "\","
         << "\"latencyMode\":\"" << latencyModeName(playerOptions_.latencyMode) << "\","
         << "\"rtspTransport\":\"" << rtspTransportName(playerOptions_.rtspTransport) << "\"}";
@@ -1042,6 +1108,7 @@ std::string NativePlayer::getStats() {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\","
+        << "\"playerState\":\"" << playerStateName(state) << "\","
         << "\"url\":\"" << escapeJson(url) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
@@ -1168,11 +1235,25 @@ std::string NativePlayer::getStats() {
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectMaxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
+        << "\"reconnectMaxRetry\":" << reconnectMaxRetryCount_.load() << ","
         << "\"reconnectRetryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"reconnectInitialDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
         << "\"reconnectAttemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectSuccessCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectTimeMs\":" << lastReconnectTimeMs_.load() << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"reconnectLastError\":\"" << escapeJson(reconnectError) << "\","
         << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\"}";
     return out.str();
 }
@@ -1183,18 +1264,32 @@ std::string NativePlayer::setReconnectOptions(bool enabled, int maxRetryCount, i
         return jsonError(-1, "player is released");
     }
 
-    const int safeMaxRetryCount = std::clamp(maxRetryCount, 0, 100);
+    const int safeMaxRetryCount = maxRetryCount < 0 ? -1 : std::clamp(maxRetryCount, 0, 100000);
     const int safeRetryDelayMs = std::clamp(retryDelayMs, 100, 60000);
     reconnectEnabled_.store(enabled);
     reconnectMaxRetryCount_.store(safeMaxRetryCount);
     reconnectRetryDelayMs_.store(safeRetryDelayMs);
+    infiniteReconnect_.store(safeMaxRetryCount < 0);
+    reconnectExhausted_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        playerOptions_.infiniteReconnect = safeMaxRetryCount < 0;
+        playerOptions_.reconnectMaxRetry = safeMaxRetryCount;
+        playerOptions_.reconnectInitialDelayMs = safeRetryDelayMs;
+        if (playerOptions_.reconnectMaxDelayMs < safeRetryDelayMs) {
+            playerOptions_.reconnectMaxDelayMs = safeRetryDelayMs;
+        }
+        syncReconnectPolicyFromOptionsLocked();
+    }
     LOGI("setPlayerReconnectOptions enabled=%d maxRetry=%d retryDelayMs=%d", enabled ? 1 : 0, safeMaxRetryCount, safeRetryDelayMs);
 
     std::ostringstream out;
     out << "{\"success\":true,\"message\":\"reconnect options updated\","
         << "\"enabled\":" << (enabled ? "true" : "false") << ","
         << "\"maxRetryCount\":" << safeMaxRetryCount << ","
-        << "\"retryDelayMs\":" << safeRetryDelayMs << "}";
+        << "\"retryDelayMs\":" << safeRetryDelayMs << ","
+        << "\"infiniteReconnect\":" << (safeMaxRetryCount < 0 ? "true" : "false") << ","
+        << "\"reconnectMaxDelayMs\":" << reconnectMaxDelayMs_.load() << "}";
     return out.str();
 }
 
@@ -1235,6 +1330,7 @@ std::string NativePlayer::setRtspTransport(const std::string &transport) {
         applyLatencyProfile(playerOptions_);
         rtspTransportMode_ = rtspTransportName(parsedTransport);
         preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
         requestSwitch = active && sourceIsRtsp;
     }
@@ -1297,6 +1393,7 @@ std::string NativePlayer::setLatencyMode(const std::string &mode) {
         applyLatencyProfile(playerOptions_);
         rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
         preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
     }
 
@@ -1334,6 +1431,86 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
     if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
         return setHardwareRenderMode(value);
     }
+    if (normalizedKey == "infinite_reconnect"
+        || normalizedKey == "reconnect_on_eof"
+        || normalizedKey == "reconnect_on_404"
+        || normalizedKey == "keep_waiting_when_source_missing") {
+        bool parsed = false;
+        if (!parseBoolOption(value, parsed)) {
+            return jsonError(-1, normalizedKey + " must be boolean");
+        }
+        PlayerOptions optionsSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (normalizedKey == "infinite_reconnect") {
+                playerOptions_.infiniteReconnect = parsed;
+                if (parsed) {
+                    playerOptions_.reconnectMaxRetry = -1;
+                } else if (playerOptions_.reconnectMaxRetry < 0) {
+                    playerOptions_.reconnectMaxRetry = 3;
+                }
+            } else if (normalizedKey == "reconnect_on_eof") {
+                playerOptions_.reconnectOnEof = parsed;
+            } else if (normalizedKey == "reconnect_on_404") {
+                playerOptions_.reconnectOn404 = parsed;
+            } else {
+                playerOptions_.keepWaitingWhenSourceMissing = parsed;
+            }
+            syncReconnectPolicyFromOptionsLocked();
+            optionsSnapshot = playerOptions_;
+        }
+        LOGI("setPlayerOption key=%s value=%s", key.c_str(), value.c_str());
+        std::ostringstream out;
+        out << "{\"success\":true,\"message\":\"reconnect option updated\","
+            << "\"key\":\"" << escapeJson(key) << "\","
+            << "\"value\":\"" << escapeJson(value) << "\","
+            << "\"infiniteReconnect\":" << (optionsSnapshot.infiniteReconnect ? "true" : "false") << ","
+            << "\"reconnectOnEof\":" << (optionsSnapshot.reconnectOnEof ? "true" : "false") << ","
+            << "\"reconnectOn404\":" << (optionsSnapshot.reconnectOn404 ? "true" : "false") << ","
+            << "\"keepWaitingWhenSourceMissing\":" << (optionsSnapshot.keepWaitingWhenSourceMissing ? "true" : "false") << ","
+            << "\"reconnectMaxRetry\":" << optionsSnapshot.reconnectMaxRetry << ","
+            << "\"reconnectInitialDelayMs\":" << optionsSnapshot.reconnectInitialDelayMs << ","
+            << "\"reconnectMaxDelayMs\":" << optionsSnapshot.reconnectMaxDelayMs << "}";
+        return out.str();
+    }
+    if (normalizedKey == "reconnect_initial_delay_ms"
+        || normalizedKey == "reconnect_max_delay_ms"
+        || normalizedKey == "reconnect_max_retry") {
+        int parsed = 0;
+        if (!parseIntOption(value, parsed)) {
+            return jsonError(-1, normalizedKey + " must be an integer");
+        }
+        if ((normalizedKey == "reconnect_initial_delay_ms" || normalizedKey == "reconnect_max_delay_ms") && parsed < 100) {
+            return jsonError(-1, normalizedKey + " must be >= 100");
+        }
+        if (normalizedKey == "reconnect_max_retry" && parsed < -1) {
+            return jsonError(-1, "reconnect_max_retry must be -1 or a non-negative integer");
+        }
+        PlayerOptions optionsSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (normalizedKey == "reconnect_initial_delay_ms") {
+                playerOptions_.reconnectInitialDelayMs = parsed;
+            } else if (normalizedKey == "reconnect_max_delay_ms") {
+                playerOptions_.reconnectMaxDelayMs = parsed;
+            } else {
+                playerOptions_.reconnectMaxRetry = parsed;
+                playerOptions_.infiniteReconnect = parsed < 0;
+            }
+            syncReconnectPolicyFromOptionsLocked();
+            optionsSnapshot = playerOptions_;
+        }
+        LOGI("setPlayerOption key=%s value=%s", key.c_str(), value.c_str());
+        std::ostringstream out;
+        out << "{\"success\":true,\"message\":\"reconnect option updated\","
+            << "\"key\":\"" << escapeJson(key) << "\","
+            << "\"value\":\"" << escapeJson(value) << "\","
+            << "\"infiniteReconnect\":" << (optionsSnapshot.infiniteReconnect ? "true" : "false") << ","
+            << "\"reconnectMaxRetry\":" << optionsSnapshot.reconnectMaxRetry << ","
+            << "\"reconnectInitialDelayMs\":" << optionsSnapshot.reconnectInitialDelayMs << ","
+            << "\"reconnectMaxDelayMs\":" << optionsSnapshot.reconnectMaxDelayMs << "}";
+        return out.str();
+    }
 
     PlayerOptions optionsSnapshot;
     std::string error;
@@ -1348,6 +1525,7 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
         }
         rtspTransportMode_ = rtspTransportName(playerOptions_.rtspTransport);
         preferUdpTransport_.store(shouldPreferUdpTransport(playerOptions_));
+        syncReconnectPolicyFromOptionsLocked();
         optionsSnapshot = playerOptions_;
     }
 
@@ -1669,7 +1847,7 @@ void NativePlayer::beginStartupKeyFrameWait(const char *reason) {
     startupKeyFrameWait_ = true;
     startupKeyFrameWaitStartMs_ = nowMs();
     startupKeyFrameWaitActive_.store(true);
-    LOGI("wait for first video keyframe reason=%s timeoutMs=%lld",
+    LOGI("wait first keyframe reason=%s timeoutMs=%lld",
          reason == nullptr ? "unknown" : reason,
          static_cast<long long>(kStartupKeyFrameWaitTimeoutMs));
 }
@@ -1680,6 +1858,12 @@ void NativePlayer::finishStartupKeyFrameWait(const char *reason) {
     startupKeyFrameWaitStartMs_ = 0;
     startupKeyFrameWaitActive_.store(false);
     resetRealtimeClock();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Reconnected && !pauseRequested_.load()) {
+            state_ = PlayerState::Playing;
+        }
+    }
     LOGI("finish first video keyframe wait reason=%s",
          reason == nullptr ? "unknown" : reason);
 }
@@ -1857,70 +2041,178 @@ bool NativePlayer::waitForReconnectDelay(int delayMs) {
     return !stopRequested_.load();
 }
 
+int NativePlayer::reconnectDelayForAttempt(int attempt) const {
+    const int initialDelayMs = std::max(100, reconnectRetryDelayMs_.load());
+    const int maxDelayMs = std::max(initialDelayMs, reconnectMaxDelayMs_.load());
+    int64_t delayMs = initialDelayMs;
+    for (int i = 1; i < attempt && delayMs < maxDelayMs; ++i) {
+        delayMs = std::min<int64_t>(delayMs * 2, maxDelayMs);
+    }
+    return static_cast<int>(std::clamp<int64_t>(delayMs, 100, maxDelayMs));
+}
+
+bool NativePlayer::shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const {
+    const bool is404 = containsInsensitive(errorMessage, "404")
+                       || containsInsensitive(errorMessage, "not found");
+    if (is404 && !reconnectOn404_.load()) {
+        return false;
+    }
+    if (containsInsensitive(errorMessage, "end of file") && !reconnectOnEof_.load()) {
+        return false;
+    }
+    return is404
+           || containsInsensitive(errorMessage, "end of file")
+           || containsInsensitive(errorMessage, "connection refused")
+           || containsInsensitive(errorMessage, "timed out")
+           || containsInsensitive(errorMessage, "network is unreachable");
+}
+
+void NativePlayer::syncReconnectPolicyFromOptionsLocked() {
+    infiniteReconnect_.store(playerOptions_.infiniteReconnect);
+    reconnectOnEof_.store(playerOptions_.reconnectOnEof);
+    reconnectOn404_.store(playerOptions_.reconnectOn404);
+    keepWaitingWhenSourceMissing_.store(playerOptions_.keepWaitingWhenSourceMissing);
+    reconnectRetryDelayMs_.store(std::clamp(playerOptions_.reconnectInitialDelayMs, 100, 60000));
+    reconnectMaxDelayMs_.store(std::clamp(playerOptions_.reconnectMaxDelayMs,
+                                         reconnectRetryDelayMs_.load(),
+                                         60000));
+    reconnectMaxRetryCount_.store(playerOptions_.infiniteReconnect ? -1 : std::max(0, playerOptions_.reconnectMaxRetry));
+}
+
 bool NativePlayer::reconnectInput(int readErrorCode) {
     if (!reconnectEnabled_.load() || !isNetworkUrl(url_)) {
         return false;
     }
 
-    const int maxRetryCount = reconnectMaxRetryCount_.load();
-    if (maxRetryCount <= 0) {
+    if (readErrorCode == AVERROR_EOF && !reconnectOnEof_.load()) {
         return false;
     }
 
+    const bool infiniteRetry = infiniteReconnect_.load() || reconnectMaxRetryCount_.load() < 0;
+    const int maxRetryCount = reconnectMaxRetryCount_.load();
+    if (!infiniteRetry && maxRetryCount <= 0) {
+        return false;
+    }
+
+    reconnectExhausted_.store(false);
     const std::string readError = ffmpegErrorToString(readErrorCode);
+    const int64_t disconnectTimeMs = nowMs();
+    lastDisconnectTimeMs_.store(disconnectTimeMs);
+    lastReconnectErrorCode_.store(readErrorCode);
+    reconnecting_.store(true);
+    waitingSource_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+            state_ = PlayerState::Disconnected;
+            errorMessage_ = readError;
+            lastReconnectError_ = readError;
+        }
+    }
     LOGE("playback disconnected url=%s error=%s, start reconnect", url_.c_str(), readError.c_str());
     if (remuxRecorder_.isRecording()) {
         LOGI("reconnect while recorder active; remux recorder keeps output context and resumes when packets return");
     }
 
-    for (int attempt = 1; attempt <= maxRetryCount && !stopRequested_.load(); ++attempt) {
-        reconnecting_.store(true);
+    releaseFfmpegResources();
+    resetRealtimeClock();
+
+    int localAttempt = 0;
+    while (!stopRequested_.load()) {
+        ++localAttempt;
+        const bool finiteRetryExhaustedBeforeAttempt = !infiniteRetry && localAttempt > maxRetryCount;
+        if (finiteRetryExhaustedBeforeAttempt) {
+            break;
+        }
+
+        const int retryDelayMs = reconnectDelayForAttempt(localAttempt);
         lastReconnectTimeMs_.store(nowMs());
         reconnectAttemptCount_.fetch_add(1);
-        {
+        if (!waitingSource_.load()) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
                 state_ = PlayerState::Reconnecting;
                 errorMessage_ = readError;
-                lastReconnectError_ = readError;
             }
         }
 
-        const int retryDelayMs = reconnectRetryDelayMs_.load();
-        LOGI("reconnect attempt %d/%d delayMs=%d url=%s", attempt, maxRetryCount, retryDelayMs, url_.c_str());
+        LOGI("reconnect attempt %d/%d delayMs=%d url=%s",
+             localAttempt, infiniteRetry ? -1 : maxRetryCount, retryDelayMs, url_.c_str());
         if (!waitForReconnectDelay(retryDelayMs)) {
             break;
         }
 
-        releaseFfmpegResources();
+        waitingSource_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+                state_ = PlayerState::Reconnecting;
+            }
+        }
+
         std::string error;
         const int result = openInput(url_, timeoutMs_, true, error);
         if (result >= 0) {
             reconnectSuccessCount_.fetch_add(1);
             reconnecting_.store(false);
+            waitingSource_.store(false);
+            reconnectExhausted_.store(false);
+            lastReconnectErrorCode_.store(0);
+            const int64_t successTimeMs = nowMs();
+            lastReconnectSuccessTimeMs_.store(successTimeMs);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
-                    state_ = pauseRequested_.load() ? PlayerState::Paused : PlayerState::Playing;
+                    state_ = pauseRequested_.load() ? PlayerState::Paused : PlayerState::Reconnected;
                     errorMessage_.clear();
                     lastReconnectError_.clear();
                 }
             }
             resetRealtimeClock();
             beginStartupKeyFrameWait("reconnect");
-            LOGI("reconnect success attempt=%d url=%s", attempt, url_.c_str());
+            if (!startupKeyFrameWaitActive_.load()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (state_ == PlayerState::Reconnected && !pauseRequested_.load()) {
+                    state_ = PlayerState::Playing;
+                }
+            }
+            LOGI("RTSP open success url=%s", url_.c_str());
+            LOGI("reconnect success attempt=%d url=%s", localAttempt, url_.c_str());
             return true;
         }
 
+        lastReconnectErrorCode_.store(result);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             lastReconnectError_ = error;
             errorMessage_ = error;
         }
-        LOGE("reconnect failed attempt=%d/%d url=%s error=%s", attempt, maxRetryCount, url_.c_str(), error.c_str());
+        LOGE("reconnect failed attempt=%d/%d url=%s error=%s",
+             localAttempt, infiniteRetry ? -1 : maxRetryCount, url_.c_str(), error.c_str());
+
+        const bool sourceMissing = shouldTreatOpenErrorAsSourceMissing(error);
+        if (sourceMissing && keepWaitingWhenSourceMissing_.load()) {
+            waitingSource_.store(true);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (state_ != PlayerState::Released && state_ != PlayerState::Stopping) {
+                    state_ = PlayerState::WaitingSource;
+                    lastReconnectError_ = error;
+                    errorMessage_ = error;
+                }
+            }
+            LOGI("playerState=WAITING_SOURCE reconnect attempt=%d lastError=%s", localAttempt, error.c_str());
+            LOGI("keep waiting for source url=%s", url_.c_str());
+            continue;
+        }
+
+        if (!infiniteRetry && localAttempt >= maxRetryCount) {
+            break;
+        }
     }
 
     reconnecting_.store(false);
+    waitingSource_.store(false);
     std::string finalError;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1929,6 +2221,7 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
     if (stopRequested_.load()) {
         return false;
     }
+    reconnectExhausted_.store(true);
     setState(PlayerState::Error, finalError);
     LOGE("reconnect exhausted url=%s error=%s", url_.c_str(), finalError.c_str());
     return false;
@@ -2010,7 +2303,10 @@ void NativePlayer::playbackLoop() {
                 continue;
             }
 
-            const bool shouldReconnectEof = readResult == AVERROR_EOF && reconnectEnabled_.load() && isNetworkUrl(url_);
+            const bool shouldReconnectEof = readResult == AVERROR_EOF
+                                            && reconnectEnabled_.load()
+                                            && reconnectOnEof_.load()
+                                            && isNetworkUrl(url_);
             if (stopRequested_.load() || (readResult == AVERROR_EOF && !shouldReconnectEof)) {
                 break;
             }
@@ -2102,6 +2398,7 @@ void NativePlayer::playbackLoop() {
                 }
                 LOGI("realtime keyframe received, resume decode pts=%lld startupWait=%d",
                      static_cast<long long>(packet_->pts), startupKeyFrameWait_ ? 1 : 0);
+                LOGI("first keyframe received pts=%lld", static_cast<long long>(packet_->pts));
                 finishStartupKeyFrameWait(startupKeyFrameWait_ ? "keyframe" : "catchup");
             } else {
                 av_packet_unref(packet_);
@@ -2563,9 +2860,14 @@ void NativePlayer::resetStats() {
     frameProcessCostSampleCount_.store(0);
     maxFrameProcessCostUs_.store(0);
     reconnecting_.store(false);
+    waitingSource_.store(false);
+    reconnectExhausted_.store(false);
     reconnectAttemptCount_.store(0);
     reconnectSuccessCount_.store(0);
     lastReconnectTimeMs_.store(0);
+    lastDisconnectTimeMs_.store(0);
+    lastReconnectSuccessTimeMs_.store(0);
+    lastReconnectErrorCode_.store(0);
     lastReconnectError_.clear();
     lastFrameFormatName_.clear();
 }
@@ -2627,6 +2929,7 @@ std::string NativePlayer::buildStateJsonLocked() const {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state_) << "\","
+        << "\"playerState\":\"" << playerStateName(state_) << "\","
         << "\"url\":\"" << escapeJson(url_) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
@@ -2646,6 +2949,13 @@ std::string NativePlayer::buildStateJsonLocked() const {
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"reconnectEnabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
+        << "\"reconnectLastError\":\"" << escapeJson(lastReconnectError_) << "\","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
         << "\"reconnectAttemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"reconnectSuccessCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectError\":\"" << escapeJson(lastReconnectError_) << "\"}";
@@ -2667,16 +2977,32 @@ std::string NativePlayer::buildReconnectJson() const {
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\"," 
+        << "\"playerState\":\"" << playerStateName(state) << "\","
         << "\"rtspTransportMode\":\"" << escapeJson(rtspTransportMode) << "\","
         << "\"currentRtspTransport\":\"" << (preferUdpTransport_.load() ? "udp" : "tcp") << "\","
         << "\"rtspTransportSwitchPending\":" << (transportSwitchRequested_.load() ? "true" : "false") << ","
         << "\"enabled\":" << (reconnectEnabled_.load() ? "true" : "false") << ","
         << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+        << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
         << "\"maxRetryCount\":" << reconnectMaxRetryCount_.load() << ","
+        << "\"maxRetry\":" << reconnectMaxRetryCount_.load() << ","
         << "\"retryDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"initialDelayMs\":" << reconnectRetryDelayMs_.load() << ","
+        << "\"maxDelayMs\":" << reconnectMaxDelayMs_.load() << ","
+        << "\"infiniteReconnect\":" << (infiniteReconnect_.load() ? "true" : "false") << ","
+        << "\"reconnectOnEof\":" << (reconnectOnEof_.load() ? "true" : "false") << ","
+        << "\"reconnectOn404\":" << (reconnectOn404_.load() ? "true" : "false") << ","
+        << "\"keepWaitingWhenSourceMissing\":" << (keepWaitingWhenSourceMissing_.load() ? "true" : "false") << ","
+        << "\"reconnectAttempt\":" << reconnectAttemptCount_.load() << ","
         << "\"attemptCount\":" << reconnectAttemptCount_.load() << ","
         << "\"successCount\":" << reconnectSuccessCount_.load() << ","
         << "\"lastReconnectTimeMs\":" << lastReconnectTimeMs_.load() << ","
+        << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+        << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load() << ","
+        << "\"lastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
+        << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
+        << "\"reconnectLastError\":\"" << escapeJson(lastError) << "\","
         << "\"lastError\":\"" << escapeJson(lastError) << "\"}";
     return out.str();
 }

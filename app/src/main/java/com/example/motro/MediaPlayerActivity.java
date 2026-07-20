@@ -1,7 +1,6 @@
 package com.example.motro;
 
 import android.content.Context;
-import android.content.Intent;
 import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.Handler;
@@ -45,6 +44,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private static final String TAG = "FFmpegPlayerDemo";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
+    public static final String EXTRA_URL = "com.example.motro.extra.URL";
+    public static final String EXTRA_HARDWARE_DECODE = "com.example.motro.extra.HARDWARE_DECODE";
+    public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
+    public static final String EXTRA_LATENCY_MODE = "com.example.motro.extra.LATENCY_MODE";
 
     private ActivityMediaPlayerBinding binding;
 
@@ -125,19 +128,43 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void initDefaults() {
-        urlEditText.setText("rtsp://192.168.1.101:554/main.mov");
+        String initialUrl = getIntent().getStringExtra(EXTRA_URL);
+        urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
         timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
-        hardwareDecodeSwitch.setChecked(false);
+        hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
+        applyIntentPlaybackDefaults();
         recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
         segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
         recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
         updateHandleLabel();
+    }
+
+    private void applyIntentPlaybackDefaults() {
+        String transport = getIntent().getStringExtra(EXTRA_RTSP_TRANSPORT);
+        if ("udp".equalsIgnoreCase(transport)) {
+            transportRadioGroup.check(R.id.udpTransportRadio);
+        } else if ("auto".equalsIgnoreCase(transport)) {
+            transportRadioGroup.check(R.id.autoTransportRadio);
+        } else if ("tcp".equalsIgnoreCase(transport)) {
+            transportRadioGroup.check(R.id.tcpTransportRadio);
+        }
+
+        String latencyMode = getIntent().getStringExtra(EXTRA_LATENCY_MODE);
+        if ("ultra_low_latency".equalsIgnoreCase(latencyMode)) {
+            latencyModeRadioGroup.check(R.id.lowLatencyUltraRadio);
+        } else if ("low_latency".equalsIgnoreCase(latencyMode)) {
+            latencyModeRadioGroup.check(R.id.lowLatencyRadio);
+        } else if ("stable".equalsIgnoreCase(latencyMode)) {
+            latencyModeRadioGroup.check(R.id.stableLatencyRadio);
+        } else if ("balanced".equalsIgnoreCase(latencyMode)) {
+            latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
+        }
     }
 
     private void bindPreviewCallback() {
@@ -393,6 +420,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
             lastPlaybackInfoInputBytes = inputBytes;
 
             String state = stats.optString("state", "unknown");
+            String playerState = stats.optString("playerState", state.toUpperCase(Locale.US));
+            boolean reconnecting = stats.optBoolean("reconnecting", false);
+            boolean waitingSource = stats.optBoolean("waitingSource", false);
+            long reconnectAttempt = stats.optLong("reconnectAttempt", stats.optLong("reconnectAttemptCount", 0));
+            String reconnectError = stats.optString("reconnectLastError", stats.optString("lastReconnectError", ""));
             String mode = stats.optString("renderMode", "unknown");
             String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
             String frameFormat = stats.optString("frameFormat", "");
@@ -402,20 +434,28 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String nominalBitrate = videoBitRate > 0
                     ? formatKbps(videoBitRate / 1000.0)
                     : (streamBitRate > 0 ? formatKbps(streamBitRate / 1000.0) : "--");
+            String stateDisplay = playerState;
+            if (waitingSource) {
+                stateDisplay += " waiting stream recovery";
+            } else if (reconnecting) {
+                stateDisplay += " reconnecting";
+            }
 
             playbackInfoTextView.setText(
-                    "状态 " + state
+                    "state=" + stateDisplay
                             + " | " + mode
                             + " | " + codec
-                            + "\n解码 " + formatFps(decodeFps)
-                            + " fps  渲染 " + formatFps(renderFps)
-                            + " fps  丢帧 " + dropped
-                            + "\n码率 " + formatKbps(videoKbps)
-                            + "  传输 " + formatKbPerSec(transferKbPerSec)
-                            + "  标称 " + nominalBitrate
-                            + "\n格式 " + frameFormat
-                            + "  包 " + stats.optLong("readPacketCount", 0)
-                            + "  帧 " + renderedFrames);
+                            + "\ndecode " + formatFps(decodeFps)
+                            + " fps  render " + formatFps(renderFps)
+                            + " fps  dropped " + dropped
+                            + "\nbitrate " + formatKbps(videoKbps)
+                            + "  transfer " + formatKbPerSec(transferKbPerSec)
+                            + "  nominal " + nominalBitrate
+                            + "\nformat " + frameFormat
+                            + "  packets " + stats.optLong("readPacketCount", 0)
+                            + "  frames " + renderedFrames
+                            + "\nreconnect attempt=" + reconnectAttempt
+                            + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError));
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
         }
@@ -523,7 +563,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle == 0) {
             return jsonError("player handle is 0");
         }
-        return FFmpegNative.setPlayerReconnectOptions(handle, reconnectSwitch.isChecked(), 3, 1000);
+        return FFmpegNative.setPlayerReconnectOptions(handle, reconnectSwitch.isChecked(), -1, 1000);
     }
 
     private String applyRtspTransport(long handle) {

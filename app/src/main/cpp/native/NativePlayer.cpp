@@ -819,6 +819,37 @@ std::string NativePlayer::setAudioCallback(JNIEnv *, jobject callback) {
     return out.str();
 }
 
+std::string NativePlayer::setPlayerEventListener(JNIEnv *env, jobject listener) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (env == nullptr) {
+        return jsonError(-1, "JNIEnv is null");
+    }
+
+    jobject newListenerRef = nullptr;
+    if (listener != nullptr) {
+        newListenerRef = env->NewGlobalRef(listener);
+        if (newListenerRef == nullptr) {
+            return jsonError(-1, "NewGlobalRef PlayerEventListener failed");
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(eventListenerMutex_);
+        if (playerEventListenerGlobalRef_ != nullptr) {
+            env->DeleteGlobalRef(playerEventListenerGlobalRef_);
+        }
+        playerEventListenerGlobalRef_ = newListenerRef;
+    }
+
+    LOGI("setPlayerEventListener listenerSet=%d", newListenerRef != nullptr ? 1 : 0);
+    std::ostringstream out;
+    out << "{\"success\":true,\"message\":\"player event listener updated\","
+        << "\"listenerSet\":" << (newListenerRef != nullptr ? "true" : "false") << "}";
+    return out.str();
+}
+
 std::string NativePlayer::enableAudio(bool enabled) {
     if (isReleased()) {
         return jsonError(-1, "player is released");
@@ -1772,10 +1803,19 @@ std::string NativePlayer::release() {
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env != nullptr) {
-        std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
-        deleteSurfaceGlobalRefLocked(env);
+        {
+            std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
+            deleteSurfaceGlobalRefLocked(env);
+        }
+        {
+            std::lock_guard<std::mutex> listenerLock(eventListenerMutex_);
+            if (playerEventListenerGlobalRef_ != nullptr) {
+                env->DeleteGlobalRef(playerEventListenerGlobalRef_);
+                playerEventListenerGlobalRef_ = nullptr;
+            }
+        }
     } else {
-        LOGE("releasePlayer could not get JNIEnv to delete Surface global ref");
+        LOGE("releasePlayer could not get JNIEnv to delete Java global refs");
     }
     detachCurrentThreadIfNeeded(attached);
     clearLastFrame();
@@ -2079,6 +2119,96 @@ void NativePlayer::syncReconnectPolicyFromOptionsLocked() {
     reconnectMaxRetryCount_.store(playerOptions_.infiniteReconnect ? -1 : std::max(0, playerOptions_.reconnectMaxRetry));
 }
 
+void NativePlayer::notifyPlayerEvent(const std::string &eventName,
+                                     PlayerState state,
+                                     int64_t attempt,
+                                     int maxRetry,
+                                     int delayMs,
+                                     int errorCode,
+                                     const std::string &errorMessage) {
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        LOGE("notifyPlayerEvent failed: JNIEnv unavailable event=%s", eventName.c_str());
+        return;
+    }
+
+    jobject listenerLocalRef = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(eventListenerMutex_);
+        if (playerEventListenerGlobalRef_ != nullptr) {
+            listenerLocalRef = env->NewLocalRef(playerEventListenerGlobalRef_);
+        }
+    }
+    if (listenerLocalRef == nullptr) {
+        detachCurrentThreadIfNeeded(attached);
+        return;
+    }
+
+    jclass listenerClass = env->GetObjectClass(listenerLocalRef);
+    jmethodID method = listenerClass == nullptr
+                       ? nullptr
+                       : env->GetMethodID(listenerClass, "onPlayerEvent", "(JLjava/lang/String;Ljava/lang/String;)V");
+    if (method == nullptr) {
+        LOGE("notifyPlayerEvent failed: onPlayerEvent method not found");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (listenerClass != nullptr) {
+            env->DeleteLocalRef(listenerClass);
+        }
+        env->DeleteLocalRef(listenerLocalRef);
+        detachCurrentThreadIfNeeded(attached);
+        return;
+    }
+
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        url = url_;
+    }
+    std::ostringstream payload;
+    payload << "{\"success\":true,"
+            << "\"event\":\"" << escapeJson(eventName) << "\","
+            << "\"playerState\":\"" << playerStateName(state) << "\","
+            << "\"state\":\"" << stateName(state) << "\","
+            << "\"handle\":" << static_cast<long long>(reinterpret_cast<intptr_t>(this)) << ","
+            << "\"url\":\"" << escapeJson(url) << "\","
+            << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
+            << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
+            << "\"attempt\":" << attempt << ","
+            << "\"maxRetry\":" << maxRetry << ","
+            << "\"delayMs\":" << delayMs << ","
+            << "\"errorCode\":" << errorCode << ","
+            << "\"errorMessage\":\"" << escapeJson(errorMessage) << "\","
+            << "\"lastDisconnectTimeMs\":" << lastDisconnectTimeMs_.load() << ","
+            << "\"lastReconnectSuccessTimeMs\":" << lastReconnectSuccessTimeMs_.load()
+            << "}";
+
+    jstring eventString = env->NewStringUTF(eventName.c_str());
+    jstring payloadString = env->NewStringUTF(payload.str().c_str());
+    if (eventString != nullptr && payloadString != nullptr) {
+        env->CallVoidMethod(listenerLocalRef,
+                            method,
+                            static_cast<jlong>(reinterpret_cast<intptr_t>(this)),
+                            eventString,
+                            payloadString);
+    }
+    if (env->ExceptionCheck()) {
+        LOGE("notifyPlayerEvent Java callback threw event=%s", eventName.c_str());
+        env->ExceptionClear();
+    }
+    if (eventString != nullptr) {
+        env->DeleteLocalRef(eventString);
+    }
+    if (payloadString != nullptr) {
+        env->DeleteLocalRef(payloadString);
+    }
+    env->DeleteLocalRef(listenerClass);
+    env->DeleteLocalRef(listenerLocalRef);
+    detachCurrentThreadIfNeeded(attached);
+}
+
 bool NativePlayer::reconnectInput(int readErrorCode) {
     if (!reconnectEnabled_.load() || !isNetworkUrl(url_)) {
         return false;
@@ -2110,6 +2240,13 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
         }
     }
     LOGE("playback disconnected url=%s error=%s, start reconnect", url_.c_str(), readError.c_str());
+    notifyPlayerEvent("reconnect_disconnected",
+                      PlayerState::Disconnected,
+                      0,
+                      infiniteRetry ? -1 : maxRetryCount,
+                      0,
+                      readErrorCode,
+                      readError);
     if (remuxRecorder_.isRecording()) {
         LOGI("reconnect while recorder active; remux recorder keeps output context and resumes when packets return");
     }
@@ -2138,6 +2275,13 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
 
         LOGI("reconnect attempt %d/%d delayMs=%d url=%s",
              localAttempt, infiniteRetry ? -1 : maxRetryCount, retryDelayMs, url_.c_str());
+        notifyPlayerEvent("reconnecting",
+                          PlayerState::Reconnecting,
+                          localAttempt,
+                          infiniteRetry ? -1 : maxRetryCount,
+                          retryDelayMs,
+                          readErrorCode,
+                          readError);
         if (!waitForReconnectDelay(retryDelayMs)) {
             break;
         }
@@ -2178,6 +2322,13 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
             }
             LOGI("RTSP open success url=%s", url_.c_str());
             LOGI("reconnect success attempt=%d url=%s", localAttempt, url_.c_str());
+            notifyPlayerEvent("reconnect_success",
+                              PlayerState::Reconnected,
+                              localAttempt,
+                              infiniteRetry ? -1 : maxRetryCount,
+                              0,
+                              0,
+                              "");
             return true;
         }
 
@@ -2203,6 +2354,13 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
             }
             LOGI("playerState=WAITING_SOURCE reconnect attempt=%d lastError=%s", localAttempt, error.c_str());
             LOGI("keep waiting for source url=%s", url_.c_str());
+            notifyPlayerEvent("waiting_source",
+                              PlayerState::WaitingSource,
+                              localAttempt,
+                              infiniteRetry ? -1 : maxRetryCount,
+                              retryDelayMs,
+                              result,
+                              error);
             continue;
         }
 
@@ -2224,6 +2382,13 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
     reconnectExhausted_.store(true);
     setState(PlayerState::Error, finalError);
     LOGE("reconnect exhausted url=%s error=%s", url_.c_str(), finalError.c_str());
+    notifyPlayerEvent("reconnect_exhausted",
+                      PlayerState::Error,
+                      reconnectAttemptCount_.load(),
+                      infiniteRetry ? -1 : maxRetryCount,
+                      0,
+                      lastReconnectErrorCode_.load(),
+                      finalError);
     return false;
 }
 

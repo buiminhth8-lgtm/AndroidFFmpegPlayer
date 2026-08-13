@@ -99,6 +99,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private float thermalBlackPoint = 0.0f;
     private float thermalWhitePoint = 1.0f;
     private boolean thermalUiUpdating;
+    private volatile String currentRenderMode = "";
 
     private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
         mainHandler.post(() -> {
@@ -164,8 +165,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
         thermalGamma = 1.0f;
         thermalBlackPoint = 0.0f;
         thermalWhitePoint = 1.0f;
+        currentRenderMode = "";
         updateThermalValueTexts();
-        updateThermalControlEnabled();
+        updateThermalControlsEnabledState();
     }
 
     private void applyIntentPlaybackDefaults() {
@@ -295,6 +297,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return jsonError("player handle is 0");
             }
             resetPlaybackInfoCounters();
+            currentRenderMode = "";
             return FFmpegNative.releasePlayer(handle);
         }));
 
@@ -341,6 +344,20 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 runNative("Reconnect Option", () -> applyReconnectOptions(handle));
             }
         });
+        hardwareDecodeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            if (isChecked && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                thermalUiUpdating = true;
+                hardwareDecodeSwitch.setChecked(false);
+                thermalUiUpdating = false;
+                Log.w(TAG, "Hardware decode blocked: disable Thermal first");
+                Toast.makeText(this, "Disable Thermal before enabling hardware decoding.", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            updateThermalControlsEnabledState();
+        });
         transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
             long handle = getPlayerHandle();
             if (handle != 0) {
@@ -362,15 +379,33 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (thermalUiUpdating) {
                 return;
             }
-            updateThermalControlEnabled();
-            long handle = getPlayerHandle();
-            if (handle == 0) {
-                return;
-            }
             if (isChecked) {
+                if (!isThermalSupported()) {
+                    thermalUiUpdating = true;
+                    controlsBinding.thermalEnabledSwitch.setChecked(false);
+                    thermalUiUpdating = false;
+                    String current = TextUtils.isEmpty(currentRenderMode)
+                            ? (hardwareDecodeSwitch.isChecked() ? "mediacodec_surface" : "software_yuv_gl")
+                            : currentRenderMode;
+                    Log.w(TAG, "Thermal blocked: requires software_yuv_gl, current=" + current);
+                    Toast.makeText(this,
+                            "Thermal requires Software YUV GL. Disable hardware decoding and restart playback.",
+                            Toast.LENGTH_LONG).show();
+                    updateThermalControlsEnabledState();
+                    return;
+                }
+                updateThermalControlsEnabledState();
+                long handle = getPlayerHandle();
+                if (handle == 0) {
+                    return;
+                }
                 callThermalApi("Thermal Enable", () -> applyThermalConfig(handle));
             } else {
-                callThermalApi("Thermal Disable", () -> FFmpegNative.setThermalEnabled(handle, false));
+                updateThermalControlsEnabledState();
+                long handle = getPlayerHandle();
+                if (handle != 0) {
+                    callThermalApi("Thermal Disable", () -> FFmpegNative.setThermalEnabled(handle, false));
+                }
             }
         });
 
@@ -395,7 +430,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (thermalUiUpdating) {
                 return;
             }
-            updateThermalControlEnabled();
+            updateThermalControlsEnabledState();
             long handle = getPlayerHandle();
             if (handle == 0 || !controlsBinding.thermalEnabledSwitch.isChecked()) {
                 return;
@@ -500,9 +535,19 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.thermalWhitePointValueText.setText(String.format(Locale.US, "%.2f", thermalWhitePoint));
     }
 
-    private void updateThermalControlEnabled() {
-        boolean thermalOn = controlsBinding.thermalEnabledSwitch.isChecked();
+    private boolean isThermalSupported() {
+        if (!TextUtils.isEmpty(currentRenderMode)) {
+            return "software_yuv_gl".equals(currentRenderMode);
+        }
+        // Player not established yet: use the pending decode-mode choice.
+        return !hardwareDecodeSwitch.isChecked();
+    }
+
+    private void updateThermalControlsEnabledState() {
+        boolean supported = isThermalSupported();
+        boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
         boolean agcOn = thermalOn && controlsBinding.thermalAgcSwitch.isChecked();
+        // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
         controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
         for (int i = 0; i < controlsBinding.thermalPaletteRadioGroup.getChildCount(); i++) {
             controlsBinding.thermalPaletteRadioGroup.getChildAt(i).setEnabled(thermalOn);
@@ -679,6 +724,20 @@ public class MediaPlayerActivity extends AppCompatActivity {
             float windowBlack = thermalAgcValid ? thermalAgcBlackPoint : thermalBlackPoint;
             float windowWhite = thermalAgcValid ? thermalAgcWhitePoint : thermalWhitePoint;
 
+            currentRenderMode = mode;
+            updateThermalControlsEnabledState();
+
+            String thermalDisplay;
+            if ("mediacodec_surface".equals(mode)) {
+                thermalDisplay = "Thermal: UNAVAILABLE | " + mode;
+            } else {
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US);
+            }
+
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | " + mode
@@ -700,14 +759,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "\nreconnect attempt=" + reconnectAttempt
                             + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
-                            + "\nThermal " + (thermalEnabled ? "ON" : "OFF")
-                            + " | " + thermalPalette
-                            + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
-                            + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
-                            + " | render " + thermalRenderMode.toUpperCase(Locale.US)
-                            + "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
-                            + " - " + String.format(Locale.US, "%.2f", windowWhite)
-                            + " | Range " + frameColorRange);
+                            + "\n" + thermalDisplay
+                            + ("mediacodec_surface".equals(mode) ? "" : "\nWindow "
+                                    + String.format(Locale.US, "%.2f", windowBlack)
+                                    + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                                    + " | Range " + frameColorRange));
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
             }
@@ -847,6 +903,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         // so apply the explicit render mode afterwards.
         String renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
         String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
+        currentRenderMode = renderMode;
         return "hardwareDecode=" + decodeResult
                 + "\nrenderMode=" + renderModeResult;
     }

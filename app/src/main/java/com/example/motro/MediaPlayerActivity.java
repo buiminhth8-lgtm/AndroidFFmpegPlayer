@@ -10,6 +10,7 @@ import android.util.Log;
 import android.view.PixelCopy;
 import android.view.Surface;
 import android.view.SurfaceHolder;
+import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.RadioGroup;
@@ -22,13 +23,12 @@ import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.example.motro.databinding.ActivityMediaPlayerBinding;
+import com.example.motro.databinding.ViewMediaPlayerControlsBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -41,7 +41,9 @@ import org.json.JSONObject;
 
 public class MediaPlayerActivity extends AppCompatActivity {
 
-    private static final String TAG = "FFmpegPlayerDemo";
+    private static final String TAG = "FFmpegPlayer";
+    private static final String TAG_STATS = "FFmpegPlayerStats";
+    private static final String TAG_EVENT = "FFmpegPlayerEvent";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
     public static final String EXTRA_URL = "com.example.motro.extra.URL";
@@ -50,6 +52,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     public static final String EXTRA_LATENCY_MODE = "com.example.motro.extra.LATENCY_MODE";
 
     private ActivityMediaPlayerBinding binding;
+    private ViewMediaPlayerControlsBinding controlsBinding;
 
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -71,9 +74,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private Switch hardwareDecodeSwitch;
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
-    private TextView handleTextView;
     private TextView playbackInfoTextView;
-    private TextView logTextView;
+    private int statsLogCounter;
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
@@ -96,7 +98,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return;
             }
             lastPlayerEventText = event;
-            appendLog("Player event: " + event + "\n" + eventJson);
+            Log.d(TAG_EVENT, "handle=" + handle + " event=" + event + "\n" + eventJson);
         });
     };
 
@@ -105,13 +107,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         binding = ActivityMediaPlayerBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+        controlsBinding = binding.playerControlPanel;
         worker = Executors.newSingleThreadExecutor(r -> new Thread(r, "FFmpegDemoWorker"));
         bindViews();
         initDefaults();
         bindPreviewCallback();
         bindActions();
         startPlaybackInfoUpdates();
-        appendLog("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
+        logDebug("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
     }
 
     private void bindViews() {
@@ -125,27 +128,24 @@ public class MediaPlayerActivity extends AppCompatActivity {
         hardwareDecodeSwitch = findViewById(R.id.hardwareDecodeSwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
-        handleTextView = findViewById(R.id.handleTextView);
         playbackInfoTextView = findViewById(R.id.playbackInfoTextView);
-        logTextView = findViewById(R.id.logTextView);
     }
 
     private void initDefaults() {
         String initialUrl = getIntent().getStringExtra(EXTRA_URL);
-        binding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
-        binding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
+        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
+        controlsBinding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         applyIntentPlaybackDefaults();
-        binding.recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
-        binding.segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
-        binding.recordFormatEditText.setText("mp4");
+        controlsBinding.recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
+        controlsBinding.segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
+        controlsBinding.recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
-        updateHandleLabel();
     }
 
     private void applyIntentPlaybackDefaults() {
@@ -306,7 +306,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
                 FFmpegNative.clearPlayerSurface(requireHandle())));
 
-        findViewById(R.id.clearLogButton).setOnClickListener(v -> logTextView.setText(""));
+        binding.controlToggleButton.setOnClickListener(v -> toggleControlPanel());
+        controlsBinding.controlPanelCloseButton.setOnClickListener(v -> hideControlPanel());
 
         audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             long handle = getPlayerHandle();
@@ -339,7 +340,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle != 0) {
             runNative(title, () -> bindSurfaceIfReady(handle));
         } else {
-            appendLog(title + ": no player yet");
+            logDebug(title + ": no player yet");
         }
     }
 
@@ -460,6 +461,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "\nreconnect attempt=" + reconnectAttempt
                             + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError));
+            if (++statsLogCounter % 5 == 0) {
+                Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
+            }
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
         }
@@ -512,11 +516,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
             }
             if (playerHandle == 0) {
                 playerHandle = FFmpegNative.createPlayer();
-                Log.d(TAG, "createPlayer handle=" + playerHandle);
+                Log.d(TAG, "playerHandle=" + playerHandle);
                 if (playerHandle != 0) {
                     Log.d(TAG, "setPlayerEventListener=" + FFmpegNative.setPlayerEventListener(playerHandle, playerEventListener));
                 }
-                postHandleLabel();
             }
             return playerHandle;
         }
@@ -532,7 +535,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         synchronized (handleLock) {
             long handle = playerHandle;
             playerHandle = 0;
-            postHandleLabel();
             return handle;
         }
     }
@@ -626,7 +628,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireUrl() {
-        String url = binding.urlEditText.getText().toString().trim();
+        String url = controlsBinding.urlEditText.getText().toString().trim();
         if (TextUtils.isEmpty(url)) {
             throw new IllegalArgumentException("Please enter RTSP/URL");
         }
@@ -634,7 +636,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private int readTimeoutMs() {
-        String value = binding.timeoutEditText.getText().toString().trim();
+        String value = controlsBinding.timeoutEditText.getText().toString().trim();
         if (TextUtils.isEmpty(value)) {
             return DEFAULT_TIMEOUT_MS;
         }
@@ -646,27 +648,27 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireRecordPath() {
-        String path = binding.recordPathEditText.getText().toString().trim();
+        String path = controlsBinding.recordPathEditText.getText().toString().trim();
         if (TextUtils.isEmpty(path)) {
             path = defaultFilePath("record_av_test.ts");
-            binding.recordPathEditText.setText(path);
+            controlsBinding.recordPathEditText.setText(path);
         }
         ensureParentExists(path);
         return path;
     }
 
     private String requireSegmentPattern() {
-        String pattern = binding.segmentPatternEditText.getText().toString().trim();
+        String pattern = controlsBinding.segmentPatternEditText.getText().toString().trim();
         if (TextUtils.isEmpty(pattern)) {
             pattern = defaultFilePath("record_segment_%03d.ts");
-            binding.segmentPatternEditText.setText(pattern);
+            controlsBinding.segmentPatternEditText.setText(pattern);
         }
         ensureParentExists(pattern.replace("%03d", "000"));
         return pattern;
     }
 
     private String requireRecordFormat() {
-        String format = binding.recordFormatEditText.getText().toString().trim();
+        String format = controlsBinding.recordFormatEditText.getText().toString().trim();
         if (TextUtils.isEmpty(format)) {
             return "auto";
         }
@@ -795,7 +797,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return;
         }
         hideKeyboard();
-        appendLog(">>> " + title);
+        logDebug(">>> " + title);
         worker.execute(() -> {
             String result;
             try {
@@ -806,7 +808,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             }
             String finalResult = result;
             mainHandler.post(() -> {
-                appendLog(title + "\n" + finalResult);
+                logDebug(title + "\n" + finalResult);
                 if (!destroyed && finalResult.contains("\"success\":false")) {
                     Toast.makeText(this, title + " failed", Toast.LENGTH_SHORT).show();
                 }
@@ -821,22 +823,41 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
     }
 
-    private void appendLog(String message) {
-        String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-        String old = logTextView.getText().toString();
-        String next = old + "\n[" + time + "] " + message + "\n";
-        if (next.length() > 20000) {
-            next = next.substring(next.length() - 20000);
+    private void logDebug(String message) {
+        Log.d(TAG, message);
+    }
+
+    private void toggleControlPanel() {
+        if (binding.playerControlPanel.getRoot().getVisibility() == View.VISIBLE) {
+            hideControlPanel();
+        } else {
+            showControlPanel();
         }
-        logTextView.setText(next.trim());
     }
 
-    private void postHandleLabel() {
-        mainHandler.post(this::updateHandleLabel);
+    private void showControlPanel() {
+        View panel = binding.playerControlPanel.getRoot();
+        panel.setVisibility(View.VISIBLE);
+        panel.setAlpha(0f);
+        panel.setTranslationX(Math.max(1, panel.getWidth()));
+        panel.animate()
+                .translationX(0f)
+                .alpha(1f)
+                .setDuration(180)
+                .start();
     }
 
-    private void updateHandleLabel() {
-        handleTextView.setText("handle: " + getPlayerHandle());
+    private void hideControlPanel() {
+        View panel = binding.playerControlPanel.getRoot();
+        if (panel.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        panel.animate()
+                .translationX(Math.max(1, panel.getWidth()))
+                .alpha(0f)
+                .setDuration(150)
+                .withEndAction(() -> panel.setVisibility(View.GONE))
+                .start();
     }
 
     private String jsonError(String message) {

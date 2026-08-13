@@ -77,10 +77,15 @@ const char *kWhiteHotFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D yTexture;
+uniform float uYMin;
+uniform float uYScale;
+uniform float uBlackPoint;
+uniform float uWhitePoint;
 uniform float uGamma;
 void main() {
     float gray = texture2D(yTexture, vTexCoord).r;
-    gray = clamp(gray, 0.0, 1.0);
+    gray = clamp((gray - uYMin) * uYScale, 0.0, 1.0);
+    gray = clamp((gray - uBlackPoint) / max(uWhitePoint - uBlackPoint, 0.001), 0.0, 1.0);
     gray = pow(gray, max(uGamma, 0.001));
     gl_FragColor = vec4(gray, gray, gray, 1.0);
 }
@@ -91,10 +96,15 @@ precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D yTexture;
 uniform sampler2D paletteTexture;
+uniform float uYMin;
+uniform float uYScale;
+uniform float uBlackPoint;
+uniform float uWhitePoint;
 uniform float uGamma;
 void main() {
     float gray = texture2D(yTexture, vTexCoord).r;
-    gray = clamp(gray, 0.0, 1.0);
+    gray = clamp((gray - uYMin) * uYScale, 0.0, 1.0);
+    gray = clamp((gray - uBlackPoint) / max(uWhitePoint - uBlackPoint, 0.001), 0.0, 1.0);
     gray = pow(gray, max(uGamma, 0.001));
     vec3 color = texture2D(paletteTexture, vec2(gray, 0.5)).rgb;
     gl_FragColor = vec4(color, 1.0);
@@ -229,7 +239,8 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
 RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
                                              const uint8_t *uData, int uStride,
                                              const uint8_t *vData, int vStride,
-                                             int width, int height, int thermalMode, float gamma) {
+                                             int width, int height, int thermalMode,
+                                             const ThermalRenderParams &params) {
     if (yData == nullptr || uData == nullptr || vData == nullptr
         || yStride <= 0 || uStride <= 0 || vStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
@@ -279,16 +290,14 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     }
     glUseProgram(program);
     if (useIronbow) {
-        if (ironbowGammaLocation_ >= 0) {
-            glUniform1f(ironbowGammaLocation_, gamma);
-        }
+        setThermalUniforms(ironbowUniforms_, params);
         if (ironbowPaletteLocation_ >= 0) {
             glActiveTexture(GL_TEXTURE3);
             glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
             glActiveTexture(GL_TEXTURE0);
         }
-    } else if (program == whiteHotProgram_ && whiteHotGammaLocation_ >= 0) {
-        glUniform1f(whiteHotGammaLocation_, gamma);
+    } else if (program == whiteHotProgram_) {
+        setThermalUniforms(whiteHotUniforms_, params);
     }
 
     const int viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
@@ -450,7 +459,7 @@ void NativeYuvGlRenderer::releaseGlLocked() {
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
         }
-        whiteHotGammaLocation_ = -1;
+        whiteHotUniforms_ = ThermalUniformSet{};
         if (ironbowTexture_ != 0) {
             glDeleteTextures(1, &ironbowTexture_);
             ironbowTexture_ = 0;
@@ -459,7 +468,7 @@ void NativeYuvGlRenderer::releaseGlLocked() {
             glDeleteProgram(ironbowProgram_);
             ironbowProgram_ = 0;
         }
-        ironbowGammaLocation_ = -1;
+        ironbowUniforms_ = ThermalUniformSet{};
         ironbowPaletteLocation_ = -1;
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (eglSurface_ != EGL_NO_SURFACE) {
@@ -522,12 +531,14 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
     if (whiteHotProgram_ != 0) {
         glUseProgram(whiteHotProgram_);
         glUniform1i(glGetUniformLocation(whiteHotProgram_, "yTexture"), 0);
-        whiteHotGammaLocation_ = glGetUniformLocation(whiteHotProgram_, "uGamma");
-        if (whiteHotGammaLocation_ < 0) {
-            LOGE("white hot shader missing uGamma uniform, fallback to normal program");
+        whiteHotUniforms_ = fetchThermalUniformSet(whiteHotProgram_);
+        if (whiteHotUniforms_.yMin < 0 || whiteHotUniforms_.yScale < 0
+            || whiteHotUniforms_.blackPoint < 0 || whiteHotUniforms_.whitePoint < 0
+            || whiteHotUniforms_.gamma < 0) {
+            LOGE("white hot shader missing thermal uniform, fallback to normal program");
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
-            whiteHotGammaLocation_ = -1;
+            whiteHotUniforms_ = ThermalUniformSet{};
         }
         glUseProgram(normalProgram_);
     }
@@ -541,18 +552,20 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
     if (ironbowProgram_ == 0) {
         LOGE("ironbow shader setup failed, fallback to white hot/normal: %s", ironbowError.c_str());
         ironbowProgram_ = 0;
-        ironbowGammaLocation_ = -1;
+        ironbowUniforms_ = ThermalUniformSet{};
         ironbowPaletteLocation_ = -1;
     } else {
         glUseProgram(ironbowProgram_);
         glUniform1i(glGetUniformLocation(ironbowProgram_, "yTexture"), 0);
-        ironbowGammaLocation_ = glGetUniformLocation(ironbowProgram_, "uGamma");
+        ironbowUniforms_ = fetchThermalUniformSet(ironbowProgram_);
         ironbowPaletteLocation_ = glGetUniformLocation(ironbowProgram_, "paletteTexture");
-        if (ironbowGammaLocation_ < 0 || ironbowPaletteLocation_ < 0) {
+        if (ironbowUniforms_.yMin < 0 || ironbowUniforms_.yScale < 0
+            || ironbowUniforms_.blackPoint < 0 || ironbowUniforms_.whitePoint < 0
+            || ironbowUniforms_.gamma < 0 || ironbowPaletteLocation_ < 0) {
             LOGE("ironbow shader missing required uniform, fallback to white hot/normal");
             glDeleteProgram(ironbowProgram_);
             ironbowProgram_ = 0;
-            ironbowGammaLocation_ = -1;
+            ironbowUniforms_ = ThermalUniformSet{};
             ironbowPaletteLocation_ = -1;
         } else {
             glActiveTexture(GL_TEXTURE3);
@@ -577,6 +590,34 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
     return true;
+}
+
+NativeYuvGlRenderer::ThermalUniformSet NativeYuvGlRenderer::fetchThermalUniformSet(GLuint program) {
+    ThermalUniformSet uniforms;
+    uniforms.yMin = glGetUniformLocation(program, "uYMin");
+    uniforms.yScale = glGetUniformLocation(program, "uYScale");
+    uniforms.blackPoint = glGetUniformLocation(program, "uBlackPoint");
+    uniforms.whitePoint = glGetUniformLocation(program, "uWhitePoint");
+    uniforms.gamma = glGetUniformLocation(program, "uGamma");
+    return uniforms;
+}
+
+void NativeYuvGlRenderer::setThermalUniforms(const ThermalUniformSet &uniforms, const ThermalRenderParams &params) {
+    if (uniforms.yMin >= 0) {
+        glUniform1f(uniforms.yMin, params.yMin);
+    }
+    if (uniforms.yScale >= 0) {
+        glUniform1f(uniforms.yScale, params.yScale);
+    }
+    if (uniforms.blackPoint >= 0) {
+        glUniform1f(uniforms.blackPoint, params.blackPoint);
+    }
+    if (uniforms.whitePoint >= 0) {
+        glUniform1f(uniforms.whitePoint, params.whitePoint);
+    }
+    if (uniforms.gamma >= 0) {
+        glUniform1f(uniforms.gamma, params.gamma);
+    }
 }
 
 const uint8_t *NativeYuvGlRenderer::compactPlane(const uint8_t *src, int srcStride, int width, int height, std::vector<uint8_t> &buffer) {

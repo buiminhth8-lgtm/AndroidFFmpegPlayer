@@ -145,6 +145,8 @@ public final class FFmpegNative {
 
     public static native String setThermalGamma(long handle, float gamma);
 
+    public static native String setThermalWindow(long handle, float blackPoint, float whitePoint);
+
     public static native String getPlayerLatencyConfig(long handle);
 
     public static native String startPlayerRecord(long handle, String outputPath);

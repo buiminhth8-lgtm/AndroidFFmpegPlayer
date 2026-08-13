@@ -23,3 +23,10 @@ bool parseThermalPalette(int value, ThermalPaletteMode &palette) {
 bool isValidThermalGamma(float gamma) {
     return std::isfinite(gamma) && gamma >= 0.5f && gamma <= 2.0f;
 }
+
+bool isValidThermalWindow(float blackPoint, float whitePoint) {
+    return std::isfinite(blackPoint) && std::isfinite(whitePoint)
+           && blackPoint >= 0.0f && whitePoint <= 1.0f
+           && blackPoint < whitePoint
+           && (whitePoint - blackPoint) >= 0.01f;
+}

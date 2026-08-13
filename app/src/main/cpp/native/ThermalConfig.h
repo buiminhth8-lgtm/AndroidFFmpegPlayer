@@ -21,5 +21,6 @@ struct ThermalConfig {
 std::string thermalPaletteName(ThermalPaletteMode palette);
 bool parseThermalPalette(int value, ThermalPaletteMode &palette);
 bool isValidThermalGamma(float gamma);
+bool isValidThermalWindow(float blackPoint, float whitePoint);
 
 #endif // MOTRO_THERMAL_CONFIG_H

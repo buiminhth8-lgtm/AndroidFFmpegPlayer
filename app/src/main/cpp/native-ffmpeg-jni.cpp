@@ -748,6 +748,15 @@ jstring nativeSetThermalGamma(JNIEnv *env, jclass, jlong handle, jfloat gamma) {
     return toJString(env, player->setThermalGamma(gamma));
 }
 
+jstring nativeSetThermalWindow(JNIEnv *env, jclass, jlong handle, jfloat blackPoint, jfloat whitePoint) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setThermalWindow(blackPoint, whitePoint));
+}
+
 jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
     if (handle == 0) {
         return toJString(env, jsonError(-1, "player handle is 0"));
@@ -812,6 +821,7 @@ bool registerNativeMethods(JNIEnv *env) {
             {"setThermalPalette", "(JI)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalPalette)},
             {"setThermalAgcEnabled", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalAgcEnabled)},
             {"setThermalGamma", "(JF)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalGamma)},
+            {"setThermalWindow", "(JFF)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalWindow)},
             {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},

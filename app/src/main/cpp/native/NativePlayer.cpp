@@ -1318,6 +1318,8 @@ std::string NativePlayer::getStats() {
         << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
         << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
+        << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
+        << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
         << "\"thermalRenderMode\":\"" << thermalRenderModeName(lastThermalRenderMode_.load()) << "\","
         << "\"whiteHotRenderedFrameCount\":" << whiteHotRenderedFrameCount_.load() << ","
         << "\"ironbowRenderedFrameCount\":" << ironbowRenderedFrameCount_.load() << "}";
@@ -1740,6 +1742,25 @@ std::string NativePlayer::setThermalGamma(float gamma) {
 ThermalConfig NativePlayer::getThermalConfig() const {
     std::lock_guard<std::mutex> lock(thermalConfigMutex_);
     return thermalConfig_;
+}
+
+std::string NativePlayer::setThermalWindow(float blackPoint, float whitePoint) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (!isValidThermalWindow(blackPoint, whitePoint)) {
+        return jsonError(-1, "thermal window must satisfy finite, 0.0 <= blackPoint < whitePoint <= 1.0, min span 0.01");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.blackPoint = blackPoint;
+        thermalConfig_.whitePoint = whitePoint;
+    }
+    LOGI("setThermalWindow blackPoint=%.3f whitePoint=%.3f", blackPoint, whitePoint);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalBlackPoint\":" << blackPoint
+        << ",\"thermalWhitePoint\":" << whitePoint << "}";
+    return out.str();
 }
 
 std::string NativePlayer::getLatencyConfig() {
@@ -2870,10 +2891,19 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     }
     lastThermalRenderMode_.store(thermalMode);
 
+    ThermalRenderParams renderParams;
+    renderParams.gamma = thermal.gamma;
+    renderParams.blackPoint = thermal.blackPoint;
+    renderParams.whitePoint = thermal.whitePoint;
+    if (frame->color_range == AVCOL_RANGE_MPEG) {
+        renderParams.yMin = 16.0f / 255.0f;
+        renderParams.yScale = 255.0f / 219.0f;
+    }
+
     const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],
                                                           frame->data[1], frame->linesize[1],
                                                           frame->data[2], frame->linesize[2],
-                                                          frameWidth, frameHeight, thermalMode, thermal.gamma);
+                                                          frameWidth, frameHeight, thermalMode, renderParams);
     lastSwsScaleCostUs_.store(-1);
     lastRenderCostUs_.store(result.stats.totalCostUs);
     lastRenderLockCostUs_.store(-1);

@@ -460,6 +460,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String thermalPalette = stats.optString("thermalPalette", "original");
             float thermalGamma = (float) stats.optDouble("thermalGamma", 1.0);
             String thermalRenderMode = stats.optString("thermalRenderMode", "normal");
+            float thermalBlackPoint = (float) stats.optDouble("thermalBlackPoint", 0.0);
+            float thermalWhitePoint = (float) stats.optDouble("thermalWhitePoint", 1.0);
 
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
@@ -486,7 +488,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + " | " + thermalPalette
                             + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
                             + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
-                            + " | render " + thermalRenderMode.toUpperCase(Locale.US));
+                            + " | render " + thermalRenderMode.toUpperCase(Locale.US)
+                            + "\nWindow " + String.format(Locale.US, "%.2f", thermalBlackPoint)
+                            + " - " + String.format(Locale.US, "%.2f", thermalWhitePoint)
+                            + " | Range " + frameColorRange);
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
             }

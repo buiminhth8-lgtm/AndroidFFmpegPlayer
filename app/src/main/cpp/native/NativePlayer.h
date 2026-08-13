@@ -71,6 +71,7 @@ public:
     std::string setThermalPalette(int palette);
     std::string setThermalAgcEnabled(bool enabled);
     std::string setThermalGamma(float gamma);
+    std::string setThermalWindow(float blackPoint, float whitePoint);
     ThermalConfig getThermalConfig() const;
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);

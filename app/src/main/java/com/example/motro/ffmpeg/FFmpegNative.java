@@ -19,6 +19,16 @@ public final class FFmpegNative {
     private FFmpegNative() {
     }
 
+    public static final String EVENT_RECONNECT_DISCONNECTED = "reconnect_disconnected";
+    public static final String EVENT_RECONNECTING = "reconnecting";
+    public static final String EVENT_WAITING_SOURCE = "waiting_source";
+    public static final String EVENT_RECONNECT_SUCCESS = "reconnect_success";
+    public static final String EVENT_RECONNECT_EXHAUSTED = "reconnect_exhausted";
+
+    public interface PlayerEventListener {
+        void onPlayerEvent(long handle, String event, String eventJson);
+    }
+
     private static void loadRequired(String name) {
         System.loadLibrary(name);
         Log.i(TAG, "loaded " + name);
@@ -71,6 +81,8 @@ public final class FFmpegNative {
 
     public static native String setAudioCallback(long handle, Object audioCallback);
 
+    public static native String setPlayerEventListener(long handle, PlayerEventListener listener);
+
     public static native String enableAudio(long handle, boolean enabled);
 
     public static native String setPlayerReconnectOptions(long handle, boolean enabled, int maxRetryCount, int retryDelayMs);
@@ -98,6 +110,10 @@ public final class FFmpegNative {
      * FFmpegNative.setHardwareDecode(handle, true);
      * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_surface");
      * FFmpegNative.enableAudio(handle, false);
+     * FFmpegNative.setPlayerEventListener(handle, (playerHandle, event, eventJson) -> {
+     *     // EVENT_RECONNECTING / EVENT_WAITING_SOURCE: show reconnect animation.
+     *     // EVENT_RECONNECT_SUCCESS: hide reconnect animation.
+     * });
      * FFmpegNative.setPlayerSurface(handle, holder.getSurface());
      * FFmpegNative.preparePlayer(handle, rtspUrl, 5000);
      * FFmpegNative.startPlayer(handle);

@@ -93,6 +93,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private long lastPlaybackInfoDecodedFrames;
     private long lastPlaybackInfoVideoBytes;
     private long lastPlaybackInfoInputBytes;
+    private volatile String lastPlayerEventText = "";
+
+    private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
+        mainHandler.post(() -> {
+            if (destroyed || handle != getPlayerHandle()) {
+                return;
+            }
+            lastPlayerEventText = event;
+            appendLog("Player event: " + event + "\n" + eventJson);
+        });
+    };
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -455,6 +466,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "  packets " + stats.optLong("readPacketCount", 0)
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt
+                            + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError));
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
@@ -468,6 +480,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         lastPlaybackInfoDecodedFrames = 0;
         lastPlaybackInfoVideoBytes = 0;
         lastPlaybackInfoInputBytes = 0;
+        lastPlayerEventText = "";
     }
 
     private double ratePerSecond(long deltaCount, long elapsedMs) {
@@ -508,6 +521,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (playerHandle == 0) {
                 playerHandle = FFmpegNative.createPlayer();
                 Log.d(TAG, "createPlayer handle=" + playerHandle);
+                if (playerHandle != 0) {
+                    Log.d(TAG, "setPlayerEventListener=" + FFmpegNative.setPlayerEventListener(playerHandle, playerEventListener));
+                }
                 postHandleLabel();
             }
             return playerHandle;

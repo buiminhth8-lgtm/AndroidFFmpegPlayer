@@ -50,6 +50,7 @@ public:
     std::string setSurface(JNIEnv *env, jobject surface);
     std::string clearSurface();
     std::string setAudioCallback(JNIEnv *env, jobject callback);
+    std::string setPlayerEventListener(JNIEnv *env, jobject listener);
     std::string enableAudio(bool enabled);
     std::string prepare(const std::string &url, int timeoutMs);
     std::string start();
@@ -86,6 +87,13 @@ private:
     int reconnectDelayForAttempt(int attempt) const;
     bool shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const;
     void syncReconnectPolicyFromOptionsLocked();
+    void notifyPlayerEvent(const std::string &eventName,
+                           PlayerState state,
+                           int64_t attempt,
+                           int maxRetry,
+                           int delayMs,
+                           int errorCode,
+                           const std::string &errorMessage);
     void beginStartupKeyFrameWait(const char *reason);
     void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
@@ -111,6 +119,7 @@ private:
 
     mutable std::mutex mutex_;
     mutable std::mutex surfaceMutex_;
+    mutable std::mutex eventListenerMutex_;
     VideoRenderer renderer_;
     NativeYuvGlRenderer yuvGlRenderer_;
     PlayerRemuxRecorder remuxRecorder_;
@@ -155,6 +164,7 @@ private:
     AVFrame *rgbaFrame_ = nullptr;
     std::vector<uint8_t> rgbaBuffer_;
     jobject surfaceGlobalRef_ = nullptr;
+    jobject playerEventListenerGlobalRef_ = nullptr;
     bool mediaCodecContextInitialized_ = false;
 
     int videoStreamIndex_ = -1;

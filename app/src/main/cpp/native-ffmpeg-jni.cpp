@@ -380,6 +380,15 @@ jstring nativeSetAudioCallback(JNIEnv *env, jclass, jlong handle, jobject callba
     return toJString(env, player->setAudioCallback(env, callback));
 }
 
+jstring nativeSetPlayerEventListener(JNIEnv *env, jclass, jlong handle, jobject listener) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setPlayerEventListener(env, listener));
+}
+
 jstring nativeEnableAudio(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
     std::string error;
     NativePlayer *player = getPlayer(handle, error);
@@ -751,6 +760,7 @@ bool registerNativeMethods(JNIEnv *env) {
             {"getPlayerStats", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerStats)},
             {"clearPlayerSurface", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeClearPlayerSurface)},
             {"setAudioCallback", "(JLjava/lang/Object;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetAudioCallback)},
+            {"setPlayerEventListener", "(JLcom/example/motro/ffmpeg/FFmpegNative$PlayerEventListener;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerEventListener)},
             {"enableAudio", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeEnableAudio)},
             {"setPlayerReconnectOptions", "(JZII)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerReconnectOptions)},
             {"getPlayerReconnectState", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerReconnectState)},

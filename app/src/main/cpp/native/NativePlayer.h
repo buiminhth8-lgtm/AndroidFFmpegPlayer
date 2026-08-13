@@ -107,6 +107,7 @@ private:
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
     bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
+    void updateAgcState(AVFrame *frame, const ThermalConfig &thermal);
     bool shouldDropRealtimePacket(const AVPacket *packet);
     bool shouldDropRealtimeFrame(int64_t ptsUs);
     bool resolveMasterClockUs(const PlayerOptions &options, int64_t videoPtsUs, int64_t &masterClockUs, SyncMaster &effectiveMaster);
@@ -223,6 +224,11 @@ private:
     std::atomic<int64_t> whiteHotRenderedFrameCount_{0};
     std::atomic<int64_t> ironbowRenderedFrameCount_{0};
     std::atomic<int> lastThermalRenderMode_{0};
+    std::atomic<bool> agcValid_{false};
+    std::atomic<float> agcBlackPoint_{0.0f};
+    std::atomic<float> agcWhitePoint_{1.0f};
+    std::atomic<int64_t> agcUpdateCount_{0};
+    std::atomic<int> agcFrameCounter_{0};
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};

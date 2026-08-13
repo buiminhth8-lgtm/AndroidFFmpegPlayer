@@ -41,6 +41,15 @@ namespace {
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
+// AGC tuning constants.
+constexpr int kAgcUpdateIntervalFrames = 5;
+constexpr int kAgcPixelStep = 4;
+constexpr int kAgcRowStep = 4;
+constexpr float kAgcLowPercentile = 0.02f;
+constexpr float kAgcHighPercentile = 0.98f;
+constexpr float kAgcSmoothingAlpha = 0.15f;
+constexpr float kAgcMinSpan = 0.05f;
+
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
     for (char c : value) {
@@ -144,6 +153,70 @@ const char *thermalRenderModeName(int mode) {
         case 2: return "ironbow";
         default: return "normal";
     }
+}
+
+struct AgcResult {
+    bool valid = false;
+    float blackPoint = 0.0f;
+    float whitePoint = 1.0f;
+};
+
+// Percentile-based AGC window from the raw 8-bit Y plane.
+// Converts raw percentile values to the same 0.0 ~ 1.0 normalized
+// thermal range used by the Slice 5 shader range normalization.
+AgcResult computeAgcWindow(const uint8_t *yData, int yStride, int width, int height, AVColorRange colorRange) {
+    AgcResult result;
+    if (yData == nullptr || yStride <= 0 || width <= 0 || height <= 0) {
+        return result;
+    }
+    uint32_t histogram[256] = {};
+    uint64_t sampleCount = 0;
+    for (int y = 0; y < height; y += kAgcRowStep) {
+        const uint8_t *row = yData + static_cast<size_t>(y) * static_cast<size_t>(yStride);
+        for (int x = 0; x < width; x += kAgcPixelStep) {
+            ++histogram[row[x]];
+            ++sampleCount;
+        }
+    }
+    if (sampleCount == 0) {
+        return result;
+    }
+
+    const uint64_t targetLow = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcLowPercentile);
+    const uint64_t targetHigh = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcHighPercentile);
+    uint64_t cumulative = 0;
+    int lowValue = 0;
+    int highValue = 255;
+    bool lowFound = false;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += histogram[i];
+        if (!lowFound && cumulative >= targetLow) {
+            lowValue = i;
+            lowFound = true;
+        }
+        if (cumulative >= targetHigh) {
+            highValue = i;
+            break;
+        }
+    }
+
+    const auto normalizeY = [colorRange](int rawValue) {
+        const float v = rawValue / 255.0f;
+        if (colorRange == AVCOL_RANGE_MPEG) {
+            return (v - 16.0f / 255.0f) / (219.0f / 255.0f);
+        }
+        return v;
+    };
+
+    float low = std::clamp(normalizeY(lowValue), 0.0f, 1.0f);
+    float high = std::clamp(normalizeY(highValue), 0.0f, 1.0f);
+    if (!std::isfinite(low) || !std::isfinite(high) || low >= high || (high - low) < kAgcMinSpan) {
+        return result;
+    }
+    result.blackPoint = low;
+    result.whitePoint = high;
+    result.valid = true;
+    return result;
 }
 
 double rationalToDouble(AVRational rational) {
@@ -1317,6 +1390,10 @@ std::string NativePlayer::getStats() {
         << "\"thermalPalette\":\"" << thermalPaletteName(thermalConfig.palette) << "\","
         << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
         << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
+        << "\"thermalAgcValid\":" << (agcValid_.load() ? "true" : "false") << ","
+        << "\"thermalAgcBlackPoint\":" << (agcValid_.load() ? agcBlackPoint_.load() : 0.0) << ","
+        << "\"thermalAgcWhitePoint\":" << (agcValid_.load() ? agcWhitePoint_.load() : 1.0) << ","
+        << "\"thermalAgcUpdateCount\":" << agcUpdateCount_.load() << ","
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
         << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
         << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
@@ -1716,6 +1793,9 @@ std::string NativePlayer::setThermalAgcEnabled(bool enabled) {
         std::lock_guard<std::mutex> lock(thermalConfigMutex_);
         thermalConfig_.agcEnabled = enabled;
     }
+    // Reset AGC state so a re-enable re-initializes quickly from the new scene.
+    agcValid_.store(false);
+    agcFrameCounter_.store(0);
     LOGI("setThermalAgcEnabled agc=%d", enabled ? 1 : 0);
     std::ostringstream out;
     out << "{\"success\":true,\"thermalAgcEnabled\":" << (enabled ? "true" : "false") << "}";
@@ -2871,6 +2951,35 @@ bool NativePlayer::isSoftwareYuvGlFrameSupported(int frameFormat) const {
     return frameFormat == AV_PIX_FMT_YUV420P || frameFormat == AV_PIX_FMT_YUVJ420P;
 }
 
+void NativePlayer::updateAgcState(AVFrame *frame, const ThermalConfig &thermal) {
+    if (!thermal.agcEnabled || frame == nullptr) {
+        return;
+    }
+    const int frameCount = agcFrameCounter_.fetch_add(1) + 1;
+    if (frameCount < kAgcUpdateIntervalFrames) {
+        return;
+    }
+    agcFrameCounter_.store(0);
+    const AgcResult detected = computeAgcWindow(frame->data[0], frame->linesize[0],
+                                                frame->width, frame->height,
+                                                static_cast<AVColorRange>(frame->color_range));
+    if (!detected.valid) {
+        return;
+    }
+    if (!agcValid_.load()) {
+        agcBlackPoint_.store(detected.blackPoint);
+        agcWhitePoint_.store(detected.whitePoint);
+        agcValid_.store(true);
+        LOGI("AGC initialized blackPoint=%.3f whitePoint=%.3f", detected.blackPoint, detected.whitePoint);
+    } else {
+        const float oldBlack = agcBlackPoint_.load();
+        const float oldWhite = agcWhitePoint_.load();
+        agcBlackPoint_.store(oldBlack * (1.0f - kAgcSmoothingAlpha) + detected.blackPoint * kAgcSmoothingAlpha);
+        agcWhitePoint_.store(oldWhite * (1.0f - kAgcSmoothingAlpha) + detected.whitePoint * kAgcSmoothingAlpha);
+    }
+    agcUpdateCount_.fetch_add(1);
+}
+
 bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
     if (frame == nullptr || !isSoftwareYuvGlFrameSupported(frame->format)) {
         return false;
@@ -2898,6 +3007,13 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     if (frame->color_range == AVCOL_RANGE_MPEG) {
         renderParams.yMin = 16.0f / 255.0f;
         renderParams.yScale = 255.0f / 219.0f;
+    }
+    if (thermalMode == 1 || thermalMode == 2) {
+        updateAgcState(frame, thermal);
+        if (thermal.agcEnabled && agcValid_.load()) {
+            renderParams.blackPoint = agcBlackPoint_.load();
+            renderParams.whitePoint = agcWhitePoint_.load();
+        }
     }
 
     const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],

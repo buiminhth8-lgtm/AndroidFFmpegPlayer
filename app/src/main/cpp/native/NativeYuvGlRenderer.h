@@ -26,7 +26,7 @@ public:
     RenderResult renderI420(const uint8_t *yData, int yStride,
                             const uint8_t *uData, int uStride,
                             const uint8_t *vData, int vStride,
-                            int width, int height, bool whiteHot);
+                            int width, int height, bool whiteHot, float gamma);
     void release();
     bool hasSurface() const;
 
@@ -45,6 +45,7 @@ private:
     EGLConfig eglConfig_ = nullptr;
     GLuint normalProgram_ = 0;
     GLuint whiteHotProgram_ = 0;
+    GLint whiteHotGammaLocation_ = -1;
     GLuint textures_[3] = {0, 0, 0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;

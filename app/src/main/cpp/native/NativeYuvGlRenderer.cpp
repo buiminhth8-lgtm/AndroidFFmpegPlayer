@@ -76,9 +76,12 @@ const char *kWhiteHotFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D yTexture;
+uniform float uGamma;
 void main() {
-    float y = texture2D(yTexture, vTexCoord).r;
-    gl_FragColor = vec4(y, y, y, 1.0);
+    float gray = texture2D(yTexture, vTexCoord).r;
+    gray = clamp(gray, 0.0, 1.0);
+    gray = pow(gray, max(uGamma, 0.001));
+    gl_FragColor = vec4(gray, gray, gray, 1.0);
 }
 )";
 
@@ -166,7 +169,7 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
 RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
                                              const uint8_t *uData, int uStride,
                                              const uint8_t *vData, int vStride,
-                                             int width, int height, bool whiteHot) {
+                                             int width, int height, bool whiteHot, float gamma) {
     if (yData == nullptr || uData == nullptr || vData == nullptr
         || yStride <= 0 || uStride <= 0 || vStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
@@ -207,6 +210,9 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
         program = normalProgram_;
     }
     glUseProgram(program);
+    if (program == whiteHotProgram_ && whiteHotGammaLocation_ >= 0) {
+        glUniform1f(whiteHotGammaLocation_, gamma);
+    }
 
     const int viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
     const int viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : height;
@@ -367,6 +373,7 @@ void NativeYuvGlRenderer::releaseGlLocked() {
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
         }
+        whiteHotGammaLocation_ = -1;
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (eglSurface_ != EGL_NO_SURFACE) {
             eglDestroySurface(eglDisplay_, eglSurface_);
@@ -428,6 +435,13 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
     if (whiteHotProgram_ != 0) {
         glUseProgram(whiteHotProgram_);
         glUniform1i(glGetUniformLocation(whiteHotProgram_, "yTexture"), 0);
+        whiteHotGammaLocation_ = glGetUniformLocation(whiteHotProgram_, "uGamma");
+        if (whiteHotGammaLocation_ < 0) {
+            LOGE("white hot shader missing uGamma uniform, fallback to normal program");
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
+            whiteHotGammaLocation_ = -1;
+        }
         glUseProgram(normalProgram_);
     }
     GLenum error = glGetError();

@@ -2862,7 +2862,7 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],
                                                           frame->data[1], frame->linesize[1],
                                                           frame->data[2], frame->linesize[2],
-                                                          frameWidth, frameHeight, useWhiteHot);
+                                                          frameWidth, frameHeight, useWhiteHot, thermal.gamma);
     lastSwsScaleCostUs_.store(-1);
     lastRenderCostUs_.store(result.stats.totalCostUs);
     lastRenderLockCostUs_.store(-1);

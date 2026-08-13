@@ -455,6 +455,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     ? videoWidth + "x" + videoHeight
                     : "--";
 
+            boolean thermalEnabled = stats.optBoolean("thermalEnabled", false);
+            boolean thermalAgcEnabled = stats.optBoolean("thermalAgcEnabled", false);
+            String thermalPalette = stats.optString("thermalPalette", "original");
+            float thermalGamma = (float) stats.optDouble("thermalGamma", 1.0);
+
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | " + mode
@@ -475,7 +480,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt
                             + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
-                            + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError));
+                            + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
+                            + "\nThermal " + (thermalEnabled ? "ON" : "OFF")
+                            + " | " + thermalPalette
+                            + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
+                            + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma));
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
             }

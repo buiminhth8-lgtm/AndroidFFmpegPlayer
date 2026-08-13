@@ -25,6 +25,10 @@ public final class FFmpegNative {
     public static final String EVENT_RECONNECT_SUCCESS = "reconnect_success";
     public static final String EVENT_RECONNECT_EXHAUSTED = "reconnect_exhausted";
 
+    public static final int THERMAL_PALETTE_ORIGINAL = 0;
+    public static final int THERMAL_PALETTE_WHITE_HOT = 1;
+    public static final int THERMAL_PALETTE_IRONBOW = 2;
+
     public interface PlayerEventListener {
         void onPlayerEvent(long handle, String event, String eventJson);
     }
@@ -132,6 +136,14 @@ public final class FFmpegNative {
     public static native String setHardwareDecode(long handle, boolean enabled);
 
     public static native String setHardwareRenderMode(long handle, String mode);
+
+    public static native String setThermalEnabled(long handle, boolean enabled);
+
+    public static native String setThermalPalette(long handle, int palette);
+
+    public static native String setThermalAgcEnabled(long handle, boolean enabled);
+
+    public static native String setThermalGamma(long handle, float gamma);
 
     public static native String getPlayerLatencyConfig(long handle);
 

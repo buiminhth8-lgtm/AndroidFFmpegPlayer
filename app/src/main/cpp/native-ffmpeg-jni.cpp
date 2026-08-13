@@ -711,6 +711,43 @@ jstring nativeGetPlayerRecordState(JNIEnv *env, jclass, jlong handle) {
     }
     return toJString(env, player->getRecordState());
 }
+
+jstring nativeSetThermalEnabled(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setThermalEnabled(enabled == JNI_TRUE));
+}
+
+jstring nativeSetThermalPalette(JNIEnv *env, jclass, jlong handle, jint palette) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setThermalPalette(palette));
+}
+
+jstring nativeSetThermalAgcEnabled(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setThermalAgcEnabled(enabled == JNI_TRUE));
+}
+
+jstring nativeSetThermalGamma(JNIEnv *env, jclass, jlong handle, jfloat gamma) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setThermalGamma(gamma));
+}
+
 jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
     if (handle == 0) {
         return toJString(env, jsonError(-1, "player handle is 0"));
@@ -771,6 +808,10 @@ bool registerNativeMethods(JNIEnv *env) {
             {"setPlayerOption", "(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerOption)},
             {"setHardwareDecode", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareDecode)},
             {"setHardwareRenderMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareRenderMode)},
+            {"setThermalEnabled", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalEnabled)},
+            {"setThermalPalette", "(JI)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalPalette)},
+            {"setThermalAgcEnabled", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalAgcEnabled)},
+            {"setThermalGamma", "(JF)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalGamma)},
             {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},

@@ -4,6 +4,7 @@
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
 #include "NativeYuvGlRenderer.h"
+#include "ThermalConfig.h"
 #include "VideoRenderer.h"
 
 #include <jni.h>
@@ -66,6 +67,11 @@ public:
     std::string setOption(const std::string &key, const std::string &value);
     std::string setHardwareDecode(bool enabled);
     std::string setHardwareRenderMode(const std::string &mode);
+    std::string setThermalEnabled(bool enabled);
+    std::string setThermalPalette(int palette);
+    std::string setThermalAgcEnabled(bool enabled);
+    std::string setThermalGamma(float gamma);
+    ThermalConfig getThermalConfig() const;
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
@@ -120,6 +126,8 @@ private:
     mutable std::mutex mutex_;
     mutable std::mutex surfaceMutex_;
     mutable std::mutex eventListenerMutex_;
+    mutable std::mutex thermalConfigMutex_;
+    ThermalConfig thermalConfig_;
     VideoRenderer renderer_;
     NativeYuvGlRenderer yuvGlRenderer_;
     PlayerRemuxRecorder remuxRecorder_;

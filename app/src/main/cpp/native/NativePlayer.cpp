@@ -1121,6 +1121,12 @@ std::string NativePlayer::getStats() {
         preferUdpInAuto = preferUdpTransport_.load();
     }
 
+    ThermalConfig thermalConfig;
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig = thermalConfig_;
+    }
+
     int frameWidth = 0;
     int frameHeight = 0;
     bool hasFrame = false;
@@ -1297,7 +1303,12 @@ std::string NativePlayer::getStats() {
         << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
         << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
         << "\"reconnectLastError\":\"" << escapeJson(reconnectError) << "\","
-        << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\"}";
+        << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\","
+        << "\"thermalEnabled\":" << (thermalConfig.enabled ? "true" : "false") << ","
+        << "\"thermalPalette\":\"" << thermalPaletteName(thermalConfig.palette) << "\","
+        << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
+        << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
+        << "\"thermalGamma\":" << thermalConfig.gamma << "}";
     return out.str();
 }
 
@@ -1648,6 +1659,75 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
     std::ostringstream out;
     out << "{\"success\":true,\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\"}";
     return out.str();
+}
+
+std::string NativePlayer::setThermalEnabled(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.enabled = enabled;
+    }
+    LOGI("setThermalEnabled enabled=%d", enabled ? 1 : 0);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalEnabled\":" << (enabled ? "true" : "false") << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalPalette(int palette) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    ThermalPaletteMode parsedMode;
+    if (!parseThermalPalette(palette, parsedMode)) {
+        return jsonError(-1, "thermal palette must be 0 (original), 1 (white_hot), or 2 (ironbow)");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.palette = parsedMode;
+    }
+    LOGI("setThermalPalette palette=%s", thermalPaletteName(parsedMode).c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalPalette\":\"" << thermalPaletteName(parsedMode)
+        << "\",\"thermalPaletteValue\":" << static_cast<int>(parsedMode) << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalAgcEnabled(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.agcEnabled = enabled;
+    }
+    LOGI("setThermalAgcEnabled agc=%d", enabled ? 1 : 0);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalAgcEnabled\":" << (enabled ? "true" : "false") << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalGamma(float gamma) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (!isValidThermalGamma(gamma)) {
+        return jsonError(-1, "thermal gamma must be finite and in range 0.5 ~ 2.0");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.gamma = gamma;
+    }
+    LOGI("setThermalGamma gamma=%.3f", gamma);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalGamma\":" << gamma << "}";
+    return out.str();
+}
+
+ThermalConfig NativePlayer::getThermalConfig() const {
+    std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+    return thermalConfig_;
 }
 
 std::string NativePlayer::getLatencyConfig() {

@@ -5,6 +5,7 @@
 #include <android/native_window_jni.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <sstream>
@@ -84,6 +85,65 @@ void main() {
     gl_FragColor = vec4(gray, gray, gray, 1.0);
 }
 )";
+
+const char *kIronbowFragmentShader = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D yTexture;
+uniform sampler2D paletteTexture;
+uniform float uGamma;
+void main() {
+    float gray = texture2D(yTexture, vTexCoord).r;
+    gray = clamp(gray, 0.0, 1.0);
+    gray = pow(gray, max(uGamma, 0.001));
+    vec3 color = texture2D(paletteTexture, vec2(gray, 0.5)).rgb;
+    gl_FragColor = vec4(color, 1.0);
+}
+)";
+
+struct RgbPoint {
+    float t;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
+
+// Ironbow color control points, piecewise-linear interpolated to 256 entries.
+// index is monotonically increasing with Y brightness.
+const RgbPoint kIronbowPoints[] = {
+        {0.00f, 10, 0, 30},     // near-black dark blue
+        {0.15f, 0, 0, 120},     // dark blue
+        {0.30f, 120, 0, 200},   // violet
+        {0.45f, 200, 0, 200},   // magenta
+        {0.60f, 230, 40, 60},   // red
+        {0.75f, 250, 140, 20},  // orange
+        {0.90f, 250, 220, 60},  // yellow
+        {1.00f, 255, 245, 235}  // white
+};
+
+std::array<uint8_t, 256 * 3> createIronbowLut() {
+    constexpr int pointCount = static_cast<int>(sizeof(kIronbowPoints) / sizeof(kIronbowPoints[0]));
+    std::array<uint8_t, 256 * 3> lut{};
+    for (int i = 0; i < 256; ++i) {
+        const float t = i / 255.0f;
+        int seg = 0;
+        for (int s = 0; s < pointCount - 1; ++s) {
+            if (t <= kIronbowPoints[s + 1].t) {
+                seg = s;
+                break;
+            }
+            seg = s;
+        }
+        const RgbPoint &a = kIronbowPoints[seg];
+        const RgbPoint &b = kIronbowPoints[seg + 1];
+        const float span = (b.t - a.t) > 0.0f ? (b.t - a.t) : 1.0f;
+        const float f = (t - a.t) / span;
+        lut[i * 3 + 0] = static_cast<uint8_t>(a.r + (b.r - a.r) * f);
+        lut[i * 3 + 1] = static_cast<uint8_t>(a.g + (b.g - a.g) * f);
+        lut[i * 3 + 2] = static_cast<uint8_t>(a.b + (b.b - a.b) * f);
+    }
+    return lut;
+}
 
 GLuint compileShader(GLenum type, const char *source, std::string &errorMessage) {
     GLuint shader = glCreateShader(type);
@@ -169,7 +229,7 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
 RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
                                              const uint8_t *uData, int uStride,
                                              const uint8_t *vData, int vStride,
-                                             int width, int height, bool whiteHot, float gamma) {
+                                             int width, int height, int thermalMode, float gamma) {
     if (yData == nullptr || uData == nullptr || vData == nullptr
         || yStride <= 0 || uStride <= 0 || vStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
@@ -205,12 +265,29 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     }
     stats.copyCostUs = steadyNowUs() - uploadStartUs;
 
-    GLuint program = whiteHot ? whiteHotProgram_ : normalProgram_;
-    if (program == 0) {
-        program = normalProgram_;
+    GLuint program = normalProgram_;
+    bool useIronbow = false;
+    if (thermalMode == 1 && whiteHotProgram_ != 0) {
+        program = whiteHotProgram_;
+    } else if (thermalMode == 2) {
+        if (ironbowProgram_ != 0 && ironbowTexture_ != 0) {
+            program = ironbowProgram_;
+            useIronbow = true;
+        } else if (whiteHotProgram_ != 0) {
+            program = whiteHotProgram_;
+        }
     }
     glUseProgram(program);
-    if (program == whiteHotProgram_ && whiteHotGammaLocation_ >= 0) {
+    if (useIronbow) {
+        if (ironbowGammaLocation_ >= 0) {
+            glUniform1f(ironbowGammaLocation_, gamma);
+        }
+        if (ironbowPaletteLocation_ >= 0) {
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+            glActiveTexture(GL_TEXTURE0);
+        }
+    } else if (program == whiteHotProgram_ && whiteHotGammaLocation_ >= 0) {
         glUniform1f(whiteHotGammaLocation_, gamma);
     }
 
@@ -374,6 +451,16 @@ void NativeYuvGlRenderer::releaseGlLocked() {
             whiteHotProgram_ = 0;
         }
         whiteHotGammaLocation_ = -1;
+        if (ironbowTexture_ != 0) {
+            glDeleteTextures(1, &ironbowTexture_);
+            ironbowTexture_ = 0;
+        }
+        if (ironbowProgram_ != 0) {
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+        }
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (eglSurface_ != EGL_NO_SURFACE) {
             eglDestroySurface(eglDisplay_, eglSurface_);
@@ -443,6 +530,44 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
             whiteHotGammaLocation_ = -1;
         }
         glUseProgram(normalProgram_);
+    }
+
+    std::string ironbowError;
+    GLuint ironbowFragmentShader = compileShader(GL_FRAGMENT_SHADER, kIronbowFragmentShader, ironbowError);
+    ironbowProgram_ = ironbowFragmentShader == 0 ? 0 : linkProgram(vertexShader, ironbowFragmentShader, ironbowError);
+    if (ironbowFragmentShader != 0) {
+        glDeleteShader(ironbowFragmentShader);
+    }
+    if (ironbowProgram_ == 0) {
+        LOGE("ironbow shader setup failed, fallback to white hot/normal: %s", ironbowError.c_str());
+        ironbowProgram_ = 0;
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
+    } else {
+        glUseProgram(ironbowProgram_);
+        glUniform1i(glGetUniformLocation(ironbowProgram_, "yTexture"), 0);
+        ironbowGammaLocation_ = glGetUniformLocation(ironbowProgram_, "uGamma");
+        ironbowPaletteLocation_ = glGetUniformLocation(ironbowProgram_, "paletteTexture");
+        if (ironbowGammaLocation_ < 0 || ironbowPaletteLocation_ < 0) {
+            LOGE("ironbow shader missing required uniform, fallback to white hot/normal");
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+            ironbowGammaLocation_ = -1;
+            ironbowPaletteLocation_ = -1;
+        } else {
+            glActiveTexture(GL_TEXTURE3);
+            glGenTextures(1, &ironbowTexture_);
+            glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            const std::array<uint8_t, 256 * 3> lut = createIronbowLut();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 256, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, lut.data());
+            glUniform1i(ironbowPaletteLocation_, 3);
+            glUseProgram(normalProgram_);
+            glActiveTexture(GL_TEXTURE0);
+        }
     }
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {

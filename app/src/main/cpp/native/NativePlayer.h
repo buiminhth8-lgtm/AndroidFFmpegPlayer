@@ -220,8 +220,8 @@ private:
     std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
     std::atomic<int64_t> whiteHotRenderedFrameCount_{0};
+    std::atomic<int64_t> ironbowRenderedFrameCount_{0};
     std::atomic<int> lastThermalRenderMode_{0};
-    std::atomic<bool> ironbowNotImplementedLogged_{false};
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};

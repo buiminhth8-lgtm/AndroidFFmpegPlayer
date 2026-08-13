@@ -137,6 +137,15 @@ std::string colorRangeName(AVColorRange range) {
     }
 }
 
+// thermal render mode: 0 = normal, 1 = white_hot, 2 = ironbow
+const char *thermalRenderModeName(int mode) {
+    switch (mode) {
+        case 1: return "white_hot";
+        case 2: return "ironbow";
+        default: return "normal";
+    }
+}
+
 double rationalToDouble(AVRational rational) {
     if (rational.den == 0) {
         return 0.0;
@@ -1309,8 +1318,9 @@ std::string NativePlayer::getStats() {
         << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
         << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
-        << "\"thermalRenderMode\":\"" << (lastThermalRenderMode_.load() == 1 ? "white_hot" : "normal") << "\","
-        << "\"whiteHotRenderedFrameCount\":" << whiteHotRenderedFrameCount_.load() << "}";
+        << "\"thermalRenderMode\":\"" << thermalRenderModeName(lastThermalRenderMode_.load()) << "\","
+        << "\"whiteHotRenderedFrameCount\":" << whiteHotRenderedFrameCount_.load() << ","
+        << "\"ironbowRenderedFrameCount\":" << ironbowRenderedFrameCount_.load() << "}";
     return out.str();
 }
 
@@ -2850,19 +2860,20 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     }
 
     const ThermalConfig thermal = getThermalConfig();
-    const bool useWhiteHot = thermal.enabled && thermal.palette == ThermalPaletteMode::WHITE_HOT;
-    lastThermalRenderMode_.store(useWhiteHot ? 1 : 0);
-    if (thermal.enabled && thermal.palette == ThermalPaletteMode::IRONBOW) {
-        bool expected = false;
-        if (ironbowNotImplementedLogged_.compare_exchange_strong(expected, true)) {
-            LOGI("Ironbow rendering is not implemented in Slice 2; using normal rendering");
+    int thermalMode = 0;  // normal
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            thermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            thermalMode = 2;
         }
     }
+    lastThermalRenderMode_.store(thermalMode);
 
     const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],
                                                           frame->data[1], frame->linesize[1],
                                                           frame->data[2], frame->linesize[2],
-                                                          frameWidth, frameHeight, useWhiteHot, thermal.gamma);
+                                                          frameWidth, frameHeight, thermalMode, thermal.gamma);
     lastSwsScaleCostUs_.store(-1);
     lastRenderCostUs_.store(result.stats.totalCostUs);
     lastRenderLockCostUs_.store(-1);
@@ -2885,8 +2896,10 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
     softwareRenderedFrameCount_.fetch_add(1);
     const int64_t yuvGlRendered = yuvGlRenderedFrameCount_.fetch_add(1) + 1;
-    if (useWhiteHot) {
+    if (thermalMode == 1) {
         whiteHotRenderedFrameCount_.fetch_add(1);
+    } else if (thermalMode == 2) {
+        ironbowRenderedFrameCount_.fetch_add(1);
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);

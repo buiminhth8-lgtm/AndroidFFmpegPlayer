@@ -35,6 +35,6 @@ dependencyResolutionManagement {
 
     }
 }
-rootProject.name = "Motro"
+rootProject.name = "AndroidFFmpegPlayer"
 include ':app'
 include ':ffmpegplayer'

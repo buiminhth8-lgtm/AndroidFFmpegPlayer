@@ -14,6 +14,7 @@ import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.RadioGroup;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -46,6 +47,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private static final String TAG_EVENT = "FFmpegPlayerEvent";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
+    private static final float MIN_WINDOW_SPAN = 0.01f;
     public static final String EXTRA_URL = "com.example.motro.extra.URL";
     public static final String EXTRA_HARDWARE_DECODE = "com.example.motro.extra.HARDWARE_DECODE";
     public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
@@ -91,6 +93,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private long lastPlaybackInfoVideoBytes;
     private long lastPlaybackInfoInputBytes;
     private volatile String lastPlayerEventText = "";
+
+    private int thermalPalette = FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+    private float thermalGamma = 1.0f;
+    private float thermalBlackPoint = 0.0f;
+    private float thermalWhitePoint = 1.0f;
+    private boolean thermalUiUpdating;
 
     private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
         mainHandler.post(() -> {
@@ -146,6 +154,18 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
+        controlsBinding.thermalEnabledSwitch.setChecked(false);
+        controlsBinding.thermalPaletteRadioGroup.check(R.id.thermalWhiteHotRadio);
+        controlsBinding.thermalAgcSwitch.setChecked(false);
+        controlsBinding.thermalGammaSeekBar.setProgress(50);
+        controlsBinding.thermalBlackPointSeekBar.setProgress(0);
+        controlsBinding.thermalWhitePointSeekBar.setProgress(100);
+        thermalPalette = FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+        thermalGamma = 1.0f;
+        thermalBlackPoint = 0.0f;
+        thermalWhitePoint = 1.0f;
+        updateThermalValueTexts();
+        updateThermalControlEnabled();
     }
 
     private void applyIntentPlaybackDefaults() {
@@ -333,6 +353,197 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 runNative("Latency Mode", () -> applyLatencyMode(handle));
             }
         });
+
+        bindThermalControls();
+    }
+
+    private void bindThermalControls() {
+        controlsBinding.thermalEnabledSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            updateThermalControlEnabled();
+            long handle = getPlayerHandle();
+            if (handle == 0) {
+                return;
+            }
+            if (isChecked) {
+                callThermalApi("Thermal Enable", () -> applyThermalConfig(handle));
+            } else {
+                callThermalApi("Thermal Disable", () -> FFmpegNative.setThermalEnabled(handle, false));
+            }
+        });
+
+        controlsBinding.thermalPaletteRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            int palette = checkedId == R.id.thermalIronbowRadio
+                    ? FFmpegNative.THERMAL_PALETTE_IRONBOW
+                    : FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+            if (palette == thermalPalette) {
+                return;
+            }
+            thermalPalette = palette;
+            long handle = getPlayerHandle();
+            if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                callThermalApi("Thermal Palette", () -> FFmpegNative.setThermalPalette(handle, thermalPalette));
+            }
+        });
+
+        controlsBinding.thermalAgcSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            updateThermalControlEnabled();
+            long handle = getPlayerHandle();
+            if (handle == 0 || !controlsBinding.thermalEnabledSwitch.isChecked()) {
+                return;
+            }
+            callThermalApi("Thermal AGC", () -> FFmpegNative.setThermalAgcEnabled(handle, isChecked));
+        });
+
+        controlsBinding.thermalGammaSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                float gamma = 0.5f + progress / 100.0f;
+                if (Math.abs(gamma - thermalGamma) < 0.001f) {
+                    return;
+                }
+                thermalGamma = gamma;
+                controlsBinding.thermalGammaValueText.setText(String.format(Locale.US, "%.2f", gamma));
+                long handle = getPlayerHandle();
+                if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                    callThermalApi("Thermal Gamma", () -> FFmpegNative.setThermalGamma(handle, thermalGamma));
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+
+        controlsBinding.thermalBlackPointSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                thermalBlackPoint = clampBlackPoint(progress / 100.0f);
+                syncWindowControls();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+
+        controlsBinding.thermalWhitePointSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                thermalWhitePoint = clampWhitePoint(progress / 100.0f);
+                syncWindowControls();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+    }
+
+    private float clampBlackPoint(float black) {
+        float maxBlack = Math.max(0.0f, thermalWhitePoint - MIN_WINDOW_SPAN);
+        return Math.max(0.0f, Math.min(black, maxBlack));
+    }
+
+    private float clampWhitePoint(float white) {
+        float minWhite = Math.min(1.0f, thermalBlackPoint + MIN_WINDOW_SPAN);
+        return Math.max(minWhite, Math.min(white, 1.0f));
+    }
+
+    private void syncWindowControls() {
+        thermalUiUpdating = true;
+        try {
+            controlsBinding.thermalBlackPointSeekBar.setProgress(Math.round(thermalBlackPoint * 100.0f));
+            controlsBinding.thermalWhitePointSeekBar.setProgress(Math.round(thermalWhitePoint * 100.0f));
+            updateThermalValueTexts();
+        } finally {
+            thermalUiUpdating = false;
+        }
+        long handle = getPlayerHandle();
+        if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+            callThermalApi("Thermal Window", () -> FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint));
+        }
+    }
+
+    private void updateThermalValueTexts() {
+        controlsBinding.thermalGammaValueText.setText(String.format(Locale.US, "%.2f", thermalGamma));
+        controlsBinding.thermalBlackPointValueText.setText(String.format(Locale.US, "%.2f", thermalBlackPoint));
+        controlsBinding.thermalWhitePointValueText.setText(String.format(Locale.US, "%.2f", thermalWhitePoint));
+    }
+
+    private void updateThermalControlEnabled() {
+        boolean thermalOn = controlsBinding.thermalEnabledSwitch.isChecked();
+        boolean agcOn = thermalOn && controlsBinding.thermalAgcSwitch.isChecked();
+        controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
+        for (int i = 0; i < controlsBinding.thermalPaletteRadioGroup.getChildCount(); i++) {
+            controlsBinding.thermalPaletteRadioGroup.getChildAt(i).setEnabled(thermalOn);
+        }
+        controlsBinding.thermalAgcSwitch.setEnabled(thermalOn);
+        controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn);
+        controlsBinding.thermalGammaValueText.setAlpha(thermalOn ? 1.0f : 0.4f);
+        boolean windowEnabled = thermalOn && !agcOn;
+        controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
+        controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
+        controlsBinding.thermalBlackPointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
+        controlsBinding.thermalWhitePointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
+    }
+
+    private String applyThermalConfig(long handle) throws Exception {
+        String paletteResult = FFmpegNative.setThermalPalette(handle, thermalPalette);
+        String gammaResult = FFmpegNative.setThermalGamma(handle, thermalGamma);
+        String windowResult = FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint);
+        String agcResult = FFmpegNative.setThermalAgcEnabled(handle, controlsBinding.thermalAgcSwitch.isChecked());
+        String enableResult = FFmpegNative.setThermalEnabled(handle, true);
+        return "palette=" + paletteResult
+                + "\ngamma=" + gammaResult
+                + "\nwindow=" + windowResult
+                + "\nagc=" + agcResult
+                + "\nenable=" + enableResult;
+    }
+
+    private void callThermalApi(String title, NativeAction action) {
+        if (destroyed) {
+            return;
+        }
+        try {
+            String result = action.run();
+            if (result != null && result.contains("\"success\":false")) {
+                Log.w(TAG, title + " failed: " + result);
+            } else {
+                Log.d(TAG, title + " " + result);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, title + " failed", t);
+        }
     }
 
     private void bindSurfaceForExistingPlayer(String title) {

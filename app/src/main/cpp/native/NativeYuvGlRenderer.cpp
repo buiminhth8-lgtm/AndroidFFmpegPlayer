@@ -506,7 +506,6 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
     std::string whiteHotError;
     GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kWhiteHotFragmentShader, whiteHotError);
     whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
-    glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     if (whiteHotFragmentShader != 0) {
         glDeleteShader(whiteHotFragmentShader);
@@ -549,6 +548,8 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
     if (ironbowFragmentShader != 0) {
         glDeleteShader(ironbowFragmentShader);
     }
+    // vertexShader is no longer needed after all programs (normal/white hot/ironbow) are linked.
+    glDeleteShader(vertexShader);
     if (ironbowProgram_ == 0) {
         LOGE("ironbow shader setup failed, fallback to white hot/normal: %s", ironbowError.c_str());
         ironbowProgram_ = 0;

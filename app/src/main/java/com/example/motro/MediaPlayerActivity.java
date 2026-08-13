@@ -64,11 +64,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
     };
 
-    private EditText urlEditText;
-    private EditText timeoutEditText;
-    private EditText recordPathEditText;
-    private EditText segmentPatternEditText;
-    private EditText recordFormatEditText;
     private EditText segmentDurationEditText;
     private EditText snapshotPathEditText;
     private Switch audioSwitch;
@@ -121,11 +116,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void bindViews() {
         binding.playerPreviewView.setKeepScreenOn(true);
-        urlEditText = findViewById(R.id.urlEditText);
-        timeoutEditText = findViewById(R.id.timeoutEditText);
-        recordPathEditText = findViewById(R.id.recordPathEditText);
-        segmentPatternEditText = findViewById(R.id.segmentPatternEditText);
-        recordFormatEditText = findViewById(R.id.recordFormatEditText);
+
+
         segmentDurationEditText = findViewById(R.id.segmentDurationEditText);
         snapshotPathEditText = findViewById(R.id.snapshotPathEditText);
         audioSwitch = findViewById(R.id.audioSwitch);
@@ -140,17 +132,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void initDefaults() {
         String initialUrl = getIntent().getStringExtra(EXTRA_URL);
-        urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
-        timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
+        binding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
+        binding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         applyIntentPlaybackDefaults();
-        recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
-        segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
-        recordFormatEditText.setText("mp4");
+        binding.recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
+        binding.segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
+        binding.recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
         updateHandleLabel();
@@ -634,7 +626,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireUrl() {
-        String url = urlEditText.getText().toString().trim();
+        String url = binding.urlEditText.getText().toString().trim();
         if (TextUtils.isEmpty(url)) {
             throw new IllegalArgumentException("Please enter RTSP/URL");
         }
@@ -642,7 +634,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private int readTimeoutMs() {
-        String value = timeoutEditText.getText().toString().trim();
+        String value = binding.timeoutEditText.getText().toString().trim();
         if (TextUtils.isEmpty(value)) {
             return DEFAULT_TIMEOUT_MS;
         }
@@ -654,27 +646,27 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireRecordPath() {
-        String path = recordPathEditText.getText().toString().trim();
+        String path = binding.recordPathEditText.getText().toString().trim();
         if (TextUtils.isEmpty(path)) {
             path = defaultFilePath("record_av_test.ts");
-            recordPathEditText.setText(path);
+            binding.recordPathEditText.setText(path);
         }
         ensureParentExists(path);
         return path;
     }
 
     private String requireSegmentPattern() {
-        String pattern = segmentPatternEditText.getText().toString().trim();
+        String pattern = binding.segmentPatternEditText.getText().toString().trim();
         if (TextUtils.isEmpty(pattern)) {
             pattern = defaultFilePath("record_segment_%03d.ts");
-            segmentPatternEditText.setText(pattern);
+            binding.segmentPatternEditText.setText(pattern);
         }
         ensureParentExists(pattern.replace("%03d", "000"));
         return pattern;
     }
 
     private String requireRecordFormat() {
-        String format = recordFormatEditText.getText().toString().trim();
+        String format = binding.recordFormatEditText.getText().toString().trim();
         if (TextUtils.isEmpty(format)) {
             return "auto";
         }

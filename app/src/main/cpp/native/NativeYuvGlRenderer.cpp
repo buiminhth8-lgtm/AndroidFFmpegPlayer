@@ -72,6 +72,16 @@ void main() {
 }
 )";
 
+const char *kWhiteHotFragmentShader = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D yTexture;
+void main() {
+    float y = texture2D(yTexture, vTexCoord).r;
+    gl_FragColor = vec4(y, y, y, 1.0);
+}
+)";
+
 GLuint compileShader(GLenum type, const char *source, std::string &errorMessage) {
     GLuint shader = glCreateShader(type);
     if (shader == 0) {
@@ -92,6 +102,30 @@ GLuint compileShader(GLenum type, const char *source, std::string &errorMessage)
         return 0;
     }
     return shader;
+}
+
+GLuint linkProgram(GLuint vertexShader, GLuint fragmentShader, std::string &errorMessage) {
+    GLuint program = glCreateProgram();
+    if (program == 0) {
+        errorMessage = glErrorString("glCreateProgram");
+        return 0;
+    }
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        GLint logLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
+        std::string log(static_cast<size_t>(std::max(logLength, 1)), '\0');
+        glGetProgramInfoLog(program, logLength, nullptr, log.data());
+        errorMessage = "program link failed: " + log;
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
 }
 
 } // namespace
@@ -132,7 +166,7 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
 RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
                                              const uint8_t *uData, int uStride,
                                              const uint8_t *vData, int vStride,
-                                             int width, int height) {
+                                             int width, int height, bool whiteHot) {
     if (yData == nullptr || uData == nullptr || vData == nullptr
         || yStride <= 0 || uStride <= 0 || vStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
@@ -168,12 +202,17 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     }
     stats.copyCostUs = steadyNowUs() - uploadStartUs;
 
+    GLuint program = whiteHot ? whiteHotProgram_ : normalProgram_;
+    if (program == 0) {
+        program = normalProgram_;
+    }
+    glUseProgram(program);
+
     const int viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
     const int viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : height;
     glViewport(0, 0, viewportWidth, viewportHeight);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(program_);
 
     static const GLfloat vertices[] = {
             -1.0f, -1.0f,
@@ -188,8 +227,8 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
             1.0f, 0.0f
     };
 
-    const GLint positionLocation = glGetAttribLocation(program_, "aPosition");
-    const GLint texCoordLocation = glGetAttribLocation(program_, "aTexCoord");
+    const GLint positionLocation = glGetAttribLocation(program, "aPosition");
+    const GLint texCoordLocation = glGetAttribLocation(program, "aTexCoord");
     if (positionLocation < 0 || texCoordLocation < 0) {
         stats.totalCostUs = steadyNowUs() - renderStartUs;
         return {false, -1, "GL YUV shader attribute not found", stats};
@@ -250,7 +289,7 @@ bool NativeYuvGlRenderer::hasSurface() const {
 
 bool NativeYuvGlRenderer::ensureGlLocked(std::string &errorMessage) {
     if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE
-        && eglContext_ != EGL_NO_CONTEXT && program_ != 0) {
+        && eglContext_ != EGL_NO_CONTEXT && normalProgram_ != 0) {
         if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
             errorMessage = eglErrorString("eglMakeCurrent");
             return false;
@@ -320,9 +359,13 @@ void NativeYuvGlRenderer::releaseGlLocked() {
             glDeleteTextures(3, textures_);
             textures_[0] = textures_[1] = textures_[2] = 0;
         }
-        if (program_ != 0) {
-            glDeleteProgram(program_);
-            program_ = 0;
+        if (normalProgram_ != 0) {
+            glDeleteProgram(normalProgram_);
+            normalProgram_ = 0;
+        }
+        if (whiteHotProgram_ != 0) {
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
         }
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (eglSurface_ != EGL_NO_SURFACE) {
@@ -350,33 +393,27 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
 
-    program_ = glCreateProgram();
-    if (program_ == 0) {
-        errorMessage = glErrorString("glCreateProgram");
+    normalProgram_ = linkProgram(vertexShader, fragmentShader, errorMessage);
+    if (normalProgram_ == 0) {
         glDeleteShader(vertexShader);
         glDeleteShader(fragmentShader);
         return false;
     }
-    glAttachShader(program_, vertexShader);
-    glAttachShader(program_, fragmentShader);
-    glLinkProgram(program_);
+
+    std::string whiteHotError;
+    GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kWhiteHotFragmentShader, whiteHotError);
+    whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
-
-    GLint linked = GL_FALSE;
-    glGetProgramiv(program_, GL_LINK_STATUS, &linked);
-    if (linked != GL_TRUE) {
-        GLint logLength = 0;
-        glGetProgramiv(program_, GL_INFO_LOG_LENGTH, &logLength);
-        std::string log(static_cast<size_t>(std::max(logLength, 1)), '\0');
-        glGetProgramInfoLog(program_, logLength, nullptr, log.data());
-        errorMessage = "program link failed: " + log;
-        glDeleteProgram(program_);
-        program_ = 0;
-        return false;
+    if (whiteHotFragmentShader != 0) {
+        glDeleteShader(whiteHotFragmentShader);
+    }
+    if (whiteHotProgram_ == 0) {
+        LOGE("white hot shader setup failed, fallback to normal program: %s", whiteHotError.c_str());
+        whiteHotProgram_ = 0;
     }
 
-    glUseProgram(program_);
+    glUseProgram(normalProgram_);
     glGenTextures(3, textures_);
     const char *samplers[] = {"yTexture", "uTexture", "vTexture"};
     for (int i = 0; i < 3; ++i) {
@@ -386,7 +423,12 @@ bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glUniform1i(glGetUniformLocation(program_, samplers[i]), i);
+        glUniform1i(glGetUniformLocation(normalProgram_, samplers[i]), i);
+    }
+    if (whiteHotProgram_ != 0) {
+        glUseProgram(whiteHotProgram_);
+        glUniform1i(glGetUniformLocation(whiteHotProgram_, "yTexture"), 0);
+        glUseProgram(normalProgram_);
     }
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {

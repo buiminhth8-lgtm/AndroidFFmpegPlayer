@@ -128,6 +128,15 @@ std::string codecName(AVCodecID codecId) {
     return name == nullptr ? "unknown" : name;
 }
 
+std::string colorRangeName(AVColorRange range) {
+    switch (range) {
+        case AVCOL_RANGE_MPEG: return "limited";
+        case AVCOL_RANGE_JPEG: return "full";
+        case AVCOL_RANGE_UNSPECIFIED: return "unspecified";
+        default: return "unknown";
+    }
+}
+
 double rationalToDouble(AVRational rational) {
     if (rational.den == 0) {
         return 0.0;
@@ -1182,6 +1191,9 @@ std::string NativePlayer::getStats() {
         << "\"fps\":" << fps_ << ","
         << "\"videoWidth\":" << videoWidth_ << ","
         << "\"videoHeight\":" << videoHeight_ << ","
+        << "\"frameColorRange\":\"" << colorRangeName(static_cast<AVColorRange>(lastFrameColorRange_.load())) << "\","
+        << "\"frameColorRangeValue\":" << lastFrameColorRange_.load() << ","
+        << "\"frameYStride\":" << lastFrameYStride_.load() << ","
         << "\"videoFrameCount\":" << videoFrameCount_.load() << ","
         << "\"audioFrameCount\":" << audioFrameCount_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
@@ -2591,6 +2603,20 @@ void NativePlayer::playbackLoop() {
             bool hasLatestFrame = false;
 
             auto processDecodedVideoFrame = [&](AVFrame *frame, int64_t frameProcessStartUs) {
+                if (frame != nullptr && frame->format != AV_PIX_FMT_MEDIACODEC) {
+                    lastFrameYStride_.store(frame->linesize[0] > 0 ? frame->linesize[0] : 0);
+                    lastFrameColorRange_.store(frame->color_range);
+                    const int64_t diagFrame = videoFrameCount_.load() + 1;
+                    if (diagFrame == 1 || diagFrame % 300 == 0) {
+                        const char *formatName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
+                        LOGI("software frame diagnostic width=%d height=%d format=%s yStride=%d colorRange=%s renderMode=%s",
+                             frame->width, frame->height,
+                             formatName == nullptr ? "unknown" : formatName,
+                             frame->linesize[0],
+                             colorRangeName(static_cast<AVColorRange>(frame->color_range)).c_str(),
+                             renderModeName(optionsSnapshot.renderMode).c_str());
+                    }
+                }
                 if (renderFrame(frame)) {
                     int64_t ptsUs = 0;
                     if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {

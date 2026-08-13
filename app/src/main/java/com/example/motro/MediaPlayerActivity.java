@@ -445,17 +445,32 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stateDisplay += " reconnecting";
             }
 
+            int videoWidth = stats.optInt("videoWidth", 0);
+            int videoHeight = stats.optInt("videoHeight", 0);
+            int frameYStride = stats.optInt("frameYStride", 0);
+            String frameColorRange = stats.optString("frameColorRange", "unknown");
+            long yuvGlRendered = stats.optLong("yuvGlRenderedFrameCount", 0);
+            long yuvGlFallback = stats.optLong("yuvGlFallbackFrameCount", 0);
+            String resolution = videoWidth > 0 && videoHeight > 0
+                    ? videoWidth + "x" + videoHeight
+                    : "--";
+
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | " + mode
                             + " | " + codec
+                            + "\n" + resolution
+                            + " | " + frameFormat
+                            + " | Y stride=" + frameYStride
+                            + " | range=" + frameColorRange
                             + "\ndecode " + formatFps(decodeFps)
                             + " fps  render " + formatFps(renderFps)
                             + " fps  dropped " + dropped
                             + "\nbitrate " + formatKbps(videoKbps)
                             + "  transfer " + formatKbPerSec(transferKbPerSec)
                             + "  nominal " + nominalBitrate
-                            + "\nformat " + frameFormat
+                            + "\nyuv-gl rendered=" + yuvGlRendered
+                            + " fallback=" + yuvGlFallback
                             + "  packets " + stats.optLong("readPacketCount", 0)
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt
@@ -596,7 +611,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
         boolean hardwareDecode = hardwareDecodeSwitch.isChecked();
         String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
-        String renderMode = hardwareDecode ? "mediacodec_surface" : "software_rgba";
+        // setHardwareDecode(false) may reset software render mode to software_rgba,
+        // so apply the explicit render mode afterwards.
+        String renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
         String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
         return "hardwareDecode=" + decodeResult
                 + "\nrenderMode=" + renderModeResult;

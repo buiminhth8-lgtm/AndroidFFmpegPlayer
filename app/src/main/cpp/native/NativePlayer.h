@@ -219,6 +219,8 @@ private:
     std::atomic<int64_t> lastFrameCacheUpdateCount_{0};
     std::atomic<int64_t> lastFrameCacheSkippedCount_{0};
     std::atomic<int64_t> lastFrameCacheCandidateCount_{0};
+    std::atomic<int> lastFrameYStride_{0};
+    std::atomic<int> lastFrameColorRange_{0};  // AVCOL_RANGE_UNSPECIFIED == 0
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};

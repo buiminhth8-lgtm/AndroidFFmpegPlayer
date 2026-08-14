@@ -388,7 +388,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     controlsBinding.thermalEnabledSwitch.setChecked(false);
                     thermalUiUpdating = false;
                     String current = TextUtils.isEmpty(currentRenderMode)
-                            ? (hardwareDecodeSwitch.isChecked() ? "mediacodec_surface" : "software_yuv_gl")
+                            ? (hardwareDecodeSwitch.isChecked() ? "mediacodec_nv12_gl" : "software_yuv_gl")
                             : currentRenderMode;
                     Log.w(TAG, "Thermal blocked: requires software_yuv_gl, current=" + current);
                     Toast.makeText(this,
@@ -545,7 +545,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     || "mediacodec_oes".equals(currentRenderMode);
         }
         // Player not established yet: use the pending decode-mode choice.
-        return !hardwareDecodeSwitch.isChecked() || "mediacodec_oes".equals(intentRenderMode);
+        return (!hardwareDecodeSwitch.isChecked() && !"mediacodec_nv12_gl".equals(intentRenderMode))
+                || "mediacodec_oes".equals(intentRenderMode);
     }
 
     private void updateThermalControlsEnabledState() {
@@ -946,10 +947,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
         String renderMode;
         if ("mediacodec_oes".equals(intentRenderMode)) {
             renderMode = "mediacodec_oes";
-        } else if ("mediacodec_nv12_gl".equals(intentRenderMode)) {
-            renderMode = "mediacodec_nv12_gl";
+        } else if ("mediacodec_surface".equals(intentRenderMode)) {
+            renderMode = "mediacodec_surface";
         } else {
-            renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
+            // Revised Phase 2 main path: Hardware Decode ON -> NV12 GL.
+            renderMode = hardwareDecode ? "mediacodec_nv12_gl" : "software_yuv_gl";
         }
         String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
         currentRenderMode = renderMode;

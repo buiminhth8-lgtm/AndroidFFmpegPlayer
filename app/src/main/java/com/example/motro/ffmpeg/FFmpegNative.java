@@ -126,13 +126,13 @@ public final class FFmpegNative {
      * FFmpegNative.preparePlayer(handle, rtspUrl, 3000000);
      * FFmpegNative.startPlayer(handle);
      *
-     * FFmpeg MediaCodec Surface low latency example:
+     * FFmpeg MediaCodec NV12 GL low latency example (Revised Phase 2 main path):
      * long handle = FFmpegNative.createPlayer();
      * FFmpegNative.setRtspTransport(handle, "udp");
      * FFmpegNative.setPlayerLatencyMode(handle, "ultra_low_latency");
      * FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
      * FFmpegNative.setHardwareDecode(handle, true);
-     * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_surface");
+     * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_nv12_gl");
      * FFmpegNative.enableAudio(handle, false);
      * FFmpegNative.setPlayerEventListener(handle, (playerHandle, event, eventJson) -> {
      *     // EVENT_RECONNECTING / EVENT_WAITING_SOURCE: show reconnect animation.

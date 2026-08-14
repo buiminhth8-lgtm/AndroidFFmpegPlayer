@@ -231,6 +231,14 @@ private:
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
     std::atomic<int64_t> nv12GlRenderedFrameCount_{0};
     std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12GlLastRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlTotalRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlRenderCostSampleCount_{0};
+    std::atomic<int64_t> nv12GlMaxRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlLastUploadCostUs_{0};
+    std::atomic<int64_t> nv12GlTotalUploadCostUs_{0};
+    std::atomic<int64_t> nv12GlUploadCostSampleCount_{0};
+    std::atomic<int64_t> nv12GlMaxUploadCostUs_{0};
     std::atomic<int64_t> oesFrameAvailableCount_{0};
     std::atomic<int64_t> oesFrameRenderedCount_{0};
     std::atomic<int64_t> oesRenderFailCount_{0};

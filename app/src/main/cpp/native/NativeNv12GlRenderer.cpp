@@ -61,7 +61,7 @@ void main() {
 )";
 
 // NV12: Y plane (GL_LUMINANCE) + interleaved UV plane (GL_LUMINANCE_ALPHA: L=U, A=V).
-// Uses the same BT.601 YUV->RGB convention as the Phase 1 YUV GL renderer.
+// BT.601/BT.709 coefficients selected via uCoeffs = (cR_V, cG_U, cG_V, cB_U).
 const char *kNv12FragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
@@ -69,15 +69,16 @@ uniform sampler2D uTextureY;
 uniform sampler2D uTextureUV;
 uniform float uYMin;
 uniform float uYScale;
+uniform vec4 uCoeffs;
 void main() {
     float y = texture2D(uTextureY, vTexCoord).r;
     y = clamp((y - uYMin) * uYScale, 0.0, 1.0);
     vec2 uv = texture2D(uTextureUV, vTexCoord).ra;
     float u = uv.x - 0.5;
     float v = uv.y - 0.5;
-    float r = y + 1.402 * v;
-    float g = y - 0.344136 * u - 0.714136 * v;
-    float b = y + 1.772 * u;
+    float r = y + uCoeffs.x * v;
+    float g = y - uCoeffs.y * u - uCoeffs.z * v;
+    float b = y + uCoeffs.w * u;
     gl_FragColor = vec4(r, g, b, 1.0);
 }
 )";
@@ -150,22 +151,28 @@ std::string NativeNv12GlRenderer::setSurface(JNIEnv *env, jobject surface, int w
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    releaseGlLocked();
+    if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT) {
+        // Surface recreated: keep EGL context / program / textures, rebuild only
+        // the EGL window surface. Resolution change reallocates textures on the
+        // next render (glTexImage2D on size change).
+        if (!rebindEglSurfaceLocked(newWindow, width, height)) {
+            LOGI("NV12 GL EGLSurface rebind failed, full teardown on next render");
+            releaseGlLocked();
+        }
+    }
     if (window_ != nullptr) {
         ANativeWindow_release(window_);
     }
     window_ = newWindow;
     surfaceWidth_ = width;
     surfaceHeight_ = height;
-    frameWidth_ = 0;
-    frameHeight_ = 0;
     LOGI("setSurface NV12 GL success surface=%dx%d", width, height);
     return jsonSuccess("nv12 gl surface set");
 }
 
 RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
                                               const uint8_t *uvData, int uvStride,
-                                              int width, int height, int colorRange) {
+                                              int width, int height, int colorRange, int colorspace) {
     if (yData == nullptr || uvData == nullptr || yStride <= 0 || uvStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
         return {false, -1, "invalid NV12 frame", {}};
@@ -195,7 +202,10 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     if (yStaging_.size() < static_cast<size_t>(width) * static_cast<size_t>(height)) {
         yStaging_.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
     }
-    const size_t uvBytes = static_cast<size_t>(width) * static_cast<size_t>(height) / 2;
+    const int chromaWidth = (width + 1) / 2;
+    const int chromaHeight = (height + 1) / 2;
+    const int uvVisibleRowBytes = chromaWidth * 2;  // NV12 interleaved U,V
+    const size_t uvBytes = static_cast<size_t>(uvVisibleRowBytes) * static_cast<size_t>(chromaHeight);
     if (uvStaging_.size() < uvBytes) {
         uvStaging_.resize(uvBytes);
     }
@@ -203,9 +213,9 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     const uint8_t *uploadY = yStride == width
                              ? yData
                              : compactPlane(yData, yStride, width, height, yStaging_);
-    const uint8_t *uploadUV = uvStride == width
+    const uint8_t *uploadUV = uvStride == uvVisibleRowBytes
                               ? uvData
-                              : compactPlane(uvData, uvStride, width, height / 2, uvStaging_);
+                              : compactPlane(uvData, uvStride, uvVisibleRowBytes, chromaHeight, uvStaging_);
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     const int64_t uploadStartUs = steadyNowUs();
@@ -221,10 +231,10 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, textures_[1]);
     if (sizeChanged) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, width / 2, height / 2, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, chromaWidth, chromaHeight, 0,
                      GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uploadUV);
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width / 2, height / 2,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, chromaWidth, chromaHeight,
                         GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uploadUV);
     }
     GLenum uploadError = glGetError();
@@ -245,6 +255,18 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     }
     glUniform1f(yMinLocation_, yMin);
     glUniform1f(yScaleLocation_, yScale);
+    // BT.601 / BT.709 matrix coefficients (cR_V, cG_U, cG_V, cB_U). Unknown -> BT.601.
+    float cR_V = 1.402f;
+    float cG_U = 0.344136f;
+    float cG_V = 0.714136f;
+    float cB_U = 1.772f;
+    if (colorspace == AVCOL_SPC_BT709) {
+        cR_V = 1.5748f;
+        cG_U = 0.1873f;
+        cG_V = 0.4681f;
+        cB_U = 1.8556f;
+    }
+    glUniform4f(coeffsLocation_, cR_V, cG_U, cG_V, cB_U);
 
     GLint viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
     GLint viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : height;
@@ -355,10 +377,19 @@ bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {
     if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE
         && eglContext_ != EGL_NO_CONTEXT && program_ != 0) {
         if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
-            errorMessage = eglErrorString("eglMakeCurrent");
-            return false;
+            const EGLint eglError = eglGetError();
+            if (eglError == EGL_CONTEXT_LOST) {
+                LOGE("NV12 GL EGL context lost; rebuilding GL resources");
+                releaseGlLocked();
+                frameWidth_ = 0;
+                frameHeight_ = 0;
+            } else {
+                errorMessage = eglErrorString("eglMakeCurrent");
+                return false;
+            }
+        } else {
+            return true;
         }
-        return true;
     }
 
     eglDisplay_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
@@ -446,13 +477,10 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         }
         yMinLocation_ = -1;
         yScaleLocation_ = -1;
+        coeffsLocation_ = -1;
         positionLocation_ = -1;
         texCoordLocation_ = -1;
-        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (eglSurface_ != EGL_NO_SURFACE) {
-            eglDestroySurface(eglDisplay_, eglSurface_);
-            eglSurface_ = EGL_NO_SURFACE;
-        }
+        releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
             eglContext_ = EGL_NO_CONTEXT;
@@ -461,6 +489,35 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         eglDisplay_ = EGL_NO_DISPLAY;
     }
     eglConfig_ = nullptr;
+}
+
+bool NativeNv12GlRenderer::rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height) {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglContext_ == EGL_NO_CONTEXT || newWindow == nullptr) {
+        return false;
+    }
+    releaseEglSurfaceLocked();
+    eglSurface_ = eglCreateWindowSurface(eglDisplay_, eglConfig_, newWindow, nullptr);
+    if (eglSurface_ == EGL_NO_SURFACE) {
+        LOGE("NV12 GL recreate EGLSurface failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
+        LOGE("NV12 GL recreate EGLSurface makeCurrent failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    glViewport(0, 0, width > 0 ? width : 1, height > 0 ? height : 1);
+    return true;
+}
+
+void NativeNv12GlRenderer::releaseEglSurfaceLocked() {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglSurface_ == EGL_NO_SURFACE) {
+        return;
+    }
+    if (eglContext_ != EGL_NO_CONTEXT) {
+        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    eglDestroySurface(eglDisplay_, eglSurface_);
+    eglSurface_ = EGL_NO_SURFACE;
 }
 
 const uint8_t *NativeNv12GlRenderer::compactPlane(const uint8_t *src, int srcStride, int width, int height, std::vector<uint8_t> &buffer) {
@@ -499,9 +556,10 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
     glUseProgram(program_);
     yMinLocation_ = glGetUniformLocation(program_, "uYMin");
     yScaleLocation_ = glGetUniformLocation(program_, "uYScale");
+    coeffsLocation_ = glGetUniformLocation(program_, "uCoeffs");
     positionLocation_ = glGetAttribLocation(program_, "aPosition");
     texCoordLocation_ = glGetAttribLocation(program_, "aTexCoord");
-    if (yMinLocation_ < 0 || yScaleLocation_ < 0 || positionLocation_ < 0 || texCoordLocation_ < 0) {
+    if (yMinLocation_ < 0 || yScaleLocation_ < 0 || coeffsLocation_ < 0 || positionLocation_ < 0 || texCoordLocation_ < 0) {
         errorMessage = "NV12 shader attribute/uniform not found";
         return false;
     }

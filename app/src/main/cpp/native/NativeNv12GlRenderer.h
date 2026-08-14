@@ -36,13 +36,16 @@ public:
     bool supportsFrameFormat(int frameFormat) const;
 
     // colorRange: AVCOL_RANGE_UNSPECIFIED(0) / AVCOL_RANGE_MPEG(1) / AVCOL_RANGE_JPEG(2).
+    // colorspace: AVColorSpace (BT.601 / BT.709 selection; unknown -> BT.601).
     RenderResult renderNv12(const uint8_t *yData, int yStride,
                             const uint8_t *uvData, int uvStride,
-                            int width, int height, int colorRange);
+                            int width, int height, int colorRange, int colorspace);
 
 private:
     bool ensureGlLocked(std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
+    bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    void releaseEglSurfaceLocked();
     void releaseGlLocked();
     const uint8_t *compactPlane(const uint8_t *src, int srcStride, int width, int height, std::vector<uint8_t> &buffer);
 
@@ -55,6 +58,7 @@ private:
     GLuint program_ = 0;
     GLint yMinLocation_ = -1;
     GLint yScaleLocation_ = -1;
+    GLint coeffsLocation_ = -1;
     GLint positionLocation_ = -1;
     GLint texCoordLocation_ = -1;
     GLuint textures_[2] = {0, 0};

@@ -1401,6 +1401,12 @@ std::string NativePlayer::getStats() {
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
         << "\"nv12GlRenderedFrameCount\":" << nv12GlRenderedFrameCount_.load() << ","
         << "\"nv12GlFallbackFrameCount\":" << nv12GlFallbackFrameCount_.load() << ","
+        << "\"lastNv12GlRenderCostUs\":" << nv12GlLastRenderCostUs_.load() << ","
+        << "\"avgNv12GlRenderCostUs\":" << averageUs(nv12GlTotalRenderCostUs_.load(), nv12GlRenderCostSampleCount_.load()) << ","
+        << "\"maxNv12GlRenderCostUs\":" << nv12GlMaxRenderCostUs_.load() << ","
+        << "\"lastNv12GlUploadCostUs\":" << nv12GlLastUploadCostUs_.load() << ","
+        << "\"avgNv12GlUploadCostUs\":" << averageUs(nv12GlTotalUploadCostUs_.load(), nv12GlUploadCostSampleCount_.load()) << ","
+        << "\"maxNv12GlUploadCostUs\":" << nv12GlMaxUploadCostUs_.load() << ","
         << "\"renderInputType\":\"" << renderInputValue << "\","
         << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
         << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
@@ -3223,11 +3229,20 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
     const RenderResult result = nv12GlRenderer_.renderNv12(frame->data[0], frame->linesize[0],
                                                            frame->data[1], frame->linesize[1],
                                                            frameWidth, frameHeight,
-                                                           static_cast<int>(frame->color_range));
+                                                           static_cast<int>(frame->color_range),
+                                                           static_cast<int>(frame->colorspace));
+    if (result.stats.copyCostUs > 0) {
+        recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
+                   nv12GlMaxUploadCostUs_, result.stats.copyCostUs);
+    }
     if (result.success) {
         lastRendererType_.store(3);  // nv12_gl
         nv12GlRenderedFrameCount_.fetch_add(1);
         renderedFrameCount_.fetch_add(1);
+        if (result.stats.totalCostUs > 0) {
+            recordCost(nv12GlLastRenderCostUs_, nv12GlTotalRenderCostUs_, nv12GlRenderCostSampleCount_,
+                       nv12GlMaxRenderCostUs_, result.stats.totalCostUs);
+        }
         lastRenderTimeMs_.store(nowMs());
         return true;
     }
@@ -3546,6 +3561,14 @@ void NativePlayer::resetStats() {
     yuvGlFallbackFrameCount_.store(0);
     nv12GlRenderedFrameCount_.store(0);
     nv12GlFallbackFrameCount_.store(0);
+    nv12GlLastRenderCostUs_.store(0);
+    nv12GlTotalRenderCostUs_.store(0);
+    nv12GlRenderCostSampleCount_.store(0);
+    nv12GlMaxRenderCostUs_.store(0);
+    nv12GlLastUploadCostUs_.store(0);
+    nv12GlTotalUploadCostUs_.store(0);
+    nv12GlUploadCostSampleCount_.store(0);
+    nv12GlMaxUploadCostUs_.store(0);
     lastFrameYStride_.store(0);
     lastFrameColorRange_.store(0);
     lastFrameOutputType_.store(0);

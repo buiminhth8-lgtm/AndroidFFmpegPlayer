@@ -231,6 +231,7 @@ private:
     std::atomic<int64_t> oesRenderFailCount_{0};
     std::atomic<int64_t> oesThermalRenderedCount_{0};
     std::atomic<int> lastOesThermalRenderMode_{0};
+    std::atomic<int> oesAgcFrameCounter_{0};
     std::atomic<int64_t> whiteHotRenderedFrameCount_{0};
     std::atomic<int64_t> ironbowRenderedFrameCount_{0};
     std::atomic<int> lastThermalRenderMode_{0};

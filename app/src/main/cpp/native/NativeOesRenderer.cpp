@@ -7,7 +7,9 @@
 #include <GLES2/gl2ext.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 
@@ -109,6 +111,30 @@ void main() {
     gl_FragColor = vec4(color, 1.0);
 }
 )";
+
+// AGC luminance downsample: output luminance only (analyzed BEFORE window/gamma/palette).
+const char *kAgcDownsampleFragmentShader = R"(
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+varying vec2 vTexCoord;
+uniform samplerExternalOES uTexture;
+void main() {
+    vec3 rgb = texture2D(uTexture, vTexCoord).rgb;
+    float y = clamp(dot(rgb, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
+    gl_FragColor = vec4(y, y, y, 1.0);
+}
+)";
+
+namespace {
+
+constexpr int kAgcDownsampleSize = 64;
+constexpr int kAgcReadbackBytes = kAgcDownsampleSize * kAgcDownsampleSize * 4;
+constexpr float kAgcLowPercentile = 0.02f;
+constexpr float kAgcHighPercentile = 0.98f;
+constexpr float kAgcSmoothingAlpha = 0.15f;
+constexpr float kAgcMinSpan = 0.05f;
+
+} // namespace
 
 GLuint compileShader(GLenum type, const char *source, std::string &errorMessage) {
     GLuint shader = glCreateShader(type);
@@ -360,7 +386,8 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
 }
 
 bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode,
-                                       float gamma, float blackPoint, float whitePoint) {
+                                       float gamma, float blackPoint, float whitePoint,
+                                       bool agcEnabled, bool runAgc) {
     if (env == nullptr || !prepared_.load()) {
         return false;
     }
@@ -400,6 +427,21 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
         return false;
     }
     env->GetFloatArrayRegion(transformMatrixArrayGlobalRef_, 0, 16, transform);
+
+    // OES AGC: analyze luminance (before window/gamma/palette) every runAgc frame.
+    bool useAgcWindow = false;
+    if (thermalMode != 0 && agcEnabled) {
+        if (runAgc) {
+            if (runAgcAnalysis(env, transform)) {
+                updateAgcFromReadback();
+            } else {
+                agcReadbackErrorCount_.fetch_add(1);
+            }
+        }
+        useAgcWindow = agcValid_.load();
+    }
+    const float effBlack = useAgcWindow ? agcBlackPoint_.load() : blackPoint;
+    const float effWhite = useAgcWindow ? agcWhitePoint_.load() : whitePoint;
 
     // Aspect-fit letterbox viewport (no forced stretch), honoring 90-degree
     // rotation from the SurfaceTexture transform matrix.
@@ -474,10 +516,10 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
             glUniform1f(ironbowGammaLocation_, gamma);
         }
         if (ironbowBlackPointLocation_ >= 0) {
-            glUniform1f(ironbowBlackPointLocation_, blackPoint);
+            glUniform1f(ironbowBlackPointLocation_, effBlack);
         }
         if (ironbowWhitePointLocation_ >= 0) {
-            glUniform1f(ironbowWhitePointLocation_, whitePoint);
+            glUniform1f(ironbowWhitePointLocation_, effWhite);
         }
         if (ironbowPaletteLocation_ >= 0) {
             glActiveTexture(GL_TEXTURE3);
@@ -489,10 +531,10 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
             glUniform1f(whiteHotGammaLocation_, gamma);
         }
         if (whiteHotBlackPointLocation_ >= 0) {
-            glUniform1f(whiteHotBlackPointLocation_, blackPoint);
+            glUniform1f(whiteHotBlackPointLocation_, effBlack);
         }
         if (whiteHotWhitePointLocation_ >= 0) {
-            glUniform1f(whiteHotWhitePointLocation_, whitePoint);
+            glUniform1f(whiteHotWhitePointLocation_, effWhite);
         }
     }
 
@@ -650,6 +692,11 @@ bool NativeOesRenderer::ensureGlLocked(JNIEnv *env, std::string &errorMessage) {
         releaseGlLocked();
         return false;
     }
+    // AGC is best-effort: failure only disables OES AGC, not playback.
+    std::string agcError;
+    if (!ensureAgcGlLocked(agcError)) {
+        LOGE("OES AGC init failed, AGC disabled: %s", agcError.c_str());
+    }
     return true;
 }
 
@@ -723,6 +770,23 @@ void NativeOesRenderer::releaseGlLocked() {
         ironbowBlackPointLocation_ = -1;
         ironbowWhitePointLocation_ = -1;
         ironbowPaletteLocation_ = -1;
+        if (agcProgram_ != 0) {
+            glDeleteProgram(agcProgram_);
+            agcProgram_ = 0;
+        }
+        agcStMatrixLocation_ = -1;
+        agcPositionLocation_ = -1;
+        agcTexCoordLocation_ = -1;
+        if (agcFbo_ != 0) {
+            glDeleteFramebuffers(1, &agcFbo_);
+            agcFbo_ = 0;
+        }
+        if (agcTexture_ != 0) {
+            glDeleteTextures(1, &agcTexture_);
+            agcTexture_ = 0;
+        }
+        agcReadbackBuffer_.clear();
+        agcValid_.store(false);
         releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
@@ -896,4 +960,197 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
     return true;
+}
+
+bool NativeOesRenderer::ensureAgcGlLocked(std::string &errorMessage) {
+    // 64x64 RGBA texture for the luminance downsample.
+    glGenTextures(1, &agcTexture_);
+    glBindTexture(GL_TEXTURE_2D, agcTexture_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kAgcDownsampleSize, kAgcDownsampleSize, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glGenFramebuffers(1, &agcFbo_);
+    glBindFramebuffer(GL_FRAMEBUFFER, agcFbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, agcTexture_, 0);
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        std::ostringstream out;
+        out << "AGC framebuffer incomplete status=0x" << std::hex << status;
+        errorMessage = out.str();
+        agcFbo_ = 0;
+        if (agcTexture_ != 0) {
+            glDeleteTextures(1, &agcTexture_);
+            agcTexture_ = 0;
+        }
+        return false;
+    }
+
+    GLuint vertexShader = compileShader(GL_VERTEX_SHADER, kOesVertexShader, errorMessage);
+    if (vertexShader == 0) {
+        glDeleteFramebuffers(1, &agcFbo_);
+        agcFbo_ = 0;
+        glDeleteTextures(1, &agcTexture_);
+        agcTexture_ = 0;
+        return false;
+    }
+    GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, kAgcDownsampleFragmentShader, errorMessage);
+    if (fragmentShader == 0) {
+        glDeleteShader(vertexShader);
+        glDeleteFramebuffers(1, &agcFbo_);
+        agcFbo_ = 0;
+        glDeleteTextures(1, &agcTexture_);
+        agcTexture_ = 0;
+        return false;
+    }
+    agcProgram_ = linkProgram(vertexShader, fragmentShader, errorMessage);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+    if (agcProgram_ == 0) {
+        glDeleteFramebuffers(1, &agcFbo_);
+        agcFbo_ = 0;
+        glDeleteTextures(1, &agcTexture_);
+        agcTexture_ = 0;
+        return false;
+    }
+    glUseProgram(agcProgram_);
+    agcStMatrixLocation_ = glGetUniformLocation(agcProgram_, "uSTMatrix");
+    agcPositionLocation_ = glGetAttribLocation(agcProgram_, "aPosition");
+    agcTexCoordLocation_ = glGetAttribLocation(agcProgram_, "aTexCoord");
+    if (agcStMatrixLocation_ < 0 || agcPositionLocation_ < 0 || agcTexCoordLocation_ < 0) {
+        errorMessage = "AGC downsample shader attribute/uniform not found";
+        return false;
+    }
+    glUniform1i(glGetUniformLocation(agcProgram_, "uTexture"), 0);
+    glUseProgram(program_);
+
+    agcReadbackBuffer_.resize(static_cast<size_t>(kAgcReadbackBytes));
+    agcValid_.store(false);
+    agcBlackPoint_.store(0.0f);
+    agcWhitePoint_.store(1.0f);
+    return true;
+}
+
+bool NativeOesRenderer::runAgcAnalysis(JNIEnv *env, const GLfloat *transform) {
+    if (agcFbo_ == 0 || agcProgram_ == 0 || agcReadbackBuffer_.empty()) {
+        return false;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, agcFbo_);
+    glViewport(0, 0, kAgcDownsampleSize, kAgcDownsampleSize);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(agcProgram_);
+    glUniformMatrix4fv(agcStMatrixLocation_, 1, GL_FALSE, transform);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexture_);
+
+    static const GLfloat vertices[] = {
+            -1.0f, -1.0f,
+             1.0f, -1.0f,
+            -1.0f,  1.0f,
+             1.0f,  1.0f
+    };
+    static const GLfloat texCoords[] = {
+            0.0f, 0.0f, 0.0f, 1.0f,
+            1.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 1.0f, 0.0f, 1.0f,
+            1.0f, 1.0f, 0.0f, 1.0f
+    };
+    glEnableVertexAttribArray(static_cast<GLuint>(agcPositionLocation_));
+    glVertexAttribPointer(static_cast<GLuint>(agcPositionLocation_), 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glEnableVertexAttribArray(static_cast<GLuint>(agcTexCoordLocation_));
+    glVertexAttribPointer(static_cast<GLuint>(agcTexCoordLocation_), 4, GL_FLOAT, GL_FALSE, 0, texCoords);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(static_cast<GLuint>(agcPositionLocation_));
+    glDisableVertexAttribArray(static_cast<GLuint>(agcTexCoordLocation_));
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, kAgcDownsampleSize, kAgcDownsampleSize,
+                 GL_RGBA, GL_UNSIGNED_BYTE, agcReadbackBuffer_.data());
+    const GLenum error = glGetError();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (error != GL_NO_ERROR) {
+        LOGE("OES AGC glReadPixels failed glError=0x%x", error);
+        return false;
+    }
+    return true;
+}
+
+void NativeOesRenderer::updateAgcFromReadback() {
+    uint32_t histogram[256] = {};
+    const size_t sampleCount = static_cast<size_t>(kAgcDownsampleSize) * kAgcDownsampleSize;
+    for (size_t i = 0; i < sampleCount; ++i) {
+        const uint8_t y = agcReadbackBuffer_[i * 4 + 0];  // R channel = luminance
+        ++histogram[y];
+    }
+
+    const uint64_t targetLow = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcLowPercentile);
+    const uint64_t targetHigh = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcHighPercentile);
+    uint64_t cumulative = 0;
+    int lowValue = 0;
+    int highValue = 255;
+    bool lowFound = false;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += histogram[i];
+        if (!lowFound && cumulative >= targetLow) {
+            lowValue = i;
+            lowFound = true;
+        }
+        if (cumulative >= targetHigh) {
+            highValue = i;
+            break;
+        }
+    }
+
+    const float black = static_cast<float>(lowValue) / 255.0f;
+    const float white = static_cast<float>(highValue) / 255.0f;
+    if (!std::isfinite(black) || !std::isfinite(white) || black >= white || (white - black) < kAgcMinSpan) {
+        return;
+    }
+
+    if (!agcValid_.load()) {
+        agcBlackPoint_.store(black);
+        agcWhitePoint_.store(white);
+        agcValid_.store(true);
+    } else {
+        const float oldBlack = agcBlackPoint_.load();
+        const float oldWhite = agcWhitePoint_.load();
+        agcBlackPoint_.store(oldBlack * (1.0f - kAgcSmoothingAlpha) + black * kAgcSmoothingAlpha);
+        agcWhitePoint_.store(oldWhite * (1.0f - kAgcSmoothingAlpha) + white * kAgcSmoothingAlpha);
+    }
+    agcUpdateCount_.fetch_add(1);
+}
+
+void NativeOesRenderer::resetAgc() {
+    agcValid_.store(false);
+    agcBlackPoint_.store(0.0f);
+    agcWhitePoint_.store(1.0f);
+    agcUpdateCount_.store(0);
+    agcReadbackErrorCount_.store(0);
+}
+
+bool NativeOesRenderer::isAgcValid() const {
+    return agcValid_.load();
+}
+
+float NativeOesRenderer::getAgcBlackPoint() const {
+    return agcBlackPoint_.load();
+}
+
+float NativeOesRenderer::getAgcWhitePoint() const {
+    return agcWhitePoint_.load();
+}
+
+int64_t NativeOesRenderer::getAgcUpdateCount() const {
+    return agcUpdateCount_.load();
+}
+
+int64_t NativeOesRenderer::getAgcReadbackErrorCount() const {
+    return agcReadbackErrorCount_.load();
 }

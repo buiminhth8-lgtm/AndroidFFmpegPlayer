@@ -50,6 +50,9 @@ constexpr float kAgcHighPercentile = 0.98f;
 constexpr float kAgcSmoothingAlpha = 0.15f;
 constexpr float kAgcMinSpan = 0.05f;
 
+// OES AGC downsample analysis interval (thermal frames).
+constexpr int kOesAgcUpdateIntervalFrames = 5;
+
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
     for (char c : value) {
@@ -1270,7 +1273,8 @@ std::string NativePlayer::getStats() {
 
     std::string effectiveThermalRenderMode;
     std::string thermalInputType;
-    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES) {
+    const bool oesRenderMode = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES;
+    if (oesRenderMode) {
         switch (lastOesThermalRenderMode_.load()) {
             case 1: effectiveThermalRenderMode = "white_hot"; break;
             case 2: effectiveThermalRenderMode = "ironbow"; break;
@@ -1284,6 +1288,13 @@ std::string NativePlayer::getStats() {
                            ? "yuv_planes"
                            : "none";
     }
+    const bool agcValidEffective = oesRenderMode ? oesRenderer_.isAgcValid() : agcValid_.load();
+    const float agcBlackEffective = agcValidEffective
+                                    ? (oesRenderMode ? oesRenderer_.getAgcBlackPoint() : agcBlackPoint_.load())
+                                    : 0.0f;
+    const float agcWhiteEffective = agcValidEffective
+                                    ? (oesRenderMode ? oesRenderer_.getAgcWhitePoint() : agcWhitePoint_.load())
+                                    : 1.0f;
 
     LOGI("getPlayerStats player=%p", this);
     std::ostringstream out;
@@ -1449,10 +1460,12 @@ std::string NativePlayer::getStats() {
         << "\"thermalPalette\":\"" << thermalPaletteName(thermalConfig.palette) << "\","
         << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
         << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
-        << "\"thermalAgcValid\":" << (agcValid_.load() ? "true" : "false") << ","
-        << "\"thermalAgcBlackPoint\":" << (agcValid_.load() ? agcBlackPoint_.load() : 0.0) << ","
-        << "\"thermalAgcWhitePoint\":" << (agcValid_.load() ? agcWhitePoint_.load() : 1.0) << ","
+        << "\"thermalAgcValid\":" << (agcValidEffective ? "true" : "false") << ","
+        << "\"thermalAgcBlackPoint\":" << agcBlackEffective << ","
+        << "\"thermalAgcWhitePoint\":" << agcWhiteEffective << ","
         << "\"thermalAgcUpdateCount\":" << agcUpdateCount_.load() << ","
+        << "\"oesAgcUpdateCount\":" << oesRenderer_.getAgcUpdateCount() << ","
+        << "\"oesAgcReadbackErrorCount\":" << oesRenderer_.getAgcReadbackErrorCount() << ","
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
         << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
         << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
@@ -1857,6 +1870,8 @@ std::string NativePlayer::setThermalAgcEnabled(bool enabled) {
     // Reset AGC state so a re-enable re-initializes quickly from the new scene.
     agcValid_.store(false);
     agcFrameCounter_.store(0);
+    oesRenderer_.resetAgc();
+    oesAgcFrameCounter_.store(0);
     LOGI("setThermalAgcEnabled agc=%d", enabled ? 1 : 0);
     std::ostringstream out;
     out << "{\"success\":true,\"thermalAgcEnabled\":" << (enabled ? "true" : "false") << "}";
@@ -2988,8 +3003,19 @@ void NativePlayer::renderOesPendingFrameIfReady() {
     }
     lastOesThermalRenderMode_.store(oesThermalMode);
 
+    const bool agcEnabled = thermal.enabled && thermal.agcEnabled && oesThermalMode != 0;
+    bool runAgc = false;
+    if (agcEnabled) {
+        const int frame = oesAgcFrameCounter_.fetch_add(1) + 1;
+        if (frame >= kOesAgcUpdateIntervalFrames) {
+            oesAgcFrameCounter_.store(0);
+            runAgc = true;
+        }
+    }
+
     if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, oesThermalMode,
-                                    thermal.gamma, thermal.blackPoint, thermal.whitePoint)) {
+                                    thermal.gamma, thermal.blackPoint, thermal.whitePoint,
+                                    agcEnabled, runAgc)) {
         oesFrameRenderedCount_.fetch_add(1);
         if (oesThermalMode != 0) {
             oesThermalRenderedCount_.fetch_add(1);
@@ -3394,7 +3420,9 @@ void NativePlayer::resetStats() {
     oesRenderFailCount_.store(0);
     oesThermalRenderedCount_.store(0);
     lastOesThermalRenderMode_.store(0);
+    oesAgcFrameCounter_.store(0);
     oesRenderer_.resetDiagnostics();
+    oesRenderer_.resetAgc();
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);

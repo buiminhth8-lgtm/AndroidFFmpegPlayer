@@ -548,20 +548,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return !hardwareDecodeSwitch.isChecked() || "mediacodec_oes".equals(intentRenderMode);
     }
 
-    private boolean isOesMode() {
-        if (!TextUtils.isEmpty(currentRenderMode)) {
-            return "mediacodec_oes".equals(currentRenderMode);
-        }
-        return "mediacodec_oes".equals(intentRenderMode);
-    }
-
     private void updateThermalControlsEnabledState() {
         boolean supported = isThermalSupported();
-        boolean oesMode = isOesMode();
         boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
-        // Gamma + palette apply to both software_yuv_gl and mediacodec_oes;
-        // AGC and manual Window are software-only (not yet in the OES pipeline).
-        boolean agcSupported = supported && !oesMode;
+        // AGC applies to both software_yuv_gl and mediacodec_oes (OES AGC since Slice 6).
+        boolean agcSupported = supported;
         boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
         // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
         controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
@@ -753,10 +744,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (mediaCodecSurfaceMode) {
                 windowLine = "";
             } else if (oesMode) {
-                // OES window lives in luminance 0..1 domain; AGC is N/A in OES mode.
+                // OES window lives in luminance 0..1 domain; AGC effective window shown when valid.
                 windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
                         + " - " + String.format(Locale.US, "%.2f", windowWhite)
-                        + " | AGC: N/A";
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF");
             } else {
                 windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
                         + " - " + String.format(Locale.US, "%.2f", windowWhite)

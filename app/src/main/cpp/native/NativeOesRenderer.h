@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct ANativeWindow;
 
@@ -40,8 +41,11 @@ public:
     bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
     // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
     // whitePoint apply to white_hot and ironbow only (window in luminance 0..1 domain).
+    // agcEnabled selects the OES AGC effective window when valid; runAgc triggers a
+    // 64x64 luminance downsample + readback + histogram analysis on this frame.
     bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode,
-                        float gamma, float blackPoint, float whitePoint);
+                        float gamma, float blackPoint, float whitePoint,
+                        bool agcEnabled, bool runAgc);
     void release();
     bool hasSurface() const;
     bool isPrepared() const;
@@ -50,10 +54,19 @@ public:
     int64_t getContextRecreateCount() const;
     int64_t getUpdateTexImageErrorCount() const;
     void resetDiagnostics();
+    void resetAgc();
+    bool isAgcValid() const;
+    float getAgcBlackPoint() const;
+    float getAgcWhitePoint() const;
+    int64_t getAgcUpdateCount() const;
+    int64_t getAgcReadbackErrorCount() const;
 
 private:
     bool ensureGlLocked(JNIEnv *env, std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
+    bool ensureAgcGlLocked(std::string &errorMessage);
+    bool runAgcAnalysis(JNIEnv *env, const GLfloat *transform);
+    void updateAgcFromReadback();
     bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
     void releaseEglSurfaceLocked();
     void releaseGlLocked();
@@ -88,6 +101,20 @@ private:
     GLuint oesTexture_ = 0;
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;
+
+    // AGC (luminance downsample -> readback -> histogram) resources + state.
+    GLuint agcFbo_ = 0;
+    GLuint agcTexture_ = 0;
+    GLuint agcProgram_ = 0;
+    GLint agcStMatrixLocation_ = -1;
+    GLint agcPositionLocation_ = -1;
+    GLint agcTexCoordLocation_ = -1;
+    std::vector<uint8_t> agcReadbackBuffer_;
+    std::atomic<bool> agcValid_{false};
+    std::atomic<float> agcBlackPoint_{0.0f};
+    std::atomic<float> agcWhitePoint_{1.0f};
+    std::atomic<int64_t> agcUpdateCount_{0};
+    std::atomic<int64_t> agcReadbackErrorCount_{0};
 
     jobject surfaceTextureGlobalRef_ = nullptr;
     jobject decoderSurfaceGlobalRef_ = nullptr;

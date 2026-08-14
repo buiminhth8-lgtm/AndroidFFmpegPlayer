@@ -1345,6 +1345,7 @@ std::string NativePlayer::getStats() {
     std::string effectiveThermalRenderMode;
     std::string thermalInputType;
     const bool oesRenderMode = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES;
+    const bool nv12GlRenderMode = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL;
     if (oesRenderMode) {
         switch (lastOesThermalRenderMode_.load()) {
             case 1: effectiveThermalRenderMode = "white_hot"; break;
@@ -1352,6 +1353,9 @@ std::string NativePlayer::getStats() {
             default: effectiveThermalRenderMode = "normal"; break;
         }
         thermalInputType = "oes_luminance";
+    } else if (nv12GlRenderMode) {
+        effectiveThermalRenderMode = lastNv12ThermalRenderMode_.load() == 1 ? "white_hot" : "normal";
+        thermalInputType = "nv12_y";
     } else {
         effectiveThermalRenderMode = thermalRenderModeName(lastThermalRenderMode_.load());
         thermalInputType = (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL
@@ -1401,6 +1405,7 @@ std::string NativePlayer::getStats() {
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
         << "\"nv12GlRenderedFrameCount\":" << nv12GlRenderedFrameCount_.load() << ","
         << "\"nv12GlFallbackFrameCount\":" << nv12GlFallbackFrameCount_.load() << ","
+        << "\"nv12ThermalRenderedFrameCount\":" << nv12ThermalRenderedCount_.load() << ","
         << "\"lastNv12GlRenderCostUs\":" << nv12GlLastRenderCostUs_.load() << ","
         << "\"avgNv12GlRenderCostUs\":" << averageUs(nv12GlTotalRenderCostUs_.load(), nv12GlRenderCostSampleCount_.load()) << ","
         << "\"maxNv12GlRenderCostUs\":" << nv12GlMaxRenderCostUs_.load() << ","
@@ -3226,11 +3231,32 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
         || frame->linesize[0] <= 0 || frame->linesize[1] <= 0) {
         return false;
     }
+
+    const ThermalConfig thermal = getThermalConfig();
+    bool whiteHot = false;
+    int nv12ThermalMode = 0;  // original
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            whiteHot = true;
+            nv12ThermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            // NV12 Ironbow not implemented: safe fallback to White Hot.
+            whiteHot = true;
+            nv12ThermalMode = 1;
+            bool expected = false;
+            if (nv12IronbowFallbackLogged_.compare_exchange_strong(expected, true)) {
+                LOGI("NV12 Ironbow is not implemented in Revised Slice 3; using white hot fallback");
+            }
+        }
+    }
+    lastNv12ThermalRenderMode_.store(nv12ThermalMode);
+
     const RenderResult result = nv12GlRenderer_.renderNv12(frame->data[0], frame->linesize[0],
                                                            frame->data[1], frame->linesize[1],
                                                            frameWidth, frameHeight,
                                                            static_cast<int>(frame->color_range),
-                                                           static_cast<int>(frame->colorspace));
+                                                           static_cast<int>(frame->colorspace),
+                                                           whiteHot);
     if (result.stats.copyCostUs > 0) {
         recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
                    nv12GlMaxUploadCostUs_, result.stats.copyCostUs);
@@ -3239,6 +3265,9 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
         lastRendererType_.store(3);  // nv12_gl
         nv12GlRenderedFrameCount_.fetch_add(1);
         renderedFrameCount_.fetch_add(1);
+        if (whiteHot) {
+            nv12ThermalRenderedCount_.fetch_add(1);
+        }
         if (result.stats.totalCostUs > 0) {
             recordCost(nv12GlLastRenderCostUs_, nv12GlTotalRenderCostUs_, nv12GlRenderCostSampleCount_,
                        nv12GlMaxRenderCostUs_, result.stats.totalCostUs);
@@ -3561,6 +3590,9 @@ void NativePlayer::resetStats() {
     yuvGlFallbackFrameCount_.store(0);
     nv12GlRenderedFrameCount_.store(0);
     nv12GlFallbackFrameCount_.store(0);
+    nv12ThermalRenderedCount_.store(0);
+    lastNv12ThermalRenderMode_.store(0);
+    nv12IronbowFallbackLogged_.store(false);
     nv12GlLastRenderCostUs_.store(0);
     nv12GlTotalRenderCostUs_.store(0);
     nv12GlRenderCostSampleCount_.store(0);

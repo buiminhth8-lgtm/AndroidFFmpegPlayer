@@ -37,9 +37,11 @@ public:
 
     // colorRange: AVCOL_RANGE_UNSPECIFIED(0) / AVCOL_RANGE_MPEG(1) / AVCOL_RANGE_JPEG(2).
     // colorspace: AVColorSpace (BT.601 / BT.709 selection; unknown -> BT.601).
+    // whiteHot: select the NV12 Y -> range normalize -> grayscale White Hot program.
     RenderResult renderNv12(const uint8_t *yData, int yStride,
                             const uint8_t *uvData, int uvStride,
-                            int width, int height, int colorRange, int colorspace);
+                            int width, int height, int colorRange, int colorspace,
+                            bool whiteHot);
 
 private:
     bool ensureGlLocked(std::string &errorMessage);
@@ -61,6 +63,11 @@ private:
     GLint coeffsLocation_ = -1;
     GLint positionLocation_ = -1;
     GLint texCoordLocation_ = -1;
+    GLuint whiteHotProgram_ = 0;
+    GLint whiteHotYMinLocation_ = -1;
+    GLint whiteHotYScaleLocation_ = -1;
+    GLint whiteHotPositionLocation_ = -1;
+    GLint whiteHotTexCoordLocation_ = -1;
     GLuint textures_[2] = {0, 0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;

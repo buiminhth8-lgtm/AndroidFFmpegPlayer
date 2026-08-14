@@ -83,6 +83,20 @@ void main() {
 }
 )";
 
+// NV12 White Hot: sample Y only, range normalize, grayscale output.
+const char *kNv12WhiteHotFragmentShader = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D uTextureY;
+uniform float uYMin;
+uniform float uYScale;
+void main() {
+    float rawY = texture2D(uTextureY, vTexCoord).r;
+    float intensity = clamp((rawY - uYMin) * uYScale, 0.0, 1.0);
+    gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
+}
+)";
+
 GLuint compileShader(GLenum type, const char *source, std::string &errorMessage) {
     GLuint shader = glCreateShader(type);
     if (shader == 0) {
@@ -172,7 +186,8 @@ std::string NativeNv12GlRenderer::setSurface(JNIEnv *env, jobject surface, int w
 
 RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
                                               const uint8_t *uvData, int uvStride,
-                                              int width, int height, int colorRange, int colorspace) {
+                                              int width, int height, int colorRange, int colorspace,
+                                              bool whiteHot) {
     if (yData == nullptr || uvData == nullptr || yStride <= 0 || uvStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
         return {false, -1, "invalid NV12 frame", {}};
@@ -246,27 +261,38 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
         return {false, -1, out.str(), stats};
     }
 
-    glUseProgram(program_);
+    // Select program: original (Y+UV->RGB) or white hot (Y only). White hot
+    // unavailability falls back to the original NV12 program.
+    const bool useWhiteHot = whiteHot && whiteHotProgram_ != 0;
+    GLuint program = useWhiteHot ? whiteHotProgram_ : program_;
+    const GLint yMinLoc = useWhiteHot ? whiteHotYMinLocation_ : yMinLocation_;
+    const GLint yScaleLoc = useWhiteHot ? whiteHotYScaleLocation_ : yScaleLocation_;
+    const GLint posLoc = useWhiteHot ? whiteHotPositionLocation_ : positionLocation_;
+    const GLint texLoc = useWhiteHot ? whiteHotTexCoordLocation_ : texCoordLocation_;
+
     float yMin = 0.0f;
     float yScale = 1.0f;
     if (colorRange == AVCOL_RANGE_MPEG) {
         yMin = 16.0f / 255.0f;
         yScale = 255.0f / 219.0f;
     }
-    glUniform1f(yMinLocation_, yMin);
-    glUniform1f(yScaleLocation_, yScale);
-    // BT.601 / BT.709 matrix coefficients (cR_V, cG_U, cG_V, cB_U). Unknown -> BT.601.
-    float cR_V = 1.402f;
-    float cG_U = 0.344136f;
-    float cG_V = 0.714136f;
-    float cB_U = 1.772f;
-    if (colorspace == AVCOL_SPC_BT709) {
-        cR_V = 1.5748f;
-        cG_U = 0.1873f;
-        cG_V = 0.4681f;
-        cB_U = 1.8556f;
+    glUseProgram(program);
+    glUniform1f(yMinLoc, yMin);
+    glUniform1f(yScaleLoc, yScale);
+    if (!useWhiteHot) {
+        // BT.601 / BT.709 matrix coefficients (cR_V, cG_U, cG_V, cB_U). Unknown -> BT.601.
+        float cR_V = 1.402f;
+        float cG_U = 0.344136f;
+        float cG_V = 0.714136f;
+        float cB_U = 1.772f;
+        if (colorspace == AVCOL_SPC_BT709) {
+            cR_V = 1.5748f;
+            cG_U = 0.1873f;
+            cG_V = 0.4681f;
+            cB_U = 1.8556f;
+        }
+        glUniform4f(coeffsLocation_, cR_V, cG_U, cG_V, cB_U);
     }
-    glUniform4f(coeffsLocation_, cR_V, cG_U, cG_V, cB_U);
 
     GLint viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
     GLint viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : height;
@@ -310,13 +336,13 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
             1.0f, 0.0f
     };
 
-    glEnableVertexAttribArray(static_cast<GLuint>(positionLocation_));
-    glVertexAttribPointer(static_cast<GLuint>(positionLocation_), 2, GL_FLOAT, GL_FALSE, 0, vertices);
-    glEnableVertexAttribArray(static_cast<GLuint>(texCoordLocation_));
-    glVertexAttribPointer(static_cast<GLuint>(texCoordLocation_), 2, GL_FLOAT, GL_FALSE, 0, texCoords);
+    glEnableVertexAttribArray(static_cast<GLuint>(posLoc));
+    glVertexAttribPointer(static_cast<GLuint>(posLoc), 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glEnableVertexAttribArray(static_cast<GLuint>(texLoc));
+    glVertexAttribPointer(static_cast<GLuint>(texLoc), 2, GL_FLOAT, GL_FALSE, 0, texCoords);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray(static_cast<GLuint>(positionLocation_));
-    glDisableVertexAttribArray(static_cast<GLuint>(texCoordLocation_));
+    glDisableVertexAttribArray(static_cast<GLuint>(posLoc));
+    glDisableVertexAttribArray(static_cast<GLuint>(texLoc));
 
     GLenum drawError = glGetError();
     if (drawError != GL_NO_ERROR) {
@@ -480,6 +506,14 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         coeffsLocation_ = -1;
         positionLocation_ = -1;
         texCoordLocation_ = -1;
+        if (whiteHotProgram_ != 0) {
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
+        }
+        whiteHotYMinLocation_ = -1;
+        whiteHotYScaleLocation_ = -1;
+        whiteHotPositionLocation_ = -1;
+        whiteHotTexCoordLocation_ = -1;
         releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
@@ -547,10 +581,27 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
     program_ = linkProgram(vertexShader, fragmentShader, errorMessage);
-    glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     if (program_ == 0) {
+        glDeleteShader(vertexShader);
         return false;
+    }
+
+    std::string whiteHotError;
+    GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kNv12WhiteHotFragmentShader, whiteHotError);
+    whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
+    // vertexShader is no longer needed after both programs are linked.
+    glDeleteShader(vertexShader);
+    if (whiteHotFragmentShader != 0) {
+        glDeleteShader(whiteHotFragmentShader);
+    }
+    if (whiteHotProgram_ == 0) {
+        LOGE("NV12 white hot shader setup failed, fallback to original NV12: %s", whiteHotError.c_str());
+        whiteHotProgram_ = 0;
+        whiteHotYMinLocation_ = -1;
+        whiteHotYScaleLocation_ = -1;
+        whiteHotPositionLocation_ = -1;
+        whiteHotTexCoordLocation_ = -1;
     }
 
     glUseProgram(program_);
@@ -565,6 +616,27 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
     }
     glUniform1i(glGetUniformLocation(program_, "uTextureY"), 0);
     glUniform1i(glGetUniformLocation(program_, "uTextureUV"), 1);
+
+    if (whiteHotProgram_ != 0) {
+        glUseProgram(whiteHotProgram_);
+        whiteHotYMinLocation_ = glGetUniformLocation(whiteHotProgram_, "uYMin");
+        whiteHotYScaleLocation_ = glGetUniformLocation(whiteHotProgram_, "uYScale");
+        whiteHotPositionLocation_ = glGetAttribLocation(whiteHotProgram_, "aPosition");
+        whiteHotTexCoordLocation_ = glGetAttribLocation(whiteHotProgram_, "aTexCoord");
+        if (whiteHotYMinLocation_ < 0 || whiteHotYScaleLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
+            LOGE("NV12 white hot shader attribute/uniform not found, fallback to original NV12");
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
+            whiteHotYMinLocation_ = -1;
+            whiteHotYScaleLocation_ = -1;
+            whiteHotPositionLocation_ = -1;
+            whiteHotTexCoordLocation_ = -1;
+        } else {
+            glUniform1i(glGetUniformLocation(whiteHotProgram_, "uTextureY"), 0);
+        }
+        glUseProgram(program_);
+    }
+
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
         std::ostringstream out;

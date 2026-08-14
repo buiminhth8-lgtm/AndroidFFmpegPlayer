@@ -540,20 +540,22 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private boolean isThermalSupported() {
         if (!TextUtils.isEmpty(currentRenderMode)) {
-            // software_yuv_gl and mediacodec_oes support Phase 1 / OES white hot.
-            return "software_yuv_gl".equals(currentRenderMode)
-                    || "mediacodec_oes".equals(currentRenderMode);
+            // software_yuv_gl, mediacodec_oes, mediacodec_nv12_gl support thermal
+            // (Phase 1 / OES / NV12 white hot); mediacodec_surface does not.
+            return !"mediacodec_surface".equals(currentRenderMode);
         }
         // Player not established yet: use the pending decode-mode choice.
-        return (!hardwareDecodeSwitch.isChecked() && !"mediacodec_nv12_gl".equals(intentRenderMode))
-                || "mediacodec_oes".equals(intentRenderMode);
+        return !"mediacodec_surface".equals(intentRenderMode);
     }
 
     private void updateThermalControlsEnabledState() {
         boolean supported = isThermalSupported();
         boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
-        // AGC applies to both software_yuv_gl and mediacodec_oes (OES AGC since Slice 6).
-        boolean agcSupported = supported;
+        // NV12 GL supports palette (Original / White Hot) only; AGC/Gamma/Window
+        // are not implemented for the NV12 GL path in this slice.
+        boolean nv12GlMode = "mediacodec_nv12_gl".equals(currentRenderMode);
+        boolean gammaSupported = supported && !nv12GlMode;
+        boolean agcSupported = supported && !nv12GlMode;
         boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
         // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
         controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
@@ -561,11 +563,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
             controlsBinding.thermalPaletteRadioGroup.getChildAt(i).setEnabled(thermalOn);
         }
         controlsBinding.thermalAgcSwitch.setEnabled(thermalOn && agcSupported);
-        controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn);
-        controlsBinding.thermalGammaValueText.setAlpha(thermalOn ? 1.0f : 0.4f);
-        // Manual window is now supported for both software_yuv_gl and mediacodec_oes;
-        // AGC (software-only) disables it, and OES AGC is not implemented.
-        boolean windowEnabled = thermalOn && !agcOn;
+        controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn && gammaSupported);
+        controlsBinding.thermalGammaValueText.setAlpha(thermalOn && gammaSupported ? 1.0f : 0.4f);
+        // Manual window supported for software_yuv_gl / mediacodec_oes; not for NV12 GL.
+        boolean windowEnabled = thermalOn && !agcOn && !nv12GlMode;
         controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalBlackPointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
@@ -738,12 +739,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
             currentRenderMode = mode;
             updateThermalControlsEnabledState();
 
-            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode)
-                    || "mediacodec_nv12_gl".equals(mode);
+            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode);
             boolean oesMode = "mediacodec_oes".equals(mode);
+            boolean nv12GlMode = "mediacodec_nv12_gl".equals(mode);
             String thermalInputType = stats.optString("thermalInputType", "none");
             String windowLine;
-            if (mediaCodecSurfaceMode) {
+            if (mediaCodecSurfaceMode || nv12GlMode) {
                 windowLine = "";
             } else if (oesMode) {
                 // OES window lives in luminance 0..1 domain; AGC effective window shown when valid.
@@ -762,6 +763,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
                         + " | " + thermalPalette
                         + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US)
+                        + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
+            } else if (nv12GlMode) {
+                // NV12 GL: palette (Original / White Hot) only; no gamma/window/AGC yet.
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US)
                         + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else {

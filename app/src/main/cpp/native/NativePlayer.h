@@ -231,6 +231,9 @@ private:
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
     std::atomic<int64_t> nv12GlRenderedFrameCount_{0};
     std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12ThermalRenderedCount_{0};
+    std::atomic<int> lastNv12ThermalRenderMode_{0};
+    std::atomic<bool> nv12IronbowFallbackLogged_{false};
     std::atomic<int64_t> nv12GlLastRenderCostUs_{0};
     std::atomic<int64_t> nv12GlTotalRenderCostUs_{0};
     std::atomic<int64_t> nv12GlRenderCostSampleCount_{0};

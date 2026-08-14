@@ -38,9 +38,10 @@ public:
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
-    // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma applies to
-    // white_hot and ironbow only.
-    bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode, float gamma);
+    // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
+    // whitePoint apply to white_hot and ironbow only (window in luminance 0..1 domain).
+    bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode,
+                        float gamma, float blackPoint, float whitePoint);
     void release();
     bool hasSurface() const;
     bool isPrepared() const;
@@ -73,11 +74,15 @@ private:
     GLint whiteHotPositionLocation_ = -1;
     GLint whiteHotTexCoordLocation_ = -1;
     GLint whiteHotGammaLocation_ = -1;
+    GLint whiteHotBlackPointLocation_ = -1;
+    GLint whiteHotWhitePointLocation_ = -1;
     GLuint ironbowProgram_ = 0;
     GLint ironbowStMatrixLocation_ = -1;
     GLint ironbowPositionLocation_ = -1;
     GLint ironbowTexCoordLocation_ = -1;
     GLint ironbowGammaLocation_ = -1;
+    GLint ironbowBlackPointLocation_ = -1;
+    GLint ironbowWhitePointLocation_ = -1;
     GLint ironbowPaletteLocation_ = -1;
     GLuint ironbowTexture_ = 0;
     GLuint oesTexture_ = 0;

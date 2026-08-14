@@ -2988,7 +2988,8 @@ void NativePlayer::renderOesPendingFrameIfReady() {
     }
     lastOesThermalRenderMode_.store(oesThermalMode);
 
-    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, oesThermalMode, thermal.gamma)) {
+    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, oesThermalMode,
+                                    thermal.gamma, thermal.blackPoint, thermal.whitePoint)) {
         oesFrameRenderedCount_.fetch_add(1);
         if (oesThermalMode != 0) {
             oesThermalRenderedCount_.fetch_add(1);

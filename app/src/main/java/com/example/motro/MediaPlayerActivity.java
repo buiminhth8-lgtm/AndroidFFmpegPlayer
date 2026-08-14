@@ -571,7 +571,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.thermalAgcSwitch.setEnabled(thermalOn && agcSupported);
         controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn);
         controlsBinding.thermalGammaValueText.setAlpha(thermalOn ? 1.0f : 0.4f);
-        boolean windowEnabled = thermalOn && !agcOn && !oesMode;
+        // Manual window is now supported for both software_yuv_gl and mediacodec_oes;
+        // AGC (software-only) disables it, and OES AGC is not implemented.
+        boolean windowEnabled = thermalOn && !agcOn;
         controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalBlackPointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
@@ -747,6 +749,19 @@ public class MediaPlayerActivity extends AppCompatActivity {
             boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode);
             boolean oesMode = "mediacodec_oes".equals(mode);
             String thermalInputType = stats.optString("thermalInputType", "none");
+            String windowLine;
+            if (mediaCodecSurfaceMode) {
+                windowLine = "";
+            } else if (oesMode) {
+                // OES window lives in luminance 0..1 domain; AGC is N/A in OES mode.
+                windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
+                        + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                        + " | AGC: N/A";
+            } else {
+                windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
+                        + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                        + " | Range " + frameColorRange;
+            }
             String thermalDisplay;
             if (mediaCodecSurfaceMode) {
                 thermalDisplay = "Thermal: UNAVAILABLE | " + mode;
@@ -796,10 +811,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
                             + "\n" + thermalDisplay
                             + oesLine
-                            + (mediaCodecSurfaceMode || oesMode ? "" : "\nWindow "
-                                    + String.format(Locale.US, "%.2f", windowBlack)
-                                    + " - " + String.format(Locale.US, "%.2f", windowWhite)
-                                    + " | Range " + frameColorRange));
+                            + windowLine);
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
             }

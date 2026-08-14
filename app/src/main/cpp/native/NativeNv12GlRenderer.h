@@ -7,6 +7,7 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -34,14 +35,17 @@ public:
     bool hasSurface() const;
     bool isReady() const;
     bool supportsFrameFormat(int frameFormat) const;
+    // Actual thermal mode applied on the last successful render (0 original, 1 white_hot, 2 ironbow).
+    int getLastAppliedThermalMode() const;
 
     // colorRange: AVCOL_RANGE_UNSPECIFIED(0) / AVCOL_RANGE_MPEG(1) / AVCOL_RANGE_JPEG(2).
     // colorspace: AVColorSpace (BT.601 / BT.709 selection; unknown -> BT.601).
-    // whiteHot: select the NV12 Y -> range normalize -> grayscale White Hot program.
+    // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma applies to
+    // white_hot and ironbow only.
     RenderResult renderNv12(const uint8_t *yData, int yStride,
                             const uint8_t *uvData, int uvStride,
                             int width, int height, int colorRange, int colorspace,
-                            bool whiteHot);
+                            int thermalMode, float gamma);
 
 private:
     bool ensureGlLocked(std::string &errorMessage);
@@ -66,9 +70,19 @@ private:
     GLuint whiteHotProgram_ = 0;
     GLint whiteHotYMinLocation_ = -1;
     GLint whiteHotYScaleLocation_ = -1;
+    GLint whiteHotGammaLocation_ = -1;
     GLint whiteHotPositionLocation_ = -1;
     GLint whiteHotTexCoordLocation_ = -1;
+    GLuint ironbowProgram_ = 0;
+    GLint ironbowYMinLocation_ = -1;
+    GLint ironbowYScaleLocation_ = -1;
+    GLint ironbowGammaLocation_ = -1;
+    GLint ironbowPaletteLocation_ = -1;
+    GLint ironbowPositionLocation_ = -1;
+    GLint ironbowTexCoordLocation_ = -1;
+    GLuint ironbowTexture_ = 0;
     GLuint textures_[2] = {0, 0};
+    std::atomic<int> lastAppliedThermalMode_{0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;
     int frameWidth_ = 0;

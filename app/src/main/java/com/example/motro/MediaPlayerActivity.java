@@ -551,10 +551,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private void updateThermalControlsEnabledState() {
         boolean supported = isThermalSupported();
         boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
-        // NV12 GL supports palette (Original / White Hot) only; AGC/Gamma/Window
-        // are not implemented for the NV12 GL path in this slice.
+        // NV12 GL supports palette + Gamma; AGC / Manual Window are not implemented
+        // for the NV12 GL path in this slice.
         boolean nv12GlMode = "mediacodec_nv12_gl".equals(currentRenderMode);
-        boolean gammaSupported = supported && !nv12GlMode;
+        boolean gammaSupported = supported;
         boolean agcSupported = supported && !nv12GlMode;
         boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
         // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
@@ -766,9 +766,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US)
                         + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else if (nv12GlMode) {
-                // NV12 GL: palette (Original / White Hot) only; no gamma/window/AGC yet.
+                // NV12 GL: palette (Original / White Hot / Ironbow) + Gamma; no window/AGC yet.
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
                         + " | " + thermalPalette
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US)
                         + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else {

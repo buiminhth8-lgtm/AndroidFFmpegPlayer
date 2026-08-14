@@ -1354,7 +1354,11 @@ std::string NativePlayer::getStats() {
         }
         thermalInputType = "oes_luminance";
     } else if (nv12GlRenderMode) {
-        effectiveThermalRenderMode = lastNv12ThermalRenderMode_.load() == 1 ? "white_hot" : "normal";
+        switch (lastNv12ThermalRenderMode_.load()) {
+            case 1: effectiveThermalRenderMode = "white_hot"; break;
+            case 2: effectiveThermalRenderMode = "ironbow"; break;
+            default: effectiveThermalRenderMode = "normal"; break;
+        }
         thermalInputType = "nv12_y";
     } else {
         effectiveThermalRenderMode = thermalRenderModeName(lastThermalRenderMode_.load());
@@ -3233,20 +3237,12 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
     }
 
     const ThermalConfig thermal = getThermalConfig();
-    bool whiteHot = false;
     int nv12ThermalMode = 0;  // original
     if (thermal.enabled) {
         if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
-            whiteHot = true;
             nv12ThermalMode = 1;
         } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
-            // NV12 Ironbow not implemented: safe fallback to White Hot.
-            whiteHot = true;
-            nv12ThermalMode = 1;
-            bool expected = false;
-            if (nv12IronbowFallbackLogged_.compare_exchange_strong(expected, true)) {
-                LOGI("NV12 Ironbow is not implemented in Revised Slice 3; using white hot fallback");
-            }
+            nv12ThermalMode = 2;
         }
     }
     lastNv12ThermalRenderMode_.store(nv12ThermalMode);
@@ -3256,16 +3252,18 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
                                                            frameWidth, frameHeight,
                                                            static_cast<int>(frame->color_range),
                                                            static_cast<int>(frame->colorspace),
-                                                           whiteHot);
+                                                           nv12ThermalMode, thermal.gamma);
     if (result.stats.copyCostUs > 0) {
         recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
                    nv12GlMaxUploadCostUs_, result.stats.copyCostUs);
     }
     if (result.success) {
         lastRendererType_.store(3);  // nv12_gl
+        // Report the mode actually applied by the renderer (e.g. ironbow -> white hot fallback).
+        lastNv12ThermalRenderMode_.store(nv12GlRenderer_.getLastAppliedThermalMode());
         nv12GlRenderedFrameCount_.fetch_add(1);
         renderedFrameCount_.fetch_add(1);
-        if (whiteHot) {
+        if (nv12ThermalMode != 0) {
             nv12ThermalRenderedCount_.fetch_add(1);
         }
         if (result.stats.totalCostUs > 0) {
@@ -3592,7 +3590,6 @@ void NativePlayer::resetStats() {
     nv12GlFallbackFrameCount_.store(0);
     nv12ThermalRenderedCount_.store(0);
     lastNv12ThermalRenderMode_.store(0);
-    nv12IronbowFallbackLogged_.store(false);
     nv12GlLastRenderCostUs_.store(0);
     nv12GlTotalRenderCostUs_.store(0);
     nv12GlRenderCostSampleCount_.store(0);

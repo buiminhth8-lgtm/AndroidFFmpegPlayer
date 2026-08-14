@@ -1,4 +1,5 @@
 #include "NativeNv12GlRenderer.h"
+#include "ThermalPaletteLut.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -83,17 +84,37 @@ void main() {
 }
 )";
 
-// NV12 White Hot: sample Y only, range normalize, grayscale output.
+// NV12 White Hot: sample Y only, range normalize, gamma, grayscale output.
 const char *kNv12WhiteHotFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D uTextureY;
 uniform float uYMin;
 uniform float uYScale;
+uniform float uGamma;
 void main() {
     float rawY = texture2D(uTextureY, vTexCoord).r;
     float intensity = clamp((rawY - uYMin) * uYScale, 0.0, 1.0);
+    intensity = pow(intensity, max(uGamma, 0.001));
     gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
+}
+)";
+
+// NV12 Ironbow: Y -> range -> gamma -> 256x1 LUT (shared Phase 1 color table).
+const char *kNv12IronbowFragmentShader = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D uTextureY;
+uniform sampler2D uPaletteTexture;
+uniform float uYMin;
+uniform float uYScale;
+uniform float uGamma;
+void main() {
+    float rawY = texture2D(uTextureY, vTexCoord).r;
+    float intensity = clamp((rawY - uYMin) * uYScale, 0.0, 1.0);
+    intensity = pow(intensity, max(uGamma, 0.001));
+    vec3 color = texture2D(uPaletteTexture, vec2(intensity, 0.5)).rgb;
+    gl_FragColor = vec4(color, 1.0);
 }
 )";
 
@@ -187,7 +208,7 @@ std::string NativeNv12GlRenderer::setSurface(JNIEnv *env, jobject surface, int w
 RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
                                               const uint8_t *uvData, int uvStride,
                                               int width, int height, int colorRange, int colorspace,
-                                              bool whiteHot) {
+                                              int thermalMode, float gamma) {
     if (yData == nullptr || uvData == nullptr || yStride <= 0 || uvStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
         return {false, -1, "invalid NV12 frame", {}};
@@ -261,14 +282,42 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
         return {false, -1, out.str(), stats};
     }
 
-    // Select program: original (Y+UV->RGB) or white hot (Y only). White hot
-    // unavailability falls back to the original NV12 program.
-    const bool useWhiteHot = whiteHot && whiteHotProgram_ != 0;
-    GLuint program = useWhiteHot ? whiteHotProgram_ : program_;
-    const GLint yMinLoc = useWhiteHot ? whiteHotYMinLocation_ : yMinLocation_;
-    const GLint yScaleLoc = useWhiteHot ? whiteHotYScaleLocation_ : yScaleLocation_;
-    const GLint posLoc = useWhiteHot ? whiteHotPositionLocation_ : positionLocation_;
-    const GLint texLoc = useWhiteHot ? whiteHotTexCoordLocation_ : texCoordLocation_;
+    // Select program: original (Y+UV->RGB), white hot (Y only), or ironbow (Y+LUT).
+    // Unavailable thermal program falls back: ironbow -> white hot -> original.
+    GLuint program = program_;
+    GLint yMinLoc = yMinLocation_;
+    GLint yScaleLoc = yScaleLocation_;
+    GLint gammaLoc = -1;
+    GLint paletteLoc = -1;
+    GLint posLoc = positionLocation_;
+    GLint texLoc = texCoordLocation_;
+    bool useIronbow = false;
+    if (thermalMode == 1 && whiteHotProgram_ != 0) {
+        program = whiteHotProgram_;
+        yMinLoc = whiteHotYMinLocation_;
+        yScaleLoc = whiteHotYScaleLocation_;
+        gammaLoc = whiteHotGammaLocation_;
+        posLoc = whiteHotPositionLocation_;
+        texLoc = whiteHotTexCoordLocation_;
+    } else if (thermalMode == 2) {
+        if (ironbowProgram_ != 0 && ironbowTexture_ != 0) {
+            program = ironbowProgram_;
+            yMinLoc = ironbowYMinLocation_;
+            yScaleLoc = ironbowYScaleLocation_;
+            gammaLoc = ironbowGammaLocation_;
+            paletteLoc = ironbowPaletteLocation_;
+            posLoc = ironbowPositionLocation_;
+            texLoc = ironbowTexCoordLocation_;
+            useIronbow = true;
+        } else if (whiteHotProgram_ != 0) {
+            program = whiteHotProgram_;
+            yMinLoc = whiteHotYMinLocation_;
+            yScaleLoc = whiteHotYScaleLocation_;
+            gammaLoc = whiteHotGammaLocation_;
+            posLoc = whiteHotPositionLocation_;
+            texLoc = whiteHotTexCoordLocation_;
+        }
+    }
 
     float yMin = 0.0f;
     float yScale = 1.0f;
@@ -279,7 +328,15 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     glUseProgram(program);
     glUniform1f(yMinLoc, yMin);
     glUniform1f(yScaleLoc, yScale);
-    if (!useWhiteHot) {
+    if (gammaLoc >= 0) {
+        glUniform1f(gammaLoc, gamma);
+    }
+    if (useIronbow && paletteLoc >= 0) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    if (program == program_) {
         // BT.601 / BT.709 matrix coefficients (cR_V, cG_U, cG_V, cB_U). Unknown -> BT.601.
         float cR_V = 1.402f;
         float cG_U = 0.344136f;
@@ -293,6 +350,7 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
         }
         glUniform4f(coeffsLocation_, cR_V, cG_U, cG_V, cB_U);
     }
+    lastAppliedThermalMode_.store(useIronbow ? 2 : (program == whiteHotProgram_ ? 1 : 0));
 
     GLint viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : width;
     GLint viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : height;
@@ -393,6 +451,10 @@ bool NativeNv12GlRenderer::hasSurface() const {
 bool NativeNv12GlRenderer::isReady() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return window_ != nullptr;
+}
+
+int NativeNv12GlRenderer::getLastAppliedThermalMode() const {
+    return lastAppliedThermalMode_.load();
 }
 
 bool NativeNv12GlRenderer::supportsFrameFormat(int frameFormat) const {
@@ -512,8 +574,23 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         }
         whiteHotYMinLocation_ = -1;
         whiteHotYScaleLocation_ = -1;
+        whiteHotGammaLocation_ = -1;
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
+        if (ironbowTexture_ != 0) {
+            glDeleteTextures(1, &ironbowTexture_);
+            ironbowTexture_ = 0;
+        }
+        if (ironbowProgram_ != 0) {
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+        }
+        ironbowYMinLocation_ = -1;
+        ironbowYScaleLocation_ = -1;
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
+        ironbowPositionLocation_ = -1;
+        ironbowTexCoordLocation_ = -1;
         releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
@@ -590,8 +667,6 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
     std::string whiteHotError;
     GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kNv12WhiteHotFragmentShader, whiteHotError);
     whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
-    // vertexShader is no longer needed after both programs are linked.
-    glDeleteShader(vertexShader);
     if (whiteHotFragmentShader != 0) {
         glDeleteShader(whiteHotFragmentShader);
     }
@@ -600,8 +675,29 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         whiteHotProgram_ = 0;
         whiteHotYMinLocation_ = -1;
         whiteHotYScaleLocation_ = -1;
+        whiteHotGammaLocation_ = -1;
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
+    }
+
+    std::string ironbowError;
+    GLuint ironbowFragmentShader = compileShader(GL_FRAGMENT_SHADER, kNv12IronbowFragmentShader, ironbowError);
+    ironbowProgram_ = ironbowFragmentShader == 0 ? 0 : linkProgram(vertexShader, ironbowFragmentShader, ironbowError);
+    // vertexShader is no longer needed after all programs are linked.
+    glDeleteShader(vertexShader);
+    if (ironbowFragmentShader != 0) {
+        glDeleteShader(ironbowFragmentShader);
+    }
+    if (ironbowProgram_ == 0) {
+        LOGE("NV12 ironbow shader setup failed, fallback to white hot/original: %s", ironbowError.c_str());
+        ironbowProgram_ = 0;
+        ironbowYMinLocation_ = -1;
+        ironbowYScaleLocation_ = -1;
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
+        ironbowPositionLocation_ = -1;
+        ironbowTexCoordLocation_ = -1;
+        ironbowTexture_ = 0;
     }
 
     glUseProgram(program_);
@@ -621,20 +717,59 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         glUseProgram(whiteHotProgram_);
         whiteHotYMinLocation_ = glGetUniformLocation(whiteHotProgram_, "uYMin");
         whiteHotYScaleLocation_ = glGetUniformLocation(whiteHotProgram_, "uYScale");
+        whiteHotGammaLocation_ = glGetUniformLocation(whiteHotProgram_, "uGamma");
         whiteHotPositionLocation_ = glGetAttribLocation(whiteHotProgram_, "aPosition");
         whiteHotTexCoordLocation_ = glGetAttribLocation(whiteHotProgram_, "aTexCoord");
-        if (whiteHotYMinLocation_ < 0 || whiteHotYScaleLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
+        if (whiteHotYMinLocation_ < 0 || whiteHotYScaleLocation_ < 0 || whiteHotGammaLocation_ < 0
+            || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
             LOGE("NV12 white hot shader attribute/uniform not found, fallback to original NV12");
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
             whiteHotYMinLocation_ = -1;
             whiteHotYScaleLocation_ = -1;
+            whiteHotGammaLocation_ = -1;
             whiteHotPositionLocation_ = -1;
             whiteHotTexCoordLocation_ = -1;
         } else {
             glUniform1i(glGetUniformLocation(whiteHotProgram_, "uTextureY"), 0);
         }
         glUseProgram(program_);
+    }
+
+    if (ironbowProgram_ != 0) {
+        glUseProgram(ironbowProgram_);
+        ironbowYMinLocation_ = glGetUniformLocation(ironbowProgram_, "uYMin");
+        ironbowYScaleLocation_ = glGetUniformLocation(ironbowProgram_, "uYScale");
+        ironbowGammaLocation_ = glGetUniformLocation(ironbowProgram_, "uGamma");
+        ironbowPaletteLocation_ = glGetUniformLocation(ironbowProgram_, "uPaletteTexture");
+        ironbowPositionLocation_ = glGetAttribLocation(ironbowProgram_, "aPosition");
+        ironbowTexCoordLocation_ = glGetAttribLocation(ironbowProgram_, "aTexCoord");
+        if (ironbowYMinLocation_ < 0 || ironbowYScaleLocation_ < 0 || ironbowGammaLocation_ < 0
+            || ironbowPaletteLocation_ < 0 || ironbowPositionLocation_ < 0 || ironbowTexCoordLocation_ < 0) {
+            LOGE("NV12 ironbow shader attribute/uniform not found, fallback to white hot/original");
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+            ironbowYMinLocation_ = -1;
+            ironbowYScaleLocation_ = -1;
+            ironbowGammaLocation_ = -1;
+            ironbowPaletteLocation_ = -1;
+            ironbowPositionLocation_ = -1;
+            ironbowTexCoordLocation_ = -1;
+            ironbowTexture_ = 0;
+        } else {
+            glActiveTexture(GL_TEXTURE3);
+            glGenTextures(1, &ironbowTexture_);
+            glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            const std::array<uint8_t, kIronbowLutSize> lut = createIronbowLut();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 256, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, lut.data());
+            glUniform1i(ironbowPaletteLocation_, 3);
+            glActiveTexture(GL_TEXTURE0);
+            glUseProgram(program_);
+        }
     }
 
     GLenum error = glGetError();

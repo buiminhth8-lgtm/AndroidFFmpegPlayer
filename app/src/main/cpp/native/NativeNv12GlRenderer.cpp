@@ -84,23 +84,26 @@ void main() {
 }
 )";
 
-// NV12 White Hot: sample Y only, range normalize, gamma, grayscale output.
+// NV12 White Hot: sample Y only, range normalize, manual window, gamma, grayscale output.
 const char *kNv12WhiteHotFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
 uniform sampler2D uTextureY;
 uniform float uYMin;
 uniform float uYScale;
+uniform float uBlackPoint;
+uniform float uWindowInvRange;
 uniform float uGamma;
 void main() {
     float rawY = texture2D(uTextureY, vTexCoord).r;
     float intensity = clamp((rawY - uYMin) * uYScale, 0.0, 1.0);
+    intensity = clamp((intensity - uBlackPoint) * uWindowInvRange, 0.0, 1.0);
     intensity = pow(intensity, max(uGamma, 0.001));
     gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
 }
 )";
 
-// NV12 Ironbow: Y -> range -> gamma -> 256x1 LUT (shared Phase 1 color table).
+// NV12 Ironbow: Y -> range -> window -> gamma -> 256x1 LUT (shared Phase 1 color table).
 const char *kNv12IronbowFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
@@ -108,10 +111,13 @@ uniform sampler2D uTextureY;
 uniform sampler2D uPaletteTexture;
 uniform float uYMin;
 uniform float uYScale;
+uniform float uBlackPoint;
+uniform float uWindowInvRange;
 uniform float uGamma;
 void main() {
     float rawY = texture2D(uTextureY, vTexCoord).r;
     float intensity = clamp((rawY - uYMin) * uYScale, 0.0, 1.0);
+    intensity = clamp((intensity - uBlackPoint) * uWindowInvRange, 0.0, 1.0);
     intensity = pow(intensity, max(uGamma, 0.001));
     vec3 color = texture2D(uPaletteTexture, vec2(intensity, 0.5)).rgb;
     gl_FragColor = vec4(color, 1.0);
@@ -208,7 +214,7 @@ std::string NativeNv12GlRenderer::setSurface(JNIEnv *env, jobject surface, int w
 RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
                                               const uint8_t *uvData, int uvStride,
                                               int width, int height, int colorRange, int colorspace,
-                                              int thermalMode, float gamma) {
+                                              int thermalMode, float gamma, float blackPoint, float whitePoint) {
     if (yData == nullptr || uvData == nullptr || yStride <= 0 || uvStride <= 0
         || width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
         return {false, -1, "invalid NV12 frame", {}};
@@ -287,6 +293,8 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     GLuint program = program_;
     GLint yMinLoc = yMinLocation_;
     GLint yScaleLoc = yScaleLocation_;
+    GLint blackLoc = -1;
+    GLint windowInvRangeLoc = -1;
     GLint gammaLoc = -1;
     GLint paletteLoc = -1;
     GLint posLoc = positionLocation_;
@@ -296,6 +304,8 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
         program = whiteHotProgram_;
         yMinLoc = whiteHotYMinLocation_;
         yScaleLoc = whiteHotYScaleLocation_;
+        blackLoc = whiteHotBlackPointLocation_;
+        windowInvRangeLoc = whiteHotWindowInvRangeLocation_;
         gammaLoc = whiteHotGammaLocation_;
         posLoc = whiteHotPositionLocation_;
         texLoc = whiteHotTexCoordLocation_;
@@ -304,6 +314,8 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
             program = ironbowProgram_;
             yMinLoc = ironbowYMinLocation_;
             yScaleLoc = ironbowYScaleLocation_;
+            blackLoc = ironbowBlackPointLocation_;
+            windowInvRangeLoc = ironbowWindowInvRangeLocation_;
             gammaLoc = ironbowGammaLocation_;
             paletteLoc = ironbowPaletteLocation_;
             posLoc = ironbowPositionLocation_;
@@ -313,6 +325,8 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
             program = whiteHotProgram_;
             yMinLoc = whiteHotYMinLocation_;
             yScaleLoc = whiteHotYScaleLocation_;
+            blackLoc = whiteHotBlackPointLocation_;
+            windowInvRangeLoc = whiteHotWindowInvRangeLocation_;
             gammaLoc = whiteHotGammaLocation_;
             posLoc = whiteHotPositionLocation_;
             texLoc = whiteHotTexCoordLocation_;
@@ -328,6 +342,15 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     glUseProgram(program);
     glUniform1f(yMinLoc, yMin);
     glUniform1f(yScaleLoc, yScale);
+    // Manual window in the range-normalized intensity 0..1 domain.
+    const float windowRange = std::max(whitePoint - blackPoint, 0.001f);
+    const float windowInvRange = 1.0f / windowRange;
+    if (blackLoc >= 0) {
+        glUniform1f(blackLoc, blackPoint);
+    }
+    if (windowInvRangeLoc >= 0) {
+        glUniform1f(windowInvRangeLoc, windowInvRange);
+    }
     if (gammaLoc >= 0) {
         glUniform1f(gammaLoc, gamma);
     }
@@ -574,6 +597,8 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         }
         whiteHotYMinLocation_ = -1;
         whiteHotYScaleLocation_ = -1;
+        whiteHotBlackPointLocation_ = -1;
+        whiteHotWindowInvRangeLocation_ = -1;
         whiteHotGammaLocation_ = -1;
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
@@ -587,6 +612,8 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         }
         ironbowYMinLocation_ = -1;
         ironbowYScaleLocation_ = -1;
+        ironbowBlackPointLocation_ = -1;
+        ironbowWindowInvRangeLocation_ = -1;
         ironbowGammaLocation_ = -1;
         ironbowPaletteLocation_ = -1;
         ironbowPositionLocation_ = -1;
@@ -693,6 +720,8 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         ironbowProgram_ = 0;
         ironbowYMinLocation_ = -1;
         ironbowYScaleLocation_ = -1;
+        ironbowBlackPointLocation_ = -1;
+        ironbowWindowInvRangeLocation_ = -1;
         ironbowGammaLocation_ = -1;
         ironbowPaletteLocation_ = -1;
         ironbowPositionLocation_ = -1;
@@ -717,16 +746,21 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         glUseProgram(whiteHotProgram_);
         whiteHotYMinLocation_ = glGetUniformLocation(whiteHotProgram_, "uYMin");
         whiteHotYScaleLocation_ = glGetUniformLocation(whiteHotProgram_, "uYScale");
+        whiteHotBlackPointLocation_ = glGetUniformLocation(whiteHotProgram_, "uBlackPoint");
+        whiteHotWindowInvRangeLocation_ = glGetUniformLocation(whiteHotProgram_, "uWindowInvRange");
         whiteHotGammaLocation_ = glGetUniformLocation(whiteHotProgram_, "uGamma");
         whiteHotPositionLocation_ = glGetAttribLocation(whiteHotProgram_, "aPosition");
         whiteHotTexCoordLocation_ = glGetAttribLocation(whiteHotProgram_, "aTexCoord");
-        if (whiteHotYMinLocation_ < 0 || whiteHotYScaleLocation_ < 0 || whiteHotGammaLocation_ < 0
-            || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
+        if (whiteHotYMinLocation_ < 0 || whiteHotYScaleLocation_ < 0
+            || whiteHotBlackPointLocation_ < 0 || whiteHotWindowInvRangeLocation_ < 0
+            || whiteHotGammaLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
             LOGE("NV12 white hot shader attribute/uniform not found, fallback to original NV12");
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
             whiteHotYMinLocation_ = -1;
             whiteHotYScaleLocation_ = -1;
+            whiteHotBlackPointLocation_ = -1;
+            whiteHotWindowInvRangeLocation_ = -1;
             whiteHotGammaLocation_ = -1;
             whiteHotPositionLocation_ = -1;
             whiteHotTexCoordLocation_ = -1;
@@ -740,17 +774,23 @@ bool NativeNv12GlRenderer::compileProgramLocked(std::string &errorMessage) {
         glUseProgram(ironbowProgram_);
         ironbowYMinLocation_ = glGetUniformLocation(ironbowProgram_, "uYMin");
         ironbowYScaleLocation_ = glGetUniformLocation(ironbowProgram_, "uYScale");
+        ironbowBlackPointLocation_ = glGetUniformLocation(ironbowProgram_, "uBlackPoint");
+        ironbowWindowInvRangeLocation_ = glGetUniformLocation(ironbowProgram_, "uWindowInvRange");
         ironbowGammaLocation_ = glGetUniformLocation(ironbowProgram_, "uGamma");
         ironbowPaletteLocation_ = glGetUniformLocation(ironbowProgram_, "uPaletteTexture");
         ironbowPositionLocation_ = glGetAttribLocation(ironbowProgram_, "aPosition");
         ironbowTexCoordLocation_ = glGetAttribLocation(ironbowProgram_, "aTexCoord");
-        if (ironbowYMinLocation_ < 0 || ironbowYScaleLocation_ < 0 || ironbowGammaLocation_ < 0
-            || ironbowPaletteLocation_ < 0 || ironbowPositionLocation_ < 0 || ironbowTexCoordLocation_ < 0) {
+        if (ironbowYMinLocation_ < 0 || ironbowYScaleLocation_ < 0
+            || ironbowBlackPointLocation_ < 0 || ironbowWindowInvRangeLocation_ < 0
+            || ironbowGammaLocation_ < 0 || ironbowPaletteLocation_ < 0
+            || ironbowPositionLocation_ < 0 || ironbowTexCoordLocation_ < 0) {
             LOGE("NV12 ironbow shader attribute/uniform not found, fallback to white hot/original");
             glDeleteProgram(ironbowProgram_);
             ironbowProgram_ = 0;
             ironbowYMinLocation_ = -1;
             ironbowYScaleLocation_ = -1;
+            ironbowBlackPointLocation_ = -1;
+            ironbowWindowInvRangeLocation_ = -1;
             ironbowGammaLocation_ = -1;
             ironbowPaletteLocation_ = -1;
             ironbowPositionLocation_ = -1;

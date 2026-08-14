@@ -40,12 +40,12 @@ public:
 
     // colorRange: AVCOL_RANGE_UNSPECIFIED(0) / AVCOL_RANGE_MPEG(1) / AVCOL_RANGE_JPEG(2).
     // colorspace: AVColorSpace (BT.601 / BT.709 selection; unknown -> BT.601).
-    // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma applies to
-    // white_hot and ironbow only.
+    // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
+    // whitePoint apply to white_hot and ironbow only (window in intensity 0..1 domain).
     RenderResult renderNv12(const uint8_t *yData, int yStride,
                             const uint8_t *uvData, int uvStride,
                             int width, int height, int colorRange, int colorspace,
-                            int thermalMode, float gamma);
+                            int thermalMode, float gamma, float blackPoint, float whitePoint);
 
 private:
     bool ensureGlLocked(std::string &errorMessage);
@@ -70,12 +70,16 @@ private:
     GLuint whiteHotProgram_ = 0;
     GLint whiteHotYMinLocation_ = -1;
     GLint whiteHotYScaleLocation_ = -1;
+    GLint whiteHotBlackPointLocation_ = -1;
+    GLint whiteHotWindowInvRangeLocation_ = -1;
     GLint whiteHotGammaLocation_ = -1;
     GLint whiteHotPositionLocation_ = -1;
     GLint whiteHotTexCoordLocation_ = -1;
     GLuint ironbowProgram_ = 0;
     GLint ironbowYMinLocation_ = -1;
     GLint ironbowYScaleLocation_ = -1;
+    GLint ironbowBlackPointLocation_ = -1;
+    GLint ironbowWindowInvRangeLocation_ = -1;
     GLint ironbowGammaLocation_ = -1;
     GLint ironbowPaletteLocation_ = -1;
     GLint ironbowPositionLocation_ = -1;

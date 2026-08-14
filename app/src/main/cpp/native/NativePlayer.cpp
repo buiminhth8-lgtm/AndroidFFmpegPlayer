@@ -1374,6 +1374,7 @@ std::string NativePlayer::getStats() {
     const float agcWhiteEffective = agcValidEffective
                                     ? (oesRenderMode ? oesRenderer_.getAgcWhitePoint() : agcWhitePoint_.load())
                                     : 1.0f;
+    const bool thermalWindowApplied = effectiveThermalRenderMode != "normal";
 
     LOGI("getPlayerStats player=%p", this);
     std::ostringstream out;
@@ -1560,6 +1561,7 @@ std::string NativePlayer::getStats() {
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
         << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
         << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
+        << "\"thermalWindowApplied\":" << (thermalWindowApplied ? "true" : "false") << ","
         << "\"thermalRenderMode\":\"" << effectiveThermalRenderMode << "\","
         << "\"thermalInputType\":\"" << thermalInputType << "\","
         << "\"oesThermalRenderedCount\":" << oesThermalRenderedCount_.load() << ","
@@ -3252,7 +3254,8 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
                                                            frameWidth, frameHeight,
                                                            static_cast<int>(frame->color_range),
                                                            static_cast<int>(frame->colorspace),
-                                                           nv12ThermalMode, thermal.gamma);
+                                                           nv12ThermalMode, thermal.gamma,
+                                                           thermal.blackPoint, thermal.whitePoint);
     if (result.stats.copyCostUs > 0) {
         recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
                    nv12GlMaxUploadCostUs_, result.stats.copyCostUs);

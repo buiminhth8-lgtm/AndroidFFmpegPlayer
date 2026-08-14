@@ -156,12 +156,17 @@ std::string NativeOesRenderer::setSurface(JNIEnv *env, jobject surface, int widt
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    // Surface change invalidates the current EGL window surface and OES texture;
-    // tear down so a later prepareForOesDecode recreates everything from the new window.
     if (prepared_.load()) {
-        releaseGlLocked();
-        releaseJavaLocked(env);
-        prepared_.store(false);
+        // Surface recreated during OES playback: keep SurfaceTexture / OES texture /
+        // program (decoder output unchanged); only rebuild the EGL window surface.
+        if (!rebindEglSurfaceLocked(newWindow, width, height)) {
+            LOGE("OES EGL surface rebind failed, full teardown; re-prepare required");
+            releaseGlLocked();
+            releaseJavaLocked(env);
+            prepared_.store(false);
+        } else {
+            surfaceRecreateCount_.fetch_add(1);
+        }
     }
     if (window_ != nullptr) {
         ANativeWindow_release(window_);
@@ -295,6 +300,7 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
     surfaceTextureGlobalRef_ = env->NewGlobalRef(surfaceTexture);
     decoderSurfaceGlobalRef_ = env->NewGlobalRef(decoderSurface);
     frameListenerGlobalRef_ = env->NewGlobalRef(listener);
+    transformMatrixArrayGlobalRef_ = static_cast<jfloatArray>(env->NewGlobalRef(env->NewFloatArray(16)));
     updateTexImageMethod_ = env->GetMethodID(surfaceTextureClass, "updateTexImage", "()V");
     getTransformMatrixMethod_ = env->GetMethodID(surfaceTextureClass, "getTransformMatrix", "([F)V");
 
@@ -314,7 +320,7 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
     return true;
 }
 
-bool NativeOesRenderer::renderOesFrame(JNIEnv *env) {
+bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight) {
     if (env == nullptr || !prepared_.load()) {
         return false;
     }
@@ -323,30 +329,73 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env) {
         return false;
     }
     if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
-        LOGE("OES eglMakeCurrent failed eglError=0x%x", eglGetError());
+        const EGLint eglError = eglGetError();
+        LOGE("OES eglMakeCurrent failed eglError=0x%x", eglError);
+        if (eglError == EGL_CONTEXT_LOST) {
+            contextRecreateCount_.fetch_add(1);
+            LOGE("OES EGL context lost; GL resources invalid, teardown for re-prepare");
+            releaseGlLocked();
+            prepared_.store(false);
+        }
         return false;
     }
 
     env->CallVoidMethod(surfaceTextureGlobalRef_, updateTexImageMethod_);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
+        updateTexImageErrorCount_.fetch_add(1);
+        const int64_t errors = updateTexImageErrorCount_.load();
+        if (errors == 1 || errors % 100 == 0) {
+            LOGE("OES updateTexImage failed count=%lld",
+                 static_cast<long long>(errors));
+        }
         return false;
     }
 
     GLfloat transform[16] = {0};
-    jfloatArray matrixArray = env->NewFloatArray(16);
-    env->CallVoidMethod(surfaceTextureGlobalRef_, getTransformMatrixMethod_, matrixArray);
+    env->CallVoidMethod(surfaceTextureGlobalRef_, getTransformMatrixMethod_, transformMatrixArrayGlobalRef_);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
-        env->DeleteLocalRef(matrixArray);
+        updateTexImageErrorCount_.fetch_add(1);
         return false;
     }
-    env->GetFloatArrayRegion(matrixArray, 0, 16, transform);
-    env->DeleteLocalRef(matrixArray);
+    env->GetFloatArrayRegion(transformMatrixArrayGlobalRef_, 0, 16, transform);
 
-    const int viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : 1;
-    const int viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : 1;
-    glViewport(0, 0, viewportWidth, viewportHeight);
+    // Aspect-fit letterbox viewport (no forced stretch), honoring 90-degree
+    // rotation from the SurfaceTexture transform matrix.
+    GLint viewportX = 0;
+    GLint viewportY = 0;
+    GLint viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : 1;
+    GLint viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : 1;
+    if (frameWidth > 0 && frameHeight > 0) {
+        const bool transposed = std::abs(transform[0]) < 0.0001f && std::abs(transform[5]) < 0.0001f;
+        const float contentAspect = transposed
+                                    ? static_cast<float>(frameHeight) / static_cast<float>(frameWidth)
+                                    : static_cast<float>(frameWidth) / static_cast<float>(frameHeight);
+        const float surfaceAspect = viewportHeight > 0
+                                    ? static_cast<float>(viewportWidth) / static_cast<float>(viewportHeight)
+                                    : 1.0f;
+        if (contentAspect > surfaceAspect) {
+            viewportWidth = static_cast<GLint>(viewportWidth);
+            viewportHeight = static_cast<GLint>(static_cast<float>(viewportWidth) / contentAspect);
+            if (viewportHeight > (surfaceHeight_ > 0 ? surfaceHeight_ : 1)) {
+                viewportHeight = surfaceHeight_;
+            }
+        } else {
+            viewportHeight = static_cast<GLint>(viewportHeight);
+            viewportWidth = static_cast<GLint>(static_cast<float>(viewportHeight) * contentAspect);
+            if (viewportWidth > (surfaceWidth_ > 0 ? surfaceWidth_ : 1)) {
+                viewportWidth = surfaceWidth_;
+            }
+        }
+        if (viewportWidth <= 0 || viewportHeight <= 0) {
+            viewportWidth = surfaceWidth_ > 0 ? surfaceWidth_ : 1;
+            viewportHeight = surfaceHeight_ > 0 ? surfaceHeight_ : 1;
+        }
+        viewportX = (surfaceWidth_ - viewportWidth) / 2;
+        viewportY = (surfaceHeight_ - viewportHeight) / 2;
+    }
+    glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
@@ -424,6 +473,24 @@ jobject NativeOesRenderer::getDecoderSurfaceGlobalRef() const {
     return decoderSurfaceGlobalRef_;
 }
 
+int64_t NativeOesRenderer::getSurfaceRecreateCount() const {
+    return surfaceRecreateCount_.load();
+}
+
+int64_t NativeOesRenderer::getContextRecreateCount() const {
+    return contextRecreateCount_.load();
+}
+
+int64_t NativeOesRenderer::getUpdateTexImageErrorCount() const {
+    return updateTexImageErrorCount_.load();
+}
+
+void NativeOesRenderer::resetDiagnostics() {
+    surfaceRecreateCount_.store(0);
+    contextRecreateCount_.store(0);
+    updateTexImageErrorCount_.store(0);
+}
+
 bool NativeOesRenderer::ensureGlLocked(JNIEnv *env, std::string &errorMessage) {
     if (window_ == nullptr) {
         errorMessage = "OES requires valid Surface before prepare";
@@ -492,6 +559,35 @@ bool NativeOesRenderer::ensureGlLocked(JNIEnv *env, std::string &errorMessage) {
     return true;
 }
 
+bool NativeOesRenderer::rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height) {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglContext_ == EGL_NO_CONTEXT || newWindow == nullptr) {
+        return false;
+    }
+    releaseEglSurfaceLocked();
+    eglSurface_ = eglCreateWindowSurface(eglDisplay_, eglConfig_, newWindow, nullptr);
+    if (eglSurface_ == EGL_NO_SURFACE) {
+        LOGE("OES recreate EGLSurface failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
+        LOGE("OES recreate EGLSurface makeCurrent failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    glViewport(0, 0, width > 0 ? width : 1, height > 0 ? height : 1);
+    return true;
+}
+
+void NativeOesRenderer::releaseEglSurfaceLocked() {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglSurface_ == EGL_NO_SURFACE) {
+        return;
+    }
+    if (eglContext_ != EGL_NO_CONTEXT) {
+        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    eglDestroySurface(eglDisplay_, eglSurface_);
+    eglSurface_ = EGL_NO_SURFACE;
+}
+
 void NativeOesRenderer::releaseGlLocked() {
     if (eglDisplay_ != EGL_NO_DISPLAY) {
         if (eglSurface_ != EGL_NO_SURFACE && eglContext_ != EGL_NO_CONTEXT) {
@@ -508,11 +604,7 @@ void NativeOesRenderer::releaseGlLocked() {
         stMatrixLocation_ = -1;
         positionLocation_ = -1;
         texCoordLocation_ = -1;
-        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (eglSurface_ != EGL_NO_SURFACE) {
-            eglDestroySurface(eglDisplay_, eglSurface_);
-            eglSurface_ = EGL_NO_SURFACE;
-        }
+        releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
             eglContext_ = EGL_NO_CONTEXT;
@@ -545,6 +637,10 @@ void NativeOesRenderer::releaseJavaLocked(JNIEnv *env) {
     if (frameListenerGlobalRef_ != nullptr) {
         env->DeleteGlobalRef(frameListenerGlobalRef_);
         frameListenerGlobalRef_ = nullptr;
+    }
+    if (transformMatrixArrayGlobalRef_ != nullptr) {
+        env->DeleteGlobalRef(transformMatrixArrayGlobalRef_);
+        transformMatrixArrayGlobalRef_ = nullptr;
     }
 }
 

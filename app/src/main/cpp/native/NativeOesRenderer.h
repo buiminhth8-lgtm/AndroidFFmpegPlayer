@@ -38,15 +38,21 @@ public:
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
-    bool renderOesFrame(JNIEnv *env);
+    bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight);
     void release();
     bool hasSurface() const;
     bool isPrepared() const;
     jobject getDecoderSurfaceGlobalRef() const;
+    int64_t getSurfaceRecreateCount() const;
+    int64_t getContextRecreateCount() const;
+    int64_t getUpdateTexImageErrorCount() const;
+    void resetDiagnostics();
 
 private:
     bool ensureGlLocked(JNIEnv *env, std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
+    bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    void releaseEglSurfaceLocked();
     void releaseGlLocked();
     void releaseJavaLocked(JNIEnv *env);
 
@@ -69,7 +75,11 @@ private:
     jobject frameListenerGlobalRef_ = nullptr;
     jmethodID updateTexImageMethod_ = nullptr;
     jmethodID getTransformMatrixMethod_ = nullptr;
+    jfloatArray transformMatrixArrayGlobalRef_ = nullptr;
     std::atomic<bool> prepared_{false};
+    std::atomic<int64_t> surfaceRecreateCount_{0};
+    std::atomic<int64_t> contextRecreateCount_{0};
+    std::atomic<int64_t> updateTexImageErrorCount_{0};
 };
 
 #endif // MOTRO_NATIVE_OES_RENDERER_H

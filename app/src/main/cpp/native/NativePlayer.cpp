@@ -1300,6 +1300,9 @@ std::string NativePlayer::getStats() {
         << "\"renderInputType\":\"" << videoRenderInputTypeName(videoRenderInputType(optionsSnapshot.renderMode)) << "\","
         << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
         << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
+        << "\"oesUpdateTexImageErrorCount\":" << oesRenderer_.getUpdateTexImageErrorCount() << ","
+        << "\"oesSurfaceRecreateCount\":" << oesRenderer_.getSurfaceRecreateCount() << ","
+        << "\"oesContextRecreateCount\":" << oesRenderer_.getContextRecreateCount() << ","
         << "\"swsScaleEnabled\":" << (swsScaleEnabled ? "true" : "false") << ","
         << "\"snapshotSupported\":" << (snapshotSupported ? "true" : "false") << ","
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
@@ -2933,9 +2936,13 @@ void NativePlayer::renderOesPendingFrameIfReady() {
         return;
     }
     PlayerOptions snapshot;
+    int frameWidth = 0;
+    int frameHeight = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         snapshot = playerOptions_;
+        frameWidth = videoWidth_;
+        frameHeight = videoHeight_;
     }
     if (snapshot.renderMode != RenderMode::MEDIACODEC_OES) {
         oesFramePending_.store(false);
@@ -2950,11 +2957,17 @@ void NativePlayer::renderOesPendingFrameIfReady() {
         oesFramePending_.store(true);
         return;
     }
-    if (oesRenderer_.renderOesFrame(env)) {
+    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight)) {
         oesFrameRenderedCount_.fetch_add(1);
         lastRenderTimeMs_.store(nowMs());
     } else {
-        LOGE("OES render frame failed");
+        const int64_t fails = oesRenderFailCount_.fetch_add(1) + 1;
+        if (fails == 1 || fails % 100 == 0) {
+            LOGE("OES render frame failed count=%lld updateTexImageErrors=%lld contextRecreates=%lld",
+                 static_cast<long long>(fails),
+                 static_cast<long long>(oesRenderer_.getUpdateTexImageErrorCount()),
+                 static_cast<long long>(oesRenderer_.getContextRecreateCount()));
+        }
     }
     detachCurrentThreadIfNeeded(attached);
 }
@@ -3341,6 +3354,10 @@ void NativePlayer::resetStats() {
     softwareRenderedFrameCount_.store(0);
     yuvGlRenderedFrameCount_.store(0);
     yuvGlFallbackFrameCount_.store(0);
+    oesFrameAvailableCount_.store(0);
+    oesFrameRenderedCount_.store(0);
+    oesRenderFailCount_.store(0);
+    oesRenderer_.resetDiagnostics();
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);

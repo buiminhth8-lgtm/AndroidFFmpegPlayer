@@ -19,7 +19,8 @@ add_library(native-ffmpeg SHARED
         native/PlayerOptions.cpp
         native/PlayerRemuxRecorder.cpp
         native/SnapshotManager.cpp
-        native/ThermalConfig.cpp)
+        native/ThermalConfig.cpp
+        native/ThermalPaletteLut.cpp)
 
 add_library(avutil SHARED IMPORTED)
 set_target_properties(avutil PROPERTIES

@@ -1273,7 +1273,7 @@ std::string NativePlayer::getStats() {
     if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES) {
         switch (lastOesThermalRenderMode_.load()) {
             case 1: effectiveThermalRenderMode = "white_hot"; break;
-            case 2: effectiveThermalRenderMode = "white_hot_fallback"; break;
+            case 2: effectiveThermalRenderMode = "ironbow"; break;
             default: effectiveThermalRenderMode = "normal"; break;
         }
         thermalInputType = "oes_luminance";
@@ -2978,27 +2978,19 @@ void NativePlayer::renderOesPendingFrameIfReady() {
     }
 
     const ThermalConfig thermal = getThermalConfig();
-    bool whiteHot = false;
-    int oesThermalMode = 0;  // normal / original
+    int oesThermalMode = 0;  // original
     if (thermal.enabled) {
         if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
-            whiteHot = true;
             oesThermalMode = 1;
         } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
-            // OES Ironbow not implemented yet: safe fallback to white hot.
-            whiteHot = true;
             oesThermalMode = 2;
-            bool expected = false;
-            if (oesIronbowFallbackLogged_.compare_exchange_strong(expected, true)) {
-                LOGI("OES Ironbow is not implemented in Slice 3; using white hot fallback");
-            }
         }
     }
     lastOesThermalRenderMode_.store(oesThermalMode);
 
-    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, whiteHot)) {
+    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, oesThermalMode, thermal.gamma)) {
         oesFrameRenderedCount_.fetch_add(1);
-        if (whiteHot) {
+        if (oesThermalMode != 0) {
             oesThermalRenderedCount_.fetch_add(1);
         }
         lastRenderTimeMs_.store(nowMs());
@@ -3401,7 +3393,6 @@ void NativePlayer::resetStats() {
     oesRenderFailCount_.store(0);
     oesThermalRenderedCount_.store(0);
     lastOesThermalRenderMode_.store(0);
-    oesIronbowFallbackLogged_.store(false);
     oesRenderer_.resetDiagnostics();
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);

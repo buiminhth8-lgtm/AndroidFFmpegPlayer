@@ -548,19 +548,30 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return !hardwareDecodeSwitch.isChecked() || "mediacodec_oes".equals(intentRenderMode);
     }
 
+    private boolean isOesMode() {
+        if (!TextUtils.isEmpty(currentRenderMode)) {
+            return "mediacodec_oes".equals(currentRenderMode);
+        }
+        return "mediacodec_oes".equals(intentRenderMode);
+    }
+
     private void updateThermalControlsEnabledState() {
         boolean supported = isThermalSupported();
+        boolean oesMode = isOesMode();
         boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
-        boolean agcOn = thermalOn && controlsBinding.thermalAgcSwitch.isChecked();
+        // Gamma + palette apply to both software_yuv_gl and mediacodec_oes;
+        // AGC and manual Window are software-only (not yet in the OES pipeline).
+        boolean agcSupported = supported && !oesMode;
+        boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
         // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
         controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
         for (int i = 0; i < controlsBinding.thermalPaletteRadioGroup.getChildCount(); i++) {
             controlsBinding.thermalPaletteRadioGroup.getChildAt(i).setEnabled(thermalOn);
         }
-        controlsBinding.thermalAgcSwitch.setEnabled(thermalOn);
+        controlsBinding.thermalAgcSwitch.setEnabled(thermalOn && agcSupported);
         controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn);
         controlsBinding.thermalGammaValueText.setAlpha(thermalOn ? 1.0f : 0.4f);
-        boolean windowEnabled = thermalOn && !agcOn;
+        boolean windowEnabled = thermalOn && !agcOn && !oesMode;
         controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalBlackPointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
@@ -742,6 +753,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             } else if (oesMode) {
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
                         + " | " + thermalPalette
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US)
                         + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else {

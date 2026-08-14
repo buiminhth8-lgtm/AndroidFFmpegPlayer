@@ -1,4 +1,5 @@
 #include "NativeOesRenderer.h"
+#include "ThermalPaletteLut.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -76,11 +77,30 @@ const char *kOesWhiteHotFragmentShader = R"(
 precision mediump float;
 varying vec2 vTexCoord;
 uniform samplerExternalOES uTexture;
+uniform float uGamma;
 void main() {
     vec3 rgb = texture2D(uTexture, vTexCoord).rgb;
     float intensity = dot(rgb, vec3(0.299, 0.587, 0.114));
     intensity = clamp(intensity, 0.0, 1.0);
+    intensity = pow(intensity, max(uGamma, 0.001));
     gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
+}
+)";
+
+const char *kOesIronbowFragmentShader = R"(
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+varying vec2 vTexCoord;
+uniform samplerExternalOES uTexture;
+uniform sampler2D uPaletteTexture;
+uniform float uGamma;
+void main() {
+    vec3 rgb = texture2D(uTexture, vTexCoord).rgb;
+    float intensity = dot(rgb, vec3(0.299, 0.587, 0.114));
+    intensity = clamp(intensity, 0.0, 1.0);
+    intensity = pow(intensity, max(uGamma, 0.001));
+    vec3 color = texture2D(uPaletteTexture, vec2(intensity, 0.5)).rgb;
+    gl_FragColor = vec4(color, 1.0);
 }
 )";
 
@@ -333,7 +353,7 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
     return true;
 }
 
-bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, bool whiteHot) {
+bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode, float gamma) {
     if (env == nullptr || !prepared_.load()) {
         return false;
     }
@@ -412,15 +432,48 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Select program: white hot (luminance) or original. If white hot is
-    // unavailable (compile/link failure), fall back to the original program.
-    GLuint program = whiteHot && whiteHotProgram_ != 0 ? whiteHotProgram_ : program_;
-    const GLint stMatrix = program == whiteHotProgram_ ? whiteHotStMatrixLocation_ : stMatrixLocation_;
-    const GLint positionLoc = program == whiteHotProgram_ ? whiteHotPositionLocation_ : positionLocation_;
-    const GLint texCoordLoc = program == whiteHotProgram_ ? whiteHotTexCoordLocation_ : texCoordLocation_;
+    // Select program: original / white hot / ironbow. If the requested thermal
+    // program is unavailable, fall back (ironbow -> white hot -> original).
+    GLuint program = program_;
+    GLint stMatrix = stMatrixLocation_;
+    GLint positionLoc = positionLocation_;
+    GLint texCoordLoc = texCoordLocation_;
+    bool useIronbow = false;
+    if (thermalMode == 1 && whiteHotProgram_ != 0) {
+        program = whiteHotProgram_;
+        stMatrix = whiteHotStMatrixLocation_;
+        positionLoc = whiteHotPositionLocation_;
+        texCoordLoc = whiteHotTexCoordLocation_;
+    } else if (thermalMode == 2) {
+        if (ironbowProgram_ != 0 && ironbowTexture_ != 0) {
+            program = ironbowProgram_;
+            stMatrix = ironbowStMatrixLocation_;
+            positionLoc = ironbowPositionLocation_;
+            texCoordLoc = ironbowTexCoordLocation_;
+            useIronbow = true;
+        } else if (whiteHotProgram_ != 0) {
+            program = whiteHotProgram_;
+            stMatrix = whiteHotStMatrixLocation_;
+            positionLoc = whiteHotPositionLocation_;
+            texCoordLoc = whiteHotTexCoordLocation_;
+        }
+    }
 
     glUseProgram(program);
     glUniformMatrix4fv(stMatrix, 1, GL_FALSE, transform);
+
+    if (useIronbow) {
+        if (ironbowGammaLocation_ >= 0) {
+            glUniform1f(ironbowGammaLocation_, gamma);
+        }
+        if (ironbowPaletteLocation_ >= 0) {
+            glActiveTexture(GL_TEXTURE3);
+            glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+            glActiveTexture(GL_TEXTURE0);
+        }
+    } else if (program == whiteHotProgram_ && whiteHotGammaLocation_ >= 0) {
+        glUniform1f(whiteHotGammaLocation_, gamma);
+    }
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexture_);
@@ -631,6 +684,20 @@ void NativeOesRenderer::releaseGlLocked() {
         whiteHotStMatrixLocation_ = -1;
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
+        whiteHotGammaLocation_ = -1;
+        if (ironbowTexture_ != 0) {
+            glDeleteTextures(1, &ironbowTexture_);
+            ironbowTexture_ = 0;
+        }
+        if (ironbowProgram_ != 0) {
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+        }
+        ironbowStMatrixLocation_ = -1;
+        ironbowPositionLocation_ = -1;
+        ironbowTexCoordLocation_ = -1;
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
         releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
@@ -691,7 +758,6 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
     std::string whiteHotError;
     GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kOesWhiteHotFragmentShader, whiteHotError);
     whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
-    glDeleteShader(vertexShader);
     if (whiteHotFragmentShader != 0) {
         glDeleteShader(whiteHotFragmentShader);
     }
@@ -701,6 +767,26 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
         whiteHotStMatrixLocation_ = -1;
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
+        whiteHotGammaLocation_ = -1;
+    }
+
+    std::string ironbowError;
+    GLuint ironbowFragmentShader = compileShader(GL_FRAGMENT_SHADER, kOesIronbowFragmentShader, ironbowError);
+    ironbowProgram_ = ironbowFragmentShader == 0 ? 0 : linkProgram(vertexShader, ironbowFragmentShader, ironbowError);
+    // vertexShader is no longer needed after all programs are linked.
+    glDeleteShader(vertexShader);
+    if (ironbowFragmentShader != 0) {
+        glDeleteShader(ironbowFragmentShader);
+    }
+    if (ironbowProgram_ == 0) {
+        LOGE("OES ironbow shader setup failed, fallback to white hot/original: %s", ironbowError.c_str());
+        ironbowProgram_ = 0;
+        ironbowStMatrixLocation_ = -1;
+        ironbowPositionLocation_ = -1;
+        ironbowTexCoordLocation_ = -1;
+        ironbowGammaLocation_ = -1;
+        ironbowPaletteLocation_ = -1;
+        ironbowTexture_ = 0;
     }
 
     glUseProgram(program_);
@@ -718,17 +804,54 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
         whiteHotStMatrixLocation_ = glGetUniformLocation(whiteHotProgram_, "uSTMatrix");
         whiteHotPositionLocation_ = glGetAttribLocation(whiteHotProgram_, "aPosition");
         whiteHotTexCoordLocation_ = glGetAttribLocation(whiteHotProgram_, "aTexCoord");
-        if (whiteHotStMatrixLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
+        whiteHotGammaLocation_ = glGetUniformLocation(whiteHotProgram_, "uGamma");
+        if (whiteHotStMatrixLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0
+            || whiteHotGammaLocation_ < 0) {
             LOGE("OES white hot shader attribute/uniform not found, fallback to original OES");
             glDeleteProgram(whiteHotProgram_);
             whiteHotProgram_ = 0;
             whiteHotStMatrixLocation_ = -1;
             whiteHotPositionLocation_ = -1;
             whiteHotTexCoordLocation_ = -1;
+            whiteHotGammaLocation_ = -1;
         } else {
             glUniform1i(glGetUniformLocation(whiteHotProgram_, "uTexture"), 0);
         }
         glUseProgram(program_);
+    }
+
+    if (ironbowProgram_ != 0) {
+        glUseProgram(ironbowProgram_);
+        ironbowStMatrixLocation_ = glGetUniformLocation(ironbowProgram_, "uSTMatrix");
+        ironbowPositionLocation_ = glGetAttribLocation(ironbowProgram_, "aPosition");
+        ironbowTexCoordLocation_ = glGetAttribLocation(ironbowProgram_, "aTexCoord");
+        ironbowGammaLocation_ = glGetUniformLocation(ironbowProgram_, "uGamma");
+        ironbowPaletteLocation_ = glGetUniformLocation(ironbowProgram_, "uPaletteTexture");
+        if (ironbowStMatrixLocation_ < 0 || ironbowPositionLocation_ < 0 || ironbowTexCoordLocation_ < 0
+            || ironbowGammaLocation_ < 0 || ironbowPaletteLocation_ < 0) {
+            LOGE("OES ironbow shader attribute/uniform not found, fallback to white hot/original");
+            glDeleteProgram(ironbowProgram_);
+            ironbowProgram_ = 0;
+            ironbowStMatrixLocation_ = -1;
+            ironbowPositionLocation_ = -1;
+            ironbowTexCoordLocation_ = -1;
+            ironbowGammaLocation_ = -1;
+            ironbowPaletteLocation_ = -1;
+            ironbowTexture_ = 0;
+        } else {
+            glActiveTexture(GL_TEXTURE3);
+            glGenTextures(1, &ironbowTexture_);
+            glBindTexture(GL_TEXTURE_2D, ironbowTexture_);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            const std::array<uint8_t, kIronbowLutSize> lut = createIronbowLut();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 256, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, lut.data());
+            glUniform1i(ironbowPaletteLocation_, 3);
+            glActiveTexture(GL_TEXTURE0);
+            glUseProgram(program_);
+        }
     }
 
     GLenum error = glGetError();

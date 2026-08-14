@@ -478,8 +478,7 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
             return false;
         }
         if (renderMode == RenderMode::MEDIACODEC_NV12_GL) {
-            errorMessage = "mediacodec_nv12_gl is not ready in Revised Phase 2 Slice 0; render mode unchanged";
-            return false;
+            // Allowed: NV12 GL renders NV12 AVFrames via OpenGL (Slice 1).
         }
         options.renderMode = renderMode;
         if (renderMode != RenderMode::MEDIACODEC_SURFACE) {

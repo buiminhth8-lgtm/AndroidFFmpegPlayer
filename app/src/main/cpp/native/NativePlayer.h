@@ -108,6 +108,7 @@ private:
     void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
+    bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
     bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
     void renderOesPendingFrameIfReady();
     bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
@@ -228,6 +229,8 @@ private:
     std::atomic<int64_t> softwareRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12GlRenderedFrameCount_{0};
+    std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
     std::atomic<int64_t> oesFrameAvailableCount_{0};
     std::atomic<int64_t> oesFrameRenderedCount_{0};
     std::atomic<int64_t> oesRenderFailCount_{0};

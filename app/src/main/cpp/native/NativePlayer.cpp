@@ -663,7 +663,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     const char *hardwareDecoderName = preferredHardwareDecoderName(videoCodecId);
     const bool hardwareModeRequested = optionsSnapshot.enableHardwareDecode
                                        && (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
-                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES)
+                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES
+                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL)
                                        && hardwareDecoderName != nullptr;
     const std::string requestedDecoderName = hardwareModeRequested ? hardwareDecoderName : codecName(videoCodecId);
 
@@ -834,14 +835,16 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     int decoderOpenResult = -1;
     bool fallbackUsed = false;
     std::string fallbackError;
-    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE && optionsSnapshot.enableHardwareDecode) {
+    if ((optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+         || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL)
+        && optionsSnapshot.enableHardwareDecode) {
         bool hasSurfaceRef = false;
         {
             std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
             hasSurfaceRef = surfaceGlobalRef_ != nullptr;
         }
         if (!hasSurfaceRef) {
-            errorMessage = "mediacodec_surface requires valid Surface before prepare";
+            errorMessage = "mediacodec_surface/mediacodec_nv12_gl requires valid Surface before prepare";
             LOGE("%s", errorMessage.c_str());
             releaseFfmpegResources();
             return -1;
@@ -1396,6 +1399,8 @@ std::string NativePlayer::getStats() {
         << "\"softwareRenderedFrameCount\":" << softwareRenderedFrameCount_.load() << ","
         << "\"yuvGlRenderedFrameCount\":" << yuvGlRenderedFrameCount_.load() << ","
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
+        << "\"nv12GlRenderedFrameCount\":" << nv12GlRenderedFrameCount_.load() << ","
+        << "\"nv12GlFallbackFrameCount\":" << nv12GlFallbackFrameCount_.load() << ","
         << "\"renderInputType\":\"" << renderInputValue << "\","
         << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
         << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
@@ -1869,12 +1874,6 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
     RenderMode parsedMode;
     if (!parseRenderMode(mode, parsedMode)) {
         return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, mediacodec_oes, or mediacodec_nv12_gl");
-    }
-    if (parsedMode == RenderMode::MEDIACODEC_NV12_GL) {
-        // Revised Phase 2 Slice 0: only the architecture entry exists; NV12 GL
-        // rendering is not implemented yet. Reject without changing the current
-        // effective render mode or disturbing playback.
-        return jsonError(-1, "mediacodec_nv12_gl is not ready in Revised Phase 2 Slice 0; current render mode unchanged");
     }
 
     PlayerOptions optionsSnapshot;
@@ -3216,6 +3215,30 @@ void NativePlayer::updateAgcState(AVFrame *frame, const ThermalConfig &thermal) 
     agcUpdateCount_.fetch_add(1);
 }
 
+bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
+    if (frame == nullptr || frame->data[0] == nullptr || frame->data[1] == nullptr
+        || frame->linesize[0] <= 0 || frame->linesize[1] <= 0) {
+        return false;
+    }
+    const RenderResult result = nv12GlRenderer_.renderNv12(frame->data[0], frame->linesize[0],
+                                                           frame->data[1], frame->linesize[1],
+                                                           frameWidth, frameHeight,
+                                                           static_cast<int>(frame->color_range));
+    if (result.success) {
+        lastRendererType_.store(3);  // nv12_gl
+        nv12GlRenderedFrameCount_.fetch_add(1);
+        renderedFrameCount_.fetch_add(1);
+        lastRenderTimeMs_.store(nowMs());
+        return true;
+    }
+    const int64_t fallback = nv12GlFallbackFrameCount_.fetch_add(1) + 1;
+    if (fallback == 1 || fallback % 100 == 0) {
+        LOGE("NV12 GL render failed, fallback RGBA count=%lld error=%s",
+             static_cast<long long>(fallback), result.errorMessage.c_str());
+    }
+    return false;
+}
+
 bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
     if (frame == nullptr || !isSoftwareYuvGlFrameSupported(frame->format)) {
         return false;
@@ -3351,6 +3374,16 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         optionsSnapshot = playerOptions_;
+    }
+    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL
+        && sourceFormat == AV_PIX_FMT_NV12
+        && optionsSnapshot.usingHardwareDecoder
+        && nv12GlRenderer_.isReady()) {
+        // NV12 GL success bypasses sws_scale / RGBA / ANativeWindow entirely.
+        if (renderNv12GlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+            return true;
+        }
+        // render failure falls through to the safe sws/RGBA path (counted + logged in renderNv12GlFrame).
     }
     if (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL) {
         if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight, ptsUs)) {
@@ -3511,6 +3544,8 @@ void NativePlayer::resetStats() {
     softwareRenderedFrameCount_.store(0);
     yuvGlRenderedFrameCount_.store(0);
     yuvGlFallbackFrameCount_.store(0);
+    nv12GlRenderedFrameCount_.store(0);
+    nv12GlFallbackFrameCount_.store(0);
     lastFrameYStride_.store(0);
     lastFrameColorRange_.store(0);
     lastFrameOutputType_.store(0);

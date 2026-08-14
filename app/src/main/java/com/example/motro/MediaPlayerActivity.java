@@ -737,7 +737,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
             currentRenderMode = mode;
             updateThermalControlsEnabledState();
 
-            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode);
+            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode)
+                    || "mediacodec_nv12_gl".equals(mode);
             boolean oesMode = "mediacodec_oes".equals(mode);
             String thermalInputType = stats.optString("thermalInputType", "none");
             String windowLine;
@@ -936,13 +937,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle == 0) {
             return jsonError("player handle is 0");
         }
-        boolean hardwareDecode = "mediacodec_oes".equals(intentRenderMode) || hardwareDecodeSwitch.isChecked();
+        boolean hardwareDecode = "mediacodec_oes".equals(intentRenderMode)
+                || "mediacodec_nv12_gl".equals(intentRenderMode)
+                || hardwareDecodeSwitch.isChecked();
         String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
         // setHardwareDecode(false) may reset software render mode to software_rgba,
         // so apply the explicit render mode afterwards.
         String renderMode;
         if ("mediacodec_oes".equals(intentRenderMode)) {
             renderMode = "mediacodec_oes";
+        } else if ("mediacodec_nv12_gl".equals(intentRenderMode)) {
+            renderMode = "mediacodec_nv12_gl";
         } else {
             renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
         }

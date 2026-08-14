@@ -1,5 +1,6 @@
 package com.example.motro.ffmpeg;
 
+import android.graphics.SurfaceTexture;
 import android.util.Log;
 import android.view.Surface;
 
@@ -32,6 +33,25 @@ public final class FFmpegNative {
     public interface PlayerEventListener {
         void onPlayerEvent(long handle, String event, String eventJson);
     }
+
+    /**
+     * Receives MediaCodec SurfaceTexture frame-available callbacks and only
+     * signals the native side (sets an atomic pending flag). No GL calls here.
+     */
+    public static final class OesFrameListener implements SurfaceTexture.OnFrameAvailableListener {
+        private final long handle;
+
+        public OesFrameListener(long handle) {
+            this.handle = handle;
+        }
+
+        @Override
+        public void onFrameAvailable(SurfaceTexture surfaceTexture) {
+            FFmpegNative.nativeNotifyOesFrameAvailable(handle);
+        }
+    }
+
+    private static native void nativeNotifyOesFrameAvailable(long handle);
 
     private static void loadRequired(String name) {
         System.loadLibrary(name);

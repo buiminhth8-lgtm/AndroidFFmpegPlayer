@@ -472,10 +472,6 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
             errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes";
             return false;
         }
-        if (renderMode == RenderMode::MEDIACODEC_OES) {
-            errorMessage = "mediacodec_oes is not ready in Phase 2 Slice 0; render mode unchanged";
-            return false;
-        }
         options.renderMode = renderMode;
         if (renderMode != RenderMode::MEDIACODEC_SURFACE) {
             options.usingHardwareDecoder = false;

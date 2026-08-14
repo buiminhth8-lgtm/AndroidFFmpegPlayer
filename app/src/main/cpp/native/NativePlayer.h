@@ -4,6 +4,7 @@
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
 #include "NativeYuvGlRenderer.h"
+#include "NativeOesRenderer.h"
 #include "ThermalConfig.h"
 #include "VideoRenderer.h"
 
@@ -73,6 +74,7 @@ public:
     std::string setThermalGamma(float gamma);
     std::string setThermalWindow(float blackPoint, float whitePoint);
     ThermalConfig getThermalConfig() const;
+    void notifyOesFrameAvailable();
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
@@ -106,6 +108,7 @@ private:
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    void renderOesPendingFrameIfReady();
     bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
     void updateAgcState(AVFrame *frame, const ThermalConfig &thermal);
     bool shouldDropRealtimePacket(const AVPacket *packet);
@@ -132,6 +135,8 @@ private:
     ThermalConfig thermalConfig_;
     VideoRenderer renderer_;
     NativeYuvGlRenderer yuvGlRenderer_;
+    NativeOesRenderer oesRenderer_;
+    std::atomic<bool> oesFramePending_{false};
     PlayerRemuxRecorder remuxRecorder_;
     std::thread playbackThread_;
     std::atomic<bool> stopRequested_{false};

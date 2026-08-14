@@ -427,11 +427,15 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
     LOGI("setSurface player=%p width=%d height=%d", this, width, height);
     const std::string rgbaResult = renderer_.setSurface(env, surface, width, height);
     const std::string glResult = yuvGlRenderer_.setSurface(env, surface, width, height);
+    const std::string oesResult = oesRenderer_.setSurface(env, surface, width, height);
     if (rgbaResult.find("\"success\":true") == std::string::npos) {
         return rgbaResult;
     }
     if (glResult.find("\"success\":true") == std::string::npos) {
         LOGE("setSurface GL YUV renderer failed: %s", glResult.c_str());
+    }
+    if (oesResult.find("\"success\":true") == std::string::npos) {
+        LOGE("setSurface OES renderer failed: %s", oesResult.c_str());
     }
     return rgbaResult;
 }
@@ -443,6 +447,7 @@ std::string NativePlayer::clearSurface() {
     LOGI("clearPlayerSurface player=%p", this);
     renderer_.release();
     yuvGlRenderer_.release();
+    oesRenderer_.release();
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env == nullptr) {
@@ -616,7 +621,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     const AVCodecID videoCodecId = videoStream->codecpar->codec_id;
     const char *hardwareDecoderName = preferredHardwareDecoderName(videoCodecId);
     const bool hardwareModeRequested = optionsSnapshot.enableHardwareDecode
-                                       && optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                       && (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES)
                                        && hardwareDecoderName != nullptr;
     const std::string requestedDecoderName = hardwareModeRequested ? hardwareDecoderName : codecName(videoCodecId);
 
@@ -699,7 +705,35 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 closeCurrentVideoDecoder();
                 return -1;
             }
-            {
+
+            if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES) {
+                if (!oesRenderer_.isPrepared()) {
+                    bool attached = false;
+                    JNIEnv *env = getJniEnvForCurrentThread(attached);
+                    std::string oesError;
+                    const bool prepared = env != nullptr
+                                          && oesRenderer_.prepareForOesDecode(env,
+                                                                               reinterpret_cast<intptr_t>(this),
+                                                                               oesError);
+                    detachCurrentThreadIfNeeded(attached);
+                    if (!prepared) {
+                        openError = "mediacodec_oes prepare failed: " + oesError;
+                        LOGE("%s", openError.c_str());
+                        av_free(mediaCodecCtx);
+                        closeCurrentVideoDecoder();
+                        return -1;
+                    }
+                }
+                jobject decoderSurface = oesRenderer_.getDecoderSurfaceGlobalRef();
+                if (decoderSurface == nullptr) {
+                    openError = "mediacodec_oes decoder Surface is null";
+                    LOGE("%s", openError.c_str());
+                    av_free(mediaCodecCtx);
+                    closeCurrentVideoDecoder();
+                    return -1;
+                }
+                openResult = av_mediacodec_default_init(videoCodecContext_, mediaCodecCtx, decoderSurface);
+            } else {
                 std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
                 if (surfaceGlobalRef_ == nullptr) {
                     openError = "mediacodec_surface requires valid Surface before prepare";
@@ -717,7 +751,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 return openResult;
             }
             mediaCodecContextInitialized_ = true;
-            LOGI("MediaCodec surface init success");
+            LOGI("MediaCodec surface init success renderMode=%s", renderModeName(optionsSnapshot.renderMode).c_str());
         }
 
         openResult = avcodec_open2(videoCodecContext_, decoder, nullptr);
@@ -802,7 +836,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                         fallbackUsed ? fallbackError : "", softwareRenderMode);
     } else {
         setDecoderState(requestedDecoderName, decoderName(videoCodecContext_->codec), true, false, "",
-                        RenderMode::MEDIACODEC_SURFACE);
+                        optionsSnapshot.renderMode);
         lastSwsScaleCostUs_.store(-1);
         lastRenderLockCostUs_.store(-1);
         lastRenderCopyCostUs_.store(-1);
@@ -1161,6 +1195,8 @@ std::string NativePlayer::stop() {
     remuxRecorder_.stop();
 
     releaseFfmpegResources();
+    oesRenderer_.release();
+    oesFramePending_.store(false);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Released) {
@@ -1728,11 +1764,6 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
     if (!parseRenderMode(mode, parsedMode)) {
         return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes");
     }
-    if (parsedMode == RenderMode::MEDIACODEC_OES) {
-        // Phase 2 Slice 0: only the architecture entry exists; OES rendering is not implemented yet.
-        // Reject explicitly without changing the current effective render mode or disturbing playback.
-        return jsonError(-1, "mediacodec_oes is not ready in Phase 2 Slice 0; current render mode unchanged");
-    }
 
     PlayerOptions optionsSnapshot;
     {
@@ -1880,6 +1911,10 @@ std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
         if (playerOptions_.renderMode == RenderMode::SOFTWARE_YUV_GL) {
             LOGE("snapshot unsupported in software_yuv_gl");
             return jsonError(-1, "Snapshot is not supported in software_yuv_gl mode yet. Use software_rgba mode or PixelCopy.");
+        }
+        if (playerOptions_.renderMode == RenderMode::MEDIACODEC_OES) {
+            LOGE("snapshot unsupported in mediacodec_oes");
+            return jsonError(-1, "Snapshot is not supported in mediacodec_oes mode yet. Use software_rgba mode or PixelCopy.");
         }
     }
 
@@ -2033,6 +2068,7 @@ std::string NativePlayer::release() {
     detachCurrentThreadIfNeeded(attached);
     clearLastFrame();
     releaseFfmpegResources();
+    oesRenderer_.release();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2875,6 +2911,8 @@ void NativePlayer::playbackLoop() {
             }
         }
 
+        renderOesPendingFrameIfReady();
+
         av_packet_unref(packet_);
     }
 
@@ -2883,6 +2921,42 @@ void NativePlayer::playbackLoop() {
         state_ = PlayerState::Stopped;
     }
     LOGI("playback thread ended player=%p", this);
+}
+
+void NativePlayer::notifyOesFrameAvailable() {
+    oesFramePending_.store(true);
+    oesFrameAvailableCount_.fetch_add(1);
+}
+
+void NativePlayer::renderOesPendingFrameIfReady() {
+    if (!oesRenderer_.isPrepared() || !oesFramePending_.load()) {
+        return;
+    }
+    PlayerOptions snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot = playerOptions_;
+    }
+    if (snapshot.renderMode != RenderMode::MEDIACODEC_OES) {
+        oesFramePending_.store(false);
+        return;
+    }
+    if (!oesFramePending_.exchange(false)) {
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        oesFramePending_.store(true);
+        return;
+    }
+    if (oesRenderer_.renderOesFrame(env)) {
+        oesFrameRenderedCount_.fetch_add(1);
+        lastRenderTimeMs_.store(nowMs());
+    } else {
+        LOGE("OES render frame failed");
+    }
+    detachCurrentThreadIfNeeded(attached);
 }
 
 bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {

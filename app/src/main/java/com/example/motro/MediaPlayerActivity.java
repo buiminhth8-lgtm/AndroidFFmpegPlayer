@@ -52,6 +52,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     public static final String EXTRA_HARDWARE_DECODE = "com.example.motro.extra.HARDWARE_DECODE";
     public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
     public static final String EXTRA_LATENCY_MODE = "com.example.motro.extra.LATENCY_MODE";
+    public static final String EXTRA_RENDER_MODE = "com.example.motro.extra.RENDER_MODE";
 
     private ActivityMediaPlayerBinding binding;
     private ViewMediaPlayerControlsBinding controlsBinding;
@@ -100,6 +101,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private float thermalWhitePoint = 1.0f;
     private boolean thermalUiUpdating;
     private volatile String currentRenderMode = "";
+    private String intentRenderMode = "";
 
     private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
         mainHandler.post(() -> {
@@ -155,6 +157,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
+        intentRenderMode = getIntent().getStringExtra(EXTRA_RENDER_MODE);
         controlsBinding.thermalEnabledSwitch.setChecked(false);
         controlsBinding.thermalPaletteRadioGroup.check(R.id.thermalWhiteHotRadio);
         controlsBinding.thermalAgcSwitch.setChecked(false);
@@ -728,8 +731,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
             currentRenderMode = mode;
             updateThermalControlsEnabledState();
 
+            boolean hardwareSurfaceMode = "mediacodec_surface".equals(mode) || "mediacodec_oes".equals(mode);
             String thermalDisplay;
-            if ("mediacodec_surface".equals(mode)) {
+            if (hardwareSurfaceMode) {
                 thermalDisplay = "Thermal: UNAVAILABLE | " + mode;
             } else {
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
@@ -737,6 +741,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
                         + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US);
+            }
+
+            String oesLine = "";
+            if ("mediacodec_oes".equals(mode)) {
+                long oesAvailable = stats.optLong("oesFrameAvailableCount", 0);
+                long oesRendered = stats.optLong("oesFrameRenderedCount", 0);
+                oesLine = "\nOES available=" + oesAvailable
+                        + " rendered=" + oesRendered;
             }
 
             playbackInfoTextView.setText(
@@ -762,7 +774,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
                             + "\n" + thermalDisplay
-                            + ("mediacodec_surface".equals(mode) ? "" : "\nWindow "
+                            + oesLine
+                            + (hardwareSurfaceMode ? "" : "\nWindow "
                                     + String.format(Locale.US, "%.2f", windowBlack)
                                     + " - " + String.format(Locale.US, "%.2f", windowWhite)
                                     + " | Range " + frameColorRange));
@@ -899,11 +912,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle == 0) {
             return jsonError("player handle is 0");
         }
-        boolean hardwareDecode = hardwareDecodeSwitch.isChecked();
+        boolean hardwareDecode = "mediacodec_oes".equals(intentRenderMode) || hardwareDecodeSwitch.isChecked();
         String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
         // setHardwareDecode(false) may reset software render mode to software_rgba,
         // so apply the explicit render mode afterwards.
-        String renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
+        String renderMode;
+        if ("mediacodec_oes".equals(intentRenderMode)) {
+            renderMode = "mediacodec_oes";
+        } else {
+            renderMode = hardwareDecode ? "mediacodec_surface" : "software_yuv_gl";
+        }
         String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
         currentRenderMode = renderMode;
         return "hardwareDecode=" + decodeResult

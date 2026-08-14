@@ -15,6 +15,7 @@ add_library(native-ffmpeg SHARED
         native/NativePlayer.cpp
         native/VideoRenderer.cpp
         native/NativeYuvGlRenderer.cpp
+        native/NativeOesRenderer.cpp
         native/PlayerOptions.cpp
         native/PlayerRemuxRecorder.cpp
         native/SnapshotManager.cpp

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "native/NativePlayer.h"
+#include "native/NativeOesRenderer.h"
 #include "native/PlayerOptions.h"
 
 extern "C" {
@@ -757,6 +758,14 @@ jstring nativeSetThermalWindow(JNIEnv *env, jclass, jlong handle, jfloat blackPo
     return toJString(env, player->setThermalWindow(blackPoint, whitePoint));
 }
 
+void nativeNotifyOesFrameAvailable(JNIEnv *, jclass, jlong handle) {
+    std::string error;
+    NativePlayer *player = getPlayer(handle, error);
+    if (player != nullptr) {
+        player->notifyOesFrameAvailable();
+    }
+}
+
 jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
     if (handle == 0) {
         return toJString(env, jsonError(-1, "player handle is 0"));
@@ -822,6 +831,7 @@ bool registerNativeMethods(JNIEnv *env) {
             {"setThermalAgcEnabled", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalAgcEnabled)},
             {"setThermalGamma", "(JF)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalGamma)},
             {"setThermalWindow", "(JFF)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalWindow)},
+            {"nativeNotifyOesFrameAvailable", "(J)V", reinterpret_cast<void *>(nativeNotifyOesFrameAvailable)},
             {"getPlayerLatencyConfig", "(J)Ljava/lang/String;", reinterpret_cast<void *>(nativeGetPlayerLatencyConfig)},
             {"startPlayerRecord", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerRecord)},
             {"startPlayerSegmentRecord", "(JLjava/lang/String;I)Ljava/lang/String;", reinterpret_cast<void *>(nativeStartPlayerSegmentRecord)},
@@ -853,6 +863,17 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
 
     avformat_network_init();
     NativePlayer::setJavaVm(vm);
+    NativeOesRenderer::setJavaVm(vm);
+    jclass oesListenerClass = env->FindClass("com/example/motro/ffmpeg/FFmpegNative$OesFrameListener");
+    if (oesListenerClass == nullptr) {
+        LOGE("JNI_OnLoad OesFrameListener class not found");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    } else {
+        NativeOesRenderer::setFrameListenerClass(env, oesListenerClass);
+        env->DeleteLocalRef(oesListenerClass);
+    }
     const int setJavaVmResult = av_jni_set_java_vm(vm, nullptr);
     g_jni_initialized = setJavaVmResult >= 0;
     if (g_jni_initialized) {

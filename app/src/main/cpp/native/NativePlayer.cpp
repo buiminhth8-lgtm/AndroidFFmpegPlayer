@@ -1261,6 +1261,9 @@ std::string NativePlayer::getStats() {
         << "\"softwareRenderedFrameCount\":" << softwareRenderedFrameCount_.load() << ","
         << "\"yuvGlRenderedFrameCount\":" << yuvGlRenderedFrameCount_.load() << ","
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
+        << "\"renderInputType\":\"" << videoRenderInputTypeName(videoRenderInputType(optionsSnapshot.renderMode)) << "\","
+        << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
+        << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
         << "\"swsScaleEnabled\":" << (swsScaleEnabled ? "true" : "false") << ","
         << "\"snapshotSupported\":" << (snapshotSupported ? "true" : "false") << ","
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
@@ -1723,7 +1726,12 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
 
     RenderMode parsedMode;
     if (!parseRenderMode(mode, parsedMode)) {
-        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface");
+        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes");
+    }
+    if (parsedMode == RenderMode::MEDIACODEC_OES) {
+        // Phase 2 Slice 0: only the architecture entry exists; OES rendering is not implemented yet.
+        // Reject explicitly without changing the current effective render mode or disturbing playback.
+        return jsonError(-1, "mediacodec_oes is not ready in Phase 2 Slice 0; current render mode unchanged");
     }
 
     PlayerOptions optionsSnapshot;

@@ -686,6 +686,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long reconnectAttempt = stats.optLong("reconnectAttempt", stats.optLong("reconnectAttemptCount", 0));
             String reconnectError = stats.optString("reconnectLastError", stats.optString("lastReconnectError", ""));
             String mode = stats.optString("renderMode", "unknown");
+            String renderInputType = stats.optString("renderInputType", "none");
             String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
             String frameFormat = stats.optString("frameFormat", "");
             long dropped = stats.optLong("droppedVideoFrameCount", 0);
@@ -741,6 +742,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | " + mode
+                            + " | " + renderInputType
                             + " | " + codec
                             + "\n" + resolution
                             + " | " + frameFormat

@@ -221,6 +221,8 @@ private:
     std::atomic<int64_t> softwareRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
+    std::atomic<int64_t> oesFrameAvailableCount_{0};
+    std::atomic<int64_t> oesFrameRenderedCount_{0};
     std::atomic<int64_t> whiteHotRenderedFrameCount_{0};
     std::atomic<int64_t> ironbowRenderedFrameCount_{0};
     std::atomic<int> lastThermalRenderMode_{0};

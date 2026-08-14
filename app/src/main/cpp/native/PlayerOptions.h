@@ -36,7 +36,16 @@ enum class SourceType {
 enum class RenderMode {
     SOFTWARE_RGBA,
     SOFTWARE_YUV_GL,
-    MEDIACODEC_SURFACE
+    MEDIACODEC_SURFACE,
+    MEDIACODEC_OES
+};
+
+// What kind of input the active render path consumes.
+enum class VideoRenderInputType {
+    NONE,
+    YUV_PLANES,
+    DIRECT_SURFACE,
+    EXTERNAL_OES
 };
 
 struct PlayerOptions {
@@ -96,6 +105,8 @@ std::string syncMasterName(SyncMaster syncMaster);
 std::string sourceTypeName(SourceType sourceType);
 std::string renderModeName(RenderMode renderMode);
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto);
+VideoRenderInputType videoRenderInputType(RenderMode renderMode);
+const char *videoRenderInputTypeName(VideoRenderInputType type);
 
 bool parseRtspTransport(const std::string &value, RtspTransport &transport);
 bool parseLatencyMode(const std::string &value, LatencyMode &mode);

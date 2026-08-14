@@ -187,8 +187,31 @@ std::string renderModeName(RenderMode renderMode) {
         case RenderMode::SOFTWARE_RGBA: return "software_rgba";
         case RenderMode::SOFTWARE_YUV_GL: return "software_yuv_gl";
         case RenderMode::MEDIACODEC_SURFACE: return "mediacodec_surface";
+        case RenderMode::MEDIACODEC_OES: return "mediacodec_oes";
     }
     return "software_rgba";
+}
+
+VideoRenderInputType videoRenderInputType(RenderMode renderMode) {
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA:
+        case RenderMode::SOFTWARE_YUV_GL:
+            return VideoRenderInputType::YUV_PLANES;
+        case RenderMode::MEDIACODEC_SURFACE:
+            return VideoRenderInputType::DIRECT_SURFACE;
+        case RenderMode::MEDIACODEC_OES:
+            return VideoRenderInputType::EXTERNAL_OES;
+    }
+    return VideoRenderInputType::NONE;
+}
+
+const char *videoRenderInputTypeName(VideoRenderInputType type) {
+    switch (type) {
+        case VideoRenderInputType::YUV_PLANES: return "yuv_planes";
+        case VideoRenderInputType::DIRECT_SURFACE: return "direct_surface";
+        case VideoRenderInputType::EXTERNAL_OES: return "external_oes";
+        default: return "none";
+    }
 }
 
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto) {
@@ -269,6 +292,10 @@ bool parseRenderMode(const std::string &value, RenderMode &renderMode) {
     }
     if (normalized == "mediacodec_surface" || normalized == "mediacodec" || normalized == "surface") {
         renderMode = RenderMode::MEDIACODEC_SURFACE;
+        return true;
+    }
+    if (normalized == "mediacodec_oes" || normalized == "media_oes" || normalized == "oes") {
+        renderMode = RenderMode::MEDIACODEC_OES;
         return true;
     }
     return false;
@@ -442,7 +469,11 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
     if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
         RenderMode renderMode;
         if (!parseRenderMode(value, renderMode)) {
-            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface";
+            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes";
+            return false;
+        }
+        if (renderMode == RenderMode::MEDIACODEC_OES) {
+            errorMessage = "mediacodec_oes is not ready in Phase 2 Slice 0; render mode unchanged";
             return false;
         }
         options.renderMode = renderMode;

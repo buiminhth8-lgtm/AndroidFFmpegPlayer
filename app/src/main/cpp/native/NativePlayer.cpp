@@ -1268,6 +1268,23 @@ std::string NativePlayer::getStats() {
                                      && !optionsSnapshot.usingHardwareDecoder);
     const bool snapshotSupported = swsScaleEnabled;
 
+    std::string effectiveThermalRenderMode;
+    std::string thermalInputType;
+    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES) {
+        switch (lastOesThermalRenderMode_.load()) {
+            case 1: effectiveThermalRenderMode = "white_hot"; break;
+            case 2: effectiveThermalRenderMode = "white_hot_fallback"; break;
+            default: effectiveThermalRenderMode = "normal"; break;
+        }
+        thermalInputType = "oes_luminance";
+    } else {
+        effectiveThermalRenderMode = thermalRenderModeName(lastThermalRenderMode_.load());
+        thermalInputType = (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL
+                            || optionsSnapshot.renderMode == RenderMode::SOFTWARE_RGBA)
+                           ? "yuv_planes"
+                           : "none";
+    }
+
     LOGI("getPlayerStats player=%p", this);
     std::ostringstream out;
     out << "{\"success\":true,"
@@ -1439,7 +1456,9 @@ std::string NativePlayer::getStats() {
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
         << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
         << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
-        << "\"thermalRenderMode\":\"" << thermalRenderModeName(lastThermalRenderMode_.load()) << "\","
+        << "\"thermalRenderMode\":\"" << effectiveThermalRenderMode << "\","
+        << "\"thermalInputType\":\"" << thermalInputType << "\","
+        << "\"oesThermalRenderedCount\":" << oesThermalRenderedCount_.load() << ","
         << "\"whiteHotRenderedFrameCount\":" << whiteHotRenderedFrameCount_.load() << ","
         << "\"ironbowRenderedFrameCount\":" << ironbowRenderedFrameCount_.load() << "}";
     return out.str();
@@ -2957,8 +2976,31 @@ void NativePlayer::renderOesPendingFrameIfReady() {
         oesFramePending_.store(true);
         return;
     }
-    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight)) {
+
+    const ThermalConfig thermal = getThermalConfig();
+    bool whiteHot = false;
+    int oesThermalMode = 0;  // normal / original
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            whiteHot = true;
+            oesThermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            // OES Ironbow not implemented yet: safe fallback to white hot.
+            whiteHot = true;
+            oesThermalMode = 2;
+            bool expected = false;
+            if (oesIronbowFallbackLogged_.compare_exchange_strong(expected, true)) {
+                LOGI("OES Ironbow is not implemented in Slice 3; using white hot fallback");
+            }
+        }
+    }
+    lastOesThermalRenderMode_.store(oesThermalMode);
+
+    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, whiteHot)) {
         oesFrameRenderedCount_.fetch_add(1);
+        if (whiteHot) {
+            oesThermalRenderedCount_.fetch_add(1);
+        }
         lastRenderTimeMs_.store(nowMs());
     } else {
         const int64_t fails = oesRenderFailCount_.fetch_add(1) + 1;
@@ -3357,6 +3399,9 @@ void NativePlayer::resetStats() {
     oesFrameAvailableCount_.store(0);
     oesFrameRenderedCount_.store(0);
     oesRenderFailCount_.store(0);
+    oesThermalRenderedCount_.store(0);
+    lastOesThermalRenderMode_.store(0);
+    oesIronbowFallbackLogged_.store(false);
     oesRenderer_.resetDiagnostics();
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);

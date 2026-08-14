@@ -540,10 +540,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private boolean isThermalSupported() {
         if (!TextUtils.isEmpty(currentRenderMode)) {
-            return "software_yuv_gl".equals(currentRenderMode);
+            // software_yuv_gl and mediacodec_oes support Phase 1 / OES white hot.
+            return "software_yuv_gl".equals(currentRenderMode)
+                    || "mediacodec_oes".equals(currentRenderMode);
         }
         // Player not established yet: use the pending decode-mode choice.
-        return !hardwareDecodeSwitch.isChecked();
+        return !hardwareDecodeSwitch.isChecked() || "mediacodec_oes".equals(intentRenderMode);
     }
 
     private void updateThermalControlsEnabledState() {
@@ -731,10 +733,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
             currentRenderMode = mode;
             updateThermalControlsEnabledState();
 
-            boolean hardwareSurfaceMode = "mediacodec_surface".equals(mode) || "mediacodec_oes".equals(mode);
+            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode);
+            boolean oesMode = "mediacodec_oes".equals(mode);
+            String thermalInputType = stats.optString("thermalInputType", "none");
             String thermalDisplay;
-            if (hardwareSurfaceMode) {
+            if (mediaCodecSurfaceMode) {
                 thermalDisplay = "Thermal: UNAVAILABLE | " + mode;
+            } else if (oesMode) {
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US)
+                        + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else {
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
                         + " | " + thermalPalette
@@ -775,7 +784,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
                             + "\n" + thermalDisplay
                             + oesLine
-                            + (hardwareSurfaceMode ? "" : "\nWindow "
+                            + (mediaCodecSurfaceMode || oesMode ? "" : "\nWindow "
                                     + String.format(Locale.US, "%.2f", windowBlack)
                                     + " - " + String.format(Locale.US, "%.2f", windowWhite)
                                     + " | Range " + frameColorRange));

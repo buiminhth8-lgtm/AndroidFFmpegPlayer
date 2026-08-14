@@ -38,7 +38,8 @@ public:
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
-    bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight);
+    // whiteHot selects the OES white-hot luminance program (false = original OES).
+    bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, bool whiteHot);
     void release();
     bool hasSurface() const;
     bool isPrepared() const;
@@ -66,6 +67,10 @@ private:
     GLint stMatrixLocation_ = -1;
     GLint positionLocation_ = -1;
     GLint texCoordLocation_ = -1;
+    GLuint whiteHotProgram_ = 0;
+    GLint whiteHotStMatrixLocation_ = -1;
+    GLint whiteHotPositionLocation_ = -1;
+    GLint whiteHotTexCoordLocation_ = -1;
     GLuint oesTexture_ = 0;
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;

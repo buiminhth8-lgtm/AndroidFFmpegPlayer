@@ -71,6 +71,19 @@ void main() {
 }
 )";
 
+const char *kOesWhiteHotFragmentShader = R"(
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+varying vec2 vTexCoord;
+uniform samplerExternalOES uTexture;
+void main() {
+    vec3 rgb = texture2D(uTexture, vTexCoord).rgb;
+    float intensity = dot(rgb, vec3(0.299, 0.587, 0.114));
+    intensity = clamp(intensity, 0.0, 1.0);
+    gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
+}
+)";
+
 GLuint compileShader(GLenum type, const char *source, std::string &errorMessage) {
     GLuint shader = glCreateShader(type);
     if (shader == 0) {
@@ -320,7 +333,7 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
     return true;
 }
 
-bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight) {
+bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, bool whiteHot) {
     if (env == nullptr || !prepared_.load()) {
         return false;
     }
@@ -399,8 +412,15 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glUseProgram(program_);
-    glUniformMatrix4fv(stMatrixLocation_, 1, GL_FALSE, transform);
+    // Select program: white hot (luminance) or original. If white hot is
+    // unavailable (compile/link failure), fall back to the original program.
+    GLuint program = whiteHot && whiteHotProgram_ != 0 ? whiteHotProgram_ : program_;
+    const GLint stMatrix = program == whiteHotProgram_ ? whiteHotStMatrixLocation_ : stMatrixLocation_;
+    const GLint positionLoc = program == whiteHotProgram_ ? whiteHotPositionLocation_ : positionLocation_;
+    const GLint texCoordLoc = program == whiteHotProgram_ ? whiteHotTexCoordLocation_ : texCoordLocation_;
+
+    glUseProgram(program);
+    glUniformMatrix4fv(stMatrix, 1, GL_FALSE, transform);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexture_);
@@ -418,13 +438,13 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
             1.0f, 1.0f, 0.0f, 1.0f
     };
 
-    glEnableVertexAttribArray(static_cast<GLuint>(positionLocation_));
-    glVertexAttribPointer(static_cast<GLuint>(positionLocation_), 2, GL_FLOAT, GL_FALSE, 0, vertices);
-    glEnableVertexAttribArray(static_cast<GLuint>(texCoordLocation_));
-    glVertexAttribPointer(static_cast<GLuint>(texCoordLocation_), 4, GL_FLOAT, GL_FALSE, 0, texCoords);
+    glEnableVertexAttribArray(static_cast<GLuint>(positionLoc));
+    glVertexAttribPointer(static_cast<GLuint>(positionLoc), 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glEnableVertexAttribArray(static_cast<GLuint>(texCoordLoc));
+    glVertexAttribPointer(static_cast<GLuint>(texCoordLoc), 4, GL_FLOAT, GL_FALSE, 0, texCoords);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray(static_cast<GLuint>(positionLocation_));
-    glDisableVertexAttribArray(static_cast<GLuint>(texCoordLocation_));
+    glDisableVertexAttribArray(static_cast<GLuint>(positionLoc));
+    glDisableVertexAttribArray(static_cast<GLuint>(texCoordLoc));
 
     GLenum glError = glGetError();
     if (glError != GL_NO_ERROR) {
@@ -604,6 +624,13 @@ void NativeOesRenderer::releaseGlLocked() {
         stMatrixLocation_ = -1;
         positionLocation_ = -1;
         texCoordLocation_ = -1;
+        if (whiteHotProgram_ != 0) {
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
+        }
+        whiteHotStMatrixLocation_ = -1;
+        whiteHotPositionLocation_ = -1;
+        whiteHotTexCoordLocation_ = -1;
         releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
@@ -655,10 +682,25 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
     program_ = linkProgram(vertexShader, fragmentShader, errorMessage);
-    glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     if (program_ == 0) {
+        glDeleteShader(vertexShader);
         return false;
+    }
+
+    std::string whiteHotError;
+    GLuint whiteHotFragmentShader = compileShader(GL_FRAGMENT_SHADER, kOesWhiteHotFragmentShader, whiteHotError);
+    whiteHotProgram_ = whiteHotFragmentShader == 0 ? 0 : linkProgram(vertexShader, whiteHotFragmentShader, whiteHotError);
+    glDeleteShader(vertexShader);
+    if (whiteHotFragmentShader != 0) {
+        glDeleteShader(whiteHotFragmentShader);
+    }
+    if (whiteHotProgram_ == 0) {
+        LOGE("OES white hot shader setup failed, fallback to original OES: %s", whiteHotError.c_str());
+        whiteHotProgram_ = 0;
+        whiteHotStMatrixLocation_ = -1;
+        whiteHotPositionLocation_ = -1;
+        whiteHotTexCoordLocation_ = -1;
     }
 
     glUseProgram(program_);
@@ -670,6 +712,25 @@ bool NativeOesRenderer::compileProgramLocked(std::string &errorMessage) {
         return false;
     }
     glUniform1i(glGetUniformLocation(program_, "uTexture"), 0);
+
+    if (whiteHotProgram_ != 0) {
+        glUseProgram(whiteHotProgram_);
+        whiteHotStMatrixLocation_ = glGetUniformLocation(whiteHotProgram_, "uSTMatrix");
+        whiteHotPositionLocation_ = glGetAttribLocation(whiteHotProgram_, "aPosition");
+        whiteHotTexCoordLocation_ = glGetAttribLocation(whiteHotProgram_, "aTexCoord");
+        if (whiteHotStMatrixLocation_ < 0 || whiteHotPositionLocation_ < 0 || whiteHotTexCoordLocation_ < 0) {
+            LOGE("OES white hot shader attribute/uniform not found, fallback to original OES");
+            glDeleteProgram(whiteHotProgram_);
+            whiteHotProgram_ = 0;
+            whiteHotStMatrixLocation_ = -1;
+            whiteHotPositionLocation_ = -1;
+            whiteHotTexCoordLocation_ = -1;
+        } else {
+            glUniform1i(glGetUniformLocation(whiteHotProgram_, "uTexture"), 0);
+        }
+        glUseProgram(program_);
+    }
+
     GLenum error = glGetError();
     if (error != GL_NO_ERROR) {
         std::ostringstream out;

@@ -188,6 +188,7 @@ std::string renderModeName(RenderMode renderMode) {
         case RenderMode::SOFTWARE_YUV_GL: return "software_yuv_gl";
         case RenderMode::MEDIACODEC_SURFACE: return "mediacodec_surface";
         case RenderMode::MEDIACODEC_OES: return "mediacodec_oes";
+        case RenderMode::MEDIACODEC_NV12_GL: return "mediacodec_nv12_gl";
     }
     return "software_rgba";
 }
@@ -296,6 +297,10 @@ bool parseRenderMode(const std::string &value, RenderMode &renderMode) {
     }
     if (normalized == "mediacodec_oes" || normalized == "media_oes" || normalized == "oes") {
         renderMode = RenderMode::MEDIACODEC_OES;
+        return true;
+    }
+    if (normalized == "mediacodec_nv12_gl" || normalized == "nv12_gl" || normalized == "media_nv12") {
+        renderMode = RenderMode::MEDIACODEC_NV12_GL;
         return true;
     }
     return false;
@@ -469,7 +474,11 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
     if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
         RenderMode renderMode;
         if (!parseRenderMode(value, renderMode)) {
-            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes";
+            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, mediacodec_oes, or mediacodec_nv12_gl";
+            return false;
+        }
+        if (renderMode == RenderMode::MEDIACODEC_NV12_GL) {
+            errorMessage = "mediacodec_nv12_gl is not ready in Revised Phase 2 Slice 0; render mode unchanged";
             return false;
         }
         options.renderMode = renderMode;

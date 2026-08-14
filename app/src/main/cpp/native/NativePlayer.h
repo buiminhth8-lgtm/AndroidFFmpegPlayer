@@ -5,6 +5,7 @@
 #include "PlayerOptions.h"
 #include "NativeYuvGlRenderer.h"
 #include "NativeOesRenderer.h"
+#include "NativeNv12GlRenderer.h"
 #include "ThermalConfig.h"
 #include "VideoRenderer.h"
 
@@ -136,6 +137,7 @@ private:
     VideoRenderer renderer_;
     NativeYuvGlRenderer yuvGlRenderer_;
     NativeOesRenderer oesRenderer_;
+    NativeNv12GlRenderer nv12GlRenderer_;
     std::atomic<bool> oesFramePending_{false};
     PlayerRemuxRecorder remuxRecorder_;
     std::thread playbackThread_;
@@ -250,6 +252,8 @@ private:
     std::atomic<int64_t> lastFrameCacheCandidateCount_{0};
     std::atomic<int> lastFrameYStride_{0};
     std::atomic<int> lastFrameColorRange_{0};  // AVCOL_RANGE_UNSPECIFIED == 0
+    std::atomic<int> lastFrameOutputType_{0};  // 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
+    std::atomic<int> lastRendererType_{0};     // 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};

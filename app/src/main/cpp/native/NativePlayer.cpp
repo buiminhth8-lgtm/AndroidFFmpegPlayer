@@ -158,6 +158,39 @@ const char *thermalRenderModeName(int mode) {
     }
 }
 
+// frame output type: 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
+const char *frameOutputTypeName(int type) {
+    switch (type) {
+        case 1: return "yuv420p_cpu";
+        case 2: return "nv12_cpu";
+        case 3: return "direct_surface";
+        case 4: return "external_oes";
+        default: return "unknown";
+    }
+}
+
+// renderer: 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
+const char *rendererTypeName(int type) {
+    switch (type) {
+        case 1: return "rgba_nativewindow";
+        case 2: return "yuv_gl";
+        case 3: return "nv12_gl";
+        case 4: return "oes_gl";
+        default: return "unknown";
+    }
+}
+
+// Renderer input described from the actual frame output type.
+const char *renderInputNameFromOutputType(int outputType) {
+    switch (outputType) {
+        case 1: return "yuv_planes";
+        case 2: return "nv12_cpu";
+        case 3: return "direct_surface";
+        case 4: return "external_oes";
+        default: return "unknown";
+    }
+}
+
 struct AgcResult {
     bool valid = false;
     float blackPoint = 0.0f;
@@ -431,6 +464,7 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
     const std::string rgbaResult = renderer_.setSurface(env, surface, width, height);
     const std::string glResult = yuvGlRenderer_.setSurface(env, surface, width, height);
     const std::string oesResult = oesRenderer_.setSurface(env, surface, width, height);
+    const std::string nv12GlResult = nv12GlRenderer_.setSurface(env, surface, width, height);
     if (rgbaResult.find("\"success\":true") == std::string::npos) {
         return rgbaResult;
     }
@@ -439,6 +473,9 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
     }
     if (oesResult.find("\"success\":true") == std::string::npos) {
         LOGE("setSurface OES renderer failed: %s", oesResult.c_str());
+    }
+    if (nv12GlResult.find("\"success\":true") == std::string::npos) {
+        LOGE("setSurface NV12 GL renderer failed: %s", nv12GlResult.c_str());
     }
     return rgbaResult;
 }
@@ -451,6 +488,7 @@ std::string NativePlayer::clearSurface() {
     renderer_.release();
     yuvGlRenderer_.release();
     oesRenderer_.release();
+    nv12GlRenderer_.clearSurface();
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env == nullptr) {
@@ -1291,10 +1329,15 @@ std::string NativePlayer::getStats() {
     const int64_t avgRenderCostUs = averageUs(totalRenderCostUs_.load(), renderCostSampleCount_.load());
     const int64_t avgFrameProcessCostUs = averageUs(totalFrameProcessCostUs_.load(), frameProcessCostSampleCount_.load());
     const int64_t avgVideoDelayUs = averageUs(totalVideoDelayUs_.load(), videoDelaySampleCount_.load());
-    const bool swsScaleEnabled = optionsSnapshot.renderMode == RenderMode::SOFTWARE_RGBA
-                                 || (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
-                                     && !optionsSnapshot.usingHardwareDecoder);
+    const int frameOutputType = lastFrameOutputType_.load();
+    const int rendererType = lastRendererType_.load();
+    // sws_scale -> RGBA is the renderer actually in use for rgba_nativewindow frames.
+    const bool swsScaleEnabled = rendererType == 1;
     const bool snapshotSupported = swsScaleEnabled;
+    const std::string decodeBackend = optionsSnapshot.usingHardwareDecoder ? "mediacodec" : "software";
+    const char *frameOutputTypeValue = frameOutputTypeName(frameOutputType);
+    const char *rendererValue = rendererTypeName(rendererType);
+    const char *renderInputValue = renderInputNameFromOutputType(frameOutputType);
 
     std::string effectiveThermalRenderMode;
     std::string thermalInputType;
@@ -1337,6 +1380,9 @@ std::string NativePlayer::getStats() {
         << "\"frameFormat\":\"" << escapeJson(frameFormatName.empty() ? (swsScaleEnabled ? "unknown" : "mediacodec") : frameFormatName) << "\","
         << "\"enableHardwareDecode\":" << (optionsSnapshot.enableHardwareDecode ? "true" : "false") << ","
         << "\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\","
+        << "\"decodeBackend\":\"" << decodeBackend << "\","
+        << "\"frameOutputType\":\"" << frameOutputTypeValue << "\","
+        << "\"renderer\":\"" << rendererValue << "\","
         << "\"hardwareDecodeAllowFallback\":" << (optionsSnapshot.hardwareDecodeAllowFallback ? "true" : "false") << ","
         << "\"requestedDecoderName\":\"" << escapeJson(optionsSnapshot.requestedDecoderName) << "\","
         << "\"actualDecoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
@@ -1350,7 +1396,7 @@ std::string NativePlayer::getStats() {
         << "\"softwareRenderedFrameCount\":" << softwareRenderedFrameCount_.load() << ","
         << "\"yuvGlRenderedFrameCount\":" << yuvGlRenderedFrameCount_.load() << ","
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
-        << "\"renderInputType\":\"" << videoRenderInputTypeName(videoRenderInputType(optionsSnapshot.renderMode)) << "\","
+        << "\"renderInputType\":\"" << renderInputValue << "\","
         << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
         << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
         << "\"oesUpdateTexImageErrorCount\":" << oesRenderer_.getUpdateTexImageErrorCount() << ","
@@ -1822,7 +1868,13 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
 
     RenderMode parsedMode;
     if (!parseRenderMode(mode, parsedMode)) {
-        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, or mediacodec_oes");
+        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, mediacodec_oes, or mediacodec_nv12_gl");
+    }
+    if (parsedMode == RenderMode::MEDIACODEC_NV12_GL) {
+        // Revised Phase 2 Slice 0: only the architecture entry exists; NV12 GL
+        // rendering is not implemented yet. Reject without changing the current
+        // effective render mode or disturbing playback.
+        return jsonError(-1, "mediacodec_nv12_gl is not ready in Revised Phase 2 Slice 0; current render mode unchanged");
     }
 
     PlayerOptions optionsSnapshot;
@@ -2131,6 +2183,7 @@ std::string NativePlayer::release() {
     clearLastFrame();
     releaseFfmpegResources();
     oesRenderer_.release();
+    nv12GlRenderer_.release();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -3042,6 +3095,7 @@ void NativePlayer::renderOesPendingFrameIfReady() {
                                     thermal.gamma, thermal.blackPoint, thermal.whitePoint,
                                     agcEnabled, runAgc)) {
         oesFrameRenderedCount_.fetch_add(1);
+        lastRendererType_.store(4);  // oes_gl
         if (oesThermalMode != 0) {
             oesThermalRenderedCount_.fetch_add(1);
         }
@@ -3064,6 +3118,7 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
     }
 
     hardwareDecodedFrameCount_.fetch_add(1);
+    lastFrameOutputType_.store(3);  // direct_surface
     lastSwsScaleCostUs_.store(-1);
     lastRenderLockCostUs_.store(-1);
     lastRenderCopyCostUs_.store(-1);
@@ -3223,6 +3278,7 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
     softwareRenderedFrameCount_.fetch_add(1);
     const int64_t yuvGlRendered = yuvGlRenderedFrameCount_.fetch_add(1) + 1;
+    lastRendererType_.store(2);  // yuv_gl
     if (thermalMode == 1) {
         whiteHotRenderedFrameCount_.fetch_add(1);
     } else if (thermalMode == 2) {
@@ -3267,11 +3323,25 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         return renderMediaCodecFrame(frame, ptsUs);
     }
 
-    softwareDecodedFrameCount_.fetch_add(1);
     const char *formatName = av_get_pix_fmt_name(sourceFormat);
+    bool hardwareBackend = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastFrameFormatName_ = formatName == nullptr ? "unknown" : formatName;
+        // The decoder backend, not the requested render mode, decides the counter.
+        hardwareBackend = playerOptions_.usingHardwareDecoder;
+    }
+    if (sourceFormat == AV_PIX_FMT_NV12) {
+        lastFrameOutputType_.store(2);
+    } else if (sourceFormat == AV_PIX_FMT_YUV420P || sourceFormat == AV_PIX_FMT_YUVJ420P) {
+        lastFrameOutputType_.store(1);
+    } else {
+        lastFrameOutputType_.store(0);
+    }
+    if (hardwareBackend) {
+        hardwareDecodedFrameCount_.fetch_add(1);
+    } else {
+        softwareDecodedFrameCount_.fetch_add(1);
     }
     if (shouldDropRealtimeFrame(ptsUs)) {
         return true;
@@ -3363,6 +3433,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     }
     const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
     softwareRenderedFrameCount_.fetch_add(1);
+    lastRendererType_.store(1);  // rgba_nativewindow
     if (renderedFrames == 1 || renderedFrames % 100 == 0) {
         LOGI("render success count=%lld width=%d height=%d rgbaLineSize=%d ptsUs=%lld",
              static_cast<long long>(renderedFrames), frameWidth, frameHeight,
@@ -3440,6 +3511,10 @@ void NativePlayer::resetStats() {
     softwareRenderedFrameCount_.store(0);
     yuvGlRenderedFrameCount_.store(0);
     yuvGlFallbackFrameCount_.store(0);
+    lastFrameYStride_.store(0);
+    lastFrameColorRange_.store(0);
+    lastFrameOutputType_.store(0);
+    lastRendererType_.store(0);
     oesFrameAvailableCount_.store(0);
     oesFrameRenderedCount_.store(0);
     oesRenderFailCount_.store(0);

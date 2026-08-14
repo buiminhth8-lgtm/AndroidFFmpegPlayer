@@ -702,6 +702,16 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
 
         if (useHardware) {
             LOGI("try hardware decoder name=%s", decoderName(decoder).c_str());
+            bool hwAttached = false;
+            JNIEnv *hwEnv = getJniEnvForCurrentThread(hwAttached);
+            const bool displaySurfaceValid = surfaceGlobalRef_ != nullptr
+                                             && (hwEnv == nullptr || !hwEnv->IsSameObject(surfaceGlobalRef_, nullptr));
+            LOGI("[HWCFG] begin decoder=%s renderMode=%s enableHardwareDecode=%d jniEnv=%s displaySurface=%s pixFmt=%d colorRange=%d colorSpace=%d",
+                 decoderName(decoder).c_str(), renderModeName(optionsSnapshot.renderMode).c_str(),
+                 optionsSnapshot.enableHardwareDecode ? 1 : 0,
+                 hwEnv ? "ok" : "null", displaySurfaceValid ? "valid" : "null",
+                 videoCodecContext_->pix_fmt, videoCodecContext_->color_range,
+                 videoCodecContext_->colorspace);
             AVMediaCodecContext *mediaCodecCtx = av_mediacodec_alloc_context();
             if (mediaCodecCtx == nullptr) {
                 openError = "av_mediacodec_alloc_context failed";
@@ -728,6 +738,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                     }
                 }
                 jobject decoderSurface = oesRenderer_.getDecoderSurfaceGlobalRef();
+                LOGI("[HWCFG] decoderSurfaceType=oes decoderSurface=%s",
+                     decoderSurface ? "valid" : "null");
                 if (decoderSurface == nullptr) {
                     openError = "mediacodec_oes decoder Surface is null";
                     LOGE("%s", openError.c_str());
@@ -746,6 +758,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 }
                 openResult = av_mediacodec_default_init(videoCodecContext_, mediaCodecCtx, surfaceGlobalRef_);
             }
+            LOGI("[HWCFG] mediaCodecContext=%s surfaceInjected=%s beforeAvcodecOpen2=yes",
+                 mediaCodecCtx ? "created" : "null", openResult == 0 ? "yes" : "no");
+            detachCurrentThreadIfNeeded(hwAttached);
             if (openResult < 0) {
                 openError = "MediaCodec surface init failed: " + ffmpegErrorToString(openResult);
                 LOGE("MediaCodec surface init failed ret=%d", openResult);
@@ -758,6 +773,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         }
 
         openResult = avcodec_open2(videoCodecContext_, decoder, nullptr);
+        LOGI("[HWCFG] avcodecOpen2=%s decoder=%s", openResult < 0 ? "error" : "success",
+             decoderName(decoder).c_str());
         if (openResult < 0) {
             openError = ffmpegErrorToString(openResult);
             if (useHardware) {
@@ -844,6 +861,14 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         lastRenderLockCostUs_.store(-1);
         lastRenderCopyCostUs_.store(-1);
         lastRenderPostCostUs_.store(-1);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        LOGI("[HWCFG] fallback=%s actualDecoder=%s actualRenderMode=%s usingHardware=%d",
+             fallbackUsed ? "yes" : "no",
+             playerOptions_.actualDecoderName.c_str(),
+             renderModeName(playerOptions_.renderMode).c_str(),
+             playerOptions_.usingHardwareDecoder ? 1 : 0);
     }
 
     packet_ = av_packet_alloc();

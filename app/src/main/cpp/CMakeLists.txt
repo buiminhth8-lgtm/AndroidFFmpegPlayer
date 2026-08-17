@@ -15,9 +15,13 @@ add_library(native-ffmpeg SHARED
         native/NativePlayer.cpp
         native/VideoRenderer.cpp
         native/NativeYuvGlRenderer.cpp
+        native/NativeOesRenderer.cpp
+        native/NativeNv12GlRenderer.cpp
         native/PlayerOptions.cpp
         native/PlayerRemuxRecorder.cpp
-        native/SnapshotManager.cpp)
+        native/SnapshotManager.cpp
+        native/ThermalConfig.cpp
+        native/ThermalPaletteLut.cpp)
 
 add_library(avutil SHARED IMPORTED)
 set_target_properties(avutil PROPERTIES

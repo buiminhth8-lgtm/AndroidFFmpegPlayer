@@ -4,6 +4,9 @@
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
 #include "NativeYuvGlRenderer.h"
+#include "NativeOesRenderer.h"
+#include "NativeNv12GlRenderer.h"
+#include "ThermalConfig.h"
 #include "VideoRenderer.h"
 
 #include <jni.h>
@@ -66,6 +69,13 @@ public:
     std::string setOption(const std::string &key, const std::string &value);
     std::string setHardwareDecode(bool enabled);
     std::string setHardwareRenderMode(const std::string &mode);
+    std::string setThermalEnabled(bool enabled);
+    std::string setThermalPalette(int palette);
+    std::string setThermalAgcEnabled(bool enabled);
+    std::string setThermalGamma(float gamma);
+    std::string setThermalWindow(float blackPoint, float whitePoint);
+    ThermalConfig getThermalConfig() const;
+    void notifyOesFrameAvailable();
     std::string getLatencyConfig();
     std::string takeSnapshot(const std::string &outputPath);
     std::string startRecord(const std::string &outputPath);
@@ -98,8 +108,11 @@ private:
     void finishStartupKeyFrameWait(const char *reason);
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
-    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight);
+    void renderOesPendingFrameIfReady();
     bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
+    void updateAgcState(AVFrame *frame, const ThermalConfig &thermal);
     bool shouldDropRealtimePacket(const AVPacket *packet);
     bool shouldDropRealtimeFrame(int64_t ptsUs);
     bool resolveMasterClockUs(const PlayerOptions &options, int64_t videoPtsUs, int64_t &masterClockUs, SyncMaster &effectiveMaster);
@@ -120,8 +133,13 @@ private:
     mutable std::mutex mutex_;
     mutable std::mutex surfaceMutex_;
     mutable std::mutex eventListenerMutex_;
+    mutable std::mutex thermalConfigMutex_;
+    ThermalConfig thermalConfig_;
     VideoRenderer renderer_;
     NativeYuvGlRenderer yuvGlRenderer_;
+    NativeOesRenderer oesRenderer_;
+    NativeNv12GlRenderer nv12GlRenderer_;
+    std::atomic<bool> oesFramePending_{false};
     PlayerRemuxRecorder remuxRecorder_;
     std::thread playbackThread_;
     std::atomic<bool> stopRequested_{false};
@@ -144,7 +162,6 @@ private:
     bool dropUntilKeyFrame_ = false;
     bool startupKeyFrameWait_ = false;
     int64_t startupKeyFrameWaitStartMs_ = 0;
-    int64_t maxRealtimeLatencyUs_ = 250000;
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
     std::atomic<bool> transportSwitchRequested_{false};
@@ -211,6 +228,40 @@ private:
     std::atomic<int64_t> softwareRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12GlRenderedFrameCount_{0};
+    std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12ThermalRenderedCount_{0};
+    std::atomic<int> lastNv12ThermalRenderMode_{0};
+    std::atomic<bool> nv12AgcValid_{false};
+    std::atomic<float> nv12AgcBlackPoint_{0.0f};
+    std::atomic<float> nv12AgcWhitePoint_{1.0f};
+    std::atomic<int64_t> nv12AgcUpdateCount_{0};
+    std::atomic<int64_t> nv12AgcInvalidCount_{0};
+    std::atomic<int> nv12AgcFrameCounter_{0};
+    std::atomic<int> nv12AgcLastFrameWidth_{0};
+    std::atomic<int> nv12AgcLastFrameHeight_{0};
+    std::atomic<int64_t> nv12GlLastRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlTotalRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlRenderCostSampleCount_{0};
+    std::atomic<int64_t> nv12GlMaxRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlLastUploadCostUs_{0};
+    std::atomic<int64_t> nv12GlTotalUploadCostUs_{0};
+    std::atomic<int64_t> nv12GlUploadCostSampleCount_{0};
+    std::atomic<int64_t> nv12GlMaxUploadCostUs_{0};
+    std::atomic<int64_t> oesFrameAvailableCount_{0};
+    std::atomic<int64_t> oesFrameRenderedCount_{0};
+    std::atomic<int64_t> oesRenderFailCount_{0};
+    std::atomic<int64_t> oesThermalRenderedCount_{0};
+    std::atomic<int> lastOesThermalRenderMode_{0};
+    std::atomic<int> oesAgcFrameCounter_{0};
+    std::atomic<int64_t> whiteHotRenderedFrameCount_{0};
+    std::atomic<int64_t> ironbowRenderedFrameCount_{0};
+    std::atomic<int> lastThermalRenderMode_{0};
+    std::atomic<bool> agcValid_{false};
+    std::atomic<float> agcBlackPoint_{0.0f};
+    std::atomic<float> agcWhitePoint_{1.0f};
+    std::atomic<int64_t> agcUpdateCount_{0};
+    std::atomic<int> agcFrameCounter_{0};
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};
@@ -219,6 +270,11 @@ private:
     std::atomic<int64_t> lastFrameCacheUpdateCount_{0};
     std::atomic<int64_t> lastFrameCacheSkippedCount_{0};
     std::atomic<int64_t> lastFrameCacheCandidateCount_{0};
+    std::atomic<int> lastFrameYStride_{0};
+    std::atomic<int> lastFrameColorRange_{0};  // AVCOL_RANGE_UNSPECIFIED == 0
+    std::atomic<int> lastFrameOutputType_{0};  // 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
+    std::atomic<int> lastRendererType_{0};     // 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
+    std::atomic<int> renderFallbackReasonCode_{0};  // 0 none, 1 nv12_gl_failed, 2 yuv_gl_failed
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};

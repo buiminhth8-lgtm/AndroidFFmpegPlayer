@@ -187,6 +187,8 @@ std::string renderModeName(RenderMode renderMode) {
         case RenderMode::SOFTWARE_RGBA: return "software_rgba";
         case RenderMode::SOFTWARE_YUV_GL: return "software_yuv_gl";
         case RenderMode::MEDIACODEC_SURFACE: return "mediacodec_surface";
+        case RenderMode::MEDIACODEC_OES: return "mediacodec_oes";
+        case RenderMode::MEDIACODEC_NV12_GL: return "mediacodec_nv12_gl";
     }
     return "software_rgba";
 }
@@ -269,6 +271,14 @@ bool parseRenderMode(const std::string &value, RenderMode &renderMode) {
     }
     if (normalized == "mediacodec_surface" || normalized == "mediacodec" || normalized == "surface") {
         renderMode = RenderMode::MEDIACODEC_SURFACE;
+        return true;
+    }
+    if (normalized == "mediacodec_oes" || normalized == "media_oes" || normalized == "oes") {
+        renderMode = RenderMode::MEDIACODEC_OES;
+        return true;
+    }
+    if (normalized == "mediacodec_nv12_gl" || normalized == "nv12_gl" || normalized == "media_nv12") {
+        renderMode = RenderMode::MEDIACODEC_NV12_GL;
         return true;
     }
     return false;
@@ -442,8 +452,11 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
     if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
         RenderMode renderMode;
         if (!parseRenderMode(value, renderMode)) {
-            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface";
+            errorMessage = "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, mediacodec_oes, or mediacodec_nv12_gl";
             return false;
+        }
+        if (renderMode == RenderMode::MEDIACODEC_NV12_GL) {
+            // NV12 GL renders CPU-visible NV12 AVFrames on the hardware mainline.
         }
         options.renderMode = renderMode;
         if (renderMode != RenderMode::MEDIACODEC_SURFACE) {
@@ -740,11 +753,13 @@ std::string latencyReportHelpJson() {
 
 std::string hardwareDecodeHelpJson() {
     return "{\"success\":true,"
-           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_surface\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_surface\","
+           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_nv12_gl\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_nv12_gl\","
            "\"software_rgba\":\"FFmpeg software decode, sws_scale to RGBA, ANativeWindow RGBA copy, native snapshot supported\","
            "\"software_yuv_gl\":\"FFmpeg software decode, render YUV420P/YUVJ420P frames with OpenGL ES shader, fallback to software_rgba for unsupported formats\","
-           "\"mediacodec_surface\":\"FFmpeg h264_mediacodec/hevc_mediacodec decode directly to Surface; no sws_scale and no RGBA memcpy\","
-           "\"snapshot\":\"native RGBA snapshot is not supported in mediacodec_surface or software_yuv_gl mode; the Java demo can use PixelCopy\","
+           "\"mediacodec_nv12_gl\":\"default hardware path: FFmpeg MediaCodec CPU NV12 output rendered by NativeNv12GlRenderer without sws_scale or RGBA conversion\","
+           "\"mediacodec_surface\":\"legacy direct-Surface compatibility mode\","
+           "\"mediacodec_oes\":\"experimental future zero-copy path; not the default\","
+           "\"snapshot\":\"native RGBA snapshot is not supported in GL or direct-Surface modes; the Java demo can use PixelCopy\","
            "\"fallback\":\"hardware decoder missing, MediaCodec surface init failure, or avcodec_open2 failure falls back to software decode when hardwareDecodeAllowFallback is true\","
            "\"hevc\":\"for low-latency HEVC preview, test RTSP UDP + ultra_low_latency + hevc_mediacodec first\","
            "\"compatibility\":\"if MediaCodec compatibility is poor on a device, disable enableHardwareDecode and use software_rgba\"}";

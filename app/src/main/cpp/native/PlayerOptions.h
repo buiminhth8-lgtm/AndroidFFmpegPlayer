@@ -36,7 +36,9 @@ enum class SourceType {
 enum class RenderMode {
     SOFTWARE_RGBA,
     SOFTWARE_YUV_GL,
-    MEDIACODEC_SURFACE
+    MEDIACODEC_SURFACE,
+    MEDIACODEC_OES,
+    MEDIACODEC_NV12_GL
 };
 
 struct PlayerOptions {

@@ -1,0 +1,473 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_control_panel"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Player Controls"
+            android:textColor="#FFFFFFFF"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <ImageButton
+            android:id="@+id/controlPanelCloseButton"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="@drawable/bg_control_toggle"
+            android:contentDescription="Close controls"
+            android:padding="8dp"
+            android:src="@drawable/ic_close" />
+    </LinearLayout>
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="SOURCE" />
+
+            <EditText
+                android:id="@+id/urlEditText"
+                style="@style/ControlEditText"
+                android:hint="rtsp:// or http(s):// test url"
+                android:inputType="textUri"
+                android:singleLine="true" />
+
+            <EditText
+                android:id="@+id/timeoutEditText"
+                style="@style/ControlEditText"
+                android:hint="timeoutMs"
+                android:inputType="number"
+                android:singleLine="true" />
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="RTSP TRANSPORT" />
+
+            <RadioGroup
+                android:id="@+id/transportRadioGroup"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/tcpTransportRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="TCP" />
+
+                <RadioButton
+                    android:id="@+id/udpTransportRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="UDP" />
+
+                <RadioButton
+                    android:id="@+id/autoTransportRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Auto" />
+            </RadioGroup>
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="LATENCY" />
+
+            <RadioGroup
+                android:id="@+id/latencyModeRadioGroup"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/lowLatencyUltraRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Ultra Low" />
+
+                <RadioButton
+                    android:id="@+id/lowLatencyRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Low" />
+
+                <RadioButton
+                    android:id="@+id/balancedLatencyRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="Balanced" />
+
+                <RadioButton
+                    android:id="@+id/stableLatencyRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Stable" />
+            </RadioGroup>
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="PLAYER OPTIONS" />
+
+            <Switch
+                android:id="@+id/audioSwitch"
+                style="@style/ControlSwitch"
+                android:text="Audio" />
+
+            <Switch
+                android:id="@+id/reconnectSwitch"
+                style="@style/ControlSwitch"
+                android:text="Reconnect" />
+
+            <Switch
+                android:id="@+id/hardwareDecodeSwitch"
+                style="@style/ControlSwitch"
+                android:text="Hardware Decode" />
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="THERMAL" />
+
+            <Switch
+                android:id="@+id/thermalEnabledSwitch"
+                style="@style/ControlSwitch"
+                android:text="Thermal" />
+
+            <RadioGroup
+                android:id="@+id/thermalPaletteRadioGroup"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/thermalWhiteHotRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="White Hot" />
+
+                <RadioButton
+                    android:id="@+id/thermalIronbowRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Ironbow" />
+            </RadioGroup>
+
+            <Switch
+                android:id="@+id/thermalAgcSwitch"
+                style="@style/ControlSwitch"
+                android:text="AGC" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Gamma"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/thermalGammaValueText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="1.00"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/thermalGammaSeekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="150"
+                android:progress="50" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Black"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/thermalBlackPointValueText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0.00"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/thermalBlackPointSeekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="0" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="White"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/thermalWhitePointValueText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="1.00"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <SeekBar
+                android:id="@+id/thermalWhitePointSeekBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="CONTROL" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/createButton"
+                    style="@style/ControlButton"
+                    android:text="Create" />
+
+                <Button
+                    android:id="@+id/prepareButton"
+                    style="@style/ControlButton"
+                    android:text="Prepare" />
+
+                <Button
+                    android:id="@+id/startButton"
+                    style="@style/ControlButton"
+                    android:text="Start" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/pauseButton"
+                    style="@style/ControlButton"
+                    android:text="Pause" />
+
+                <Button
+                    android:id="@+id/stopButton"
+                    style="@style/ControlButton"
+                    android:text="Stop" />
+
+                <Button
+                    android:id="@+id/releaseButton"
+                    style="@style/ControlButton"
+                    android:text="Release" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/clearSurfaceButton"
+                style="@style/ControlButton"
+                android:layout_width="match_parent"
+                android:text="Clear Surface" />
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="DEBUG" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/infoButton"
+                    style="@style/ControlButton"
+                    android:text="Info" />
+
+                <Button
+                    android:id="@+id/probeButton"
+                    style="@style/ControlButton"
+                    android:text="Probe" />
+
+                <Button
+                    android:id="@+id/stateButton"
+                    style="@style/ControlButton"
+                    android:text="State" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/statsButton"
+                    style="@style/ControlButton"
+                    android:text="Stats" />
+
+                <Button
+                    android:id="@+id/reconnectStateButton"
+                    style="@style/ControlButton"
+                    android:text="Reconnect" />
+
+                <Button
+                    android:id="@+id/recordStateButton"
+                    style="@style/ControlButton"
+                    android:text="Rec State" />
+            </LinearLayout>
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="RECORDING" />
+
+            <EditText
+                android:id="@+id/recordPathEditText"
+                style="@style/ControlEditText"
+                android:hint="record output .mp4/.mkv/.ts"
+                android:inputType="textUri"
+                android:singleLine="true" />
+
+            <EditText
+                android:id="@+id/segmentPatternEditText"
+                style="@style/ControlEditText"
+                android:hint="segment pattern, e.g. record_%03d.mp4"
+                android:inputType="textUri"
+                android:singleLine="true" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/recordFormatEditText"
+                    style="@style/ControlEditText"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:hint="format: mp4/mkv/ts"
+                    android:inputType="text"
+                    android:singleLine="true" />
+
+                <EditText
+                    android:id="@+id/segmentDurationEditText"
+                    style="@style/ControlEditText"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_weight="1"
+                    android:hint="segment seconds"
+                    android:inputType="number"
+                    android:singleLine="true" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/startRecordButton"
+                    style="@style/ControlButton"
+                    android:text="Record" />
+
+                <Button
+                    android:id="@+id/startSegmentRecordButton"
+                    style="@style/ControlButton"
+                    android:text="Segment" />
+
+                <Button
+                    android:id="@+id/stopRecordButton"
+                    style="@style/ControlButton"
+                    android:text="Stop Rec" />
+            </LinearLayout>
+
+            <TextView
+                style="@style/ControlSectionHeader"
+                android:text="SNAPSHOT" />
+
+            <EditText
+                android:id="@+id/snapshotPathEditText"
+                style="@style/ControlEditText"
+                android:hint="snapshot output .png"
+                android:inputType="textUri"
+                android:singleLine="true" />
+
+            <Button
+                android:id="@+id/snapshotButton"
+                style="@style/ControlButton"
+                android:layout_width="match_parent"
+                android:text="Snapshot" />
+
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

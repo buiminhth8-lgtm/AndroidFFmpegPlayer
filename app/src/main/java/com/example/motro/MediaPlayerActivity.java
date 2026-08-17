@@ -10,9 +10,11 @@ import android.util.Log;
 import android.view.PixelCopy;
 import android.view.Surface;
 import android.view.SurfaceHolder;
+import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.RadioGroup;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -22,13 +24,12 @@ import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 
 import com.example.motro.databinding.ActivityMediaPlayerBinding;
+import com.example.motro.databinding.ViewMediaPlayerControlsBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -41,15 +42,20 @@ import org.json.JSONObject;
 
 public class MediaPlayerActivity extends AppCompatActivity {
 
-    private static final String TAG = "FFmpegPlayerDemo";
+    private static final String TAG = "FFmpegPlayer";
+    private static final String TAG_STATS = "FFmpegPlayerStats";
+    private static final String TAG_EVENT = "FFmpegPlayerEvent";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
+    private static final float MIN_WINDOW_SPAN = 0.01f;
     public static final String EXTRA_URL = "com.example.motro.extra.URL";
     public static final String EXTRA_HARDWARE_DECODE = "com.example.motro.extra.HARDWARE_DECODE";
     public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
     public static final String EXTRA_LATENCY_MODE = "com.example.motro.extra.LATENCY_MODE";
+    public static final String EXTRA_RENDER_MODE = "com.example.motro.extra.RENDER_MODE";
 
     private ActivityMediaPlayerBinding binding;
+    private ViewMediaPlayerControlsBinding controlsBinding;
 
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -64,11 +70,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
     };
 
-    private EditText urlEditText;
-    private EditText timeoutEditText;
-    private EditText recordPathEditText;
-    private EditText segmentPatternEditText;
-    private EditText recordFormatEditText;
     private EditText segmentDurationEditText;
     private EditText snapshotPathEditText;
     private Switch audioSwitch;
@@ -76,9 +77,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private Switch hardwareDecodeSwitch;
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
-    private TextView handleTextView;
     private TextView playbackInfoTextView;
-    private TextView logTextView;
+    private int statsLogCounter;
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
@@ -95,13 +95,21 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private long lastPlaybackInfoInputBytes;
     private volatile String lastPlayerEventText = "";
 
+    private int thermalPalette = FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+    private float thermalGamma = 1.0f;
+    private float thermalBlackPoint = 0.0f;
+    private float thermalWhitePoint = 1.0f;
+    private boolean thermalUiUpdating;
+    private volatile String currentRenderMode = "";
+    private String intentRenderMode = "";
+
     private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
         mainHandler.post(() -> {
             if (destroyed || handle != getPlayerHandle()) {
                 return;
             }
             lastPlayerEventText = event;
-            appendLog("Player event: " + event + "\n" + eventJson);
+            Log.d(TAG_EVENT, "handle=" + handle + " event=" + event + "\n" + eventJson);
         });
     };
 
@@ -110,22 +118,20 @@ public class MediaPlayerActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         binding = ActivityMediaPlayerBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+        controlsBinding = binding.playerControlPanel;
         worker = Executors.newSingleThreadExecutor(r -> new Thread(r, "FFmpegDemoWorker"));
         bindViews();
         initDefaults();
         bindPreviewCallback();
         bindActions();
         startPlaybackInfoUpdates();
-        appendLog("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
+        logDebug("Demo ready. Tap Create/Info/Prepare to load FFmpeg native libraries.");
     }
 
     private void bindViews() {
         binding.playerPreviewView.setKeepScreenOn(true);
-        urlEditText = findViewById(R.id.urlEditText);
-        timeoutEditText = findViewById(R.id.timeoutEditText);
-        recordPathEditText = findViewById(R.id.recordPathEditText);
-        segmentPatternEditText = findViewById(R.id.segmentPatternEditText);
-        recordFormatEditText = findViewById(R.id.recordFormatEditText);
+
+
         segmentDurationEditText = findViewById(R.id.segmentDurationEditText);
         snapshotPathEditText = findViewById(R.id.snapshotPathEditText);
         audioSwitch = findViewById(R.id.audioSwitch);
@@ -133,27 +139,38 @@ public class MediaPlayerActivity extends AppCompatActivity {
         hardwareDecodeSwitch = findViewById(R.id.hardwareDecodeSwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
-        handleTextView = findViewById(R.id.handleTextView);
         playbackInfoTextView = findViewById(R.id.playbackInfoTextView);
-        logTextView = findViewById(R.id.logTextView);
     }
 
     private void initDefaults() {
         String initialUrl = getIntent().getStringExtra(EXTRA_URL);
-        urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
-        timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
+        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
+        controlsBinding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         applyIntentPlaybackDefaults();
-        recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
-        segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
-        recordFormatEditText.setText("mp4");
+        controlsBinding.recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
+        controlsBinding.segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
+        controlsBinding.recordFormatEditText.setText("mp4");
         segmentDurationEditText.setText("300");
         snapshotPathEditText.setText(defaultFilePath("snapshot.png"));
-        updateHandleLabel();
+        intentRenderMode = getIntent().getStringExtra(EXTRA_RENDER_MODE);
+        controlsBinding.thermalEnabledSwitch.setChecked(false);
+        controlsBinding.thermalPaletteRadioGroup.check(R.id.thermalWhiteHotRadio);
+        controlsBinding.thermalAgcSwitch.setChecked(false);
+        controlsBinding.thermalGammaSeekBar.setProgress(50);
+        controlsBinding.thermalBlackPointSeekBar.setProgress(0);
+        controlsBinding.thermalWhitePointSeekBar.setProgress(100);
+        thermalPalette = FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+        thermalGamma = 1.0f;
+        thermalBlackPoint = 0.0f;
+        thermalWhitePoint = 1.0f;
+        currentRenderMode = "";
+        updateThermalValueTexts();
+        updateThermalControlsEnabledState();
     }
 
     private void applyIntentPlaybackDefaults() {
@@ -226,13 +243,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String decodeResult = newlyCreated
                     ? applyDecodeModeOption(handle)
                     : "{\"success\":true,\"message\":\"player already exists, decode mode unchanged until next prepare\"}";
+            String thermalResult = newlyCreated
+                    ? applyThermalOptionsToPlayer(handle)
+                    : "{\"success\":true,\"message\":\"player already exists, thermal config unchanged\"}";
             return "{\"success\":true,\"handle\":" + handle + "}"
                     + "\nsurface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
-                    + "\ndecode=" + decodeResult;
+                    + "\ndecode=" + decodeResult
+                    + "\nthermal=" + thermalResult;
         }));
 
         findViewById(R.id.infoButton).setOnClickListener(v -> runNative("FFmpeg Info", () ->
@@ -252,6 +273,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             String decodeResult = applyDecodeModeOption(handle);
+            String thermalResult = applyThermalOptionsToPlayer(handle);
             String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
                     + "\ntransport=" + transportResult
@@ -259,6 +281,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
+                    + "\nthermal=" + thermalResult
                     + "\nprepare=" + prepareResult;
         }));
 
@@ -283,6 +306,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return jsonError("player handle is 0");
             }
             resetPlaybackInfoCounters();
+            currentRenderMode = "";
             return FFmpegNative.releasePlayer(handle);
         }));
 
@@ -314,7 +338,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
                 FFmpegNative.clearPlayerSurface(requireHandle())));
 
-        findViewById(R.id.clearLogButton).setOnClickListener(v -> logTextView.setText(""));
+        binding.controlToggleButton.setOnClickListener(v -> toggleControlPanel());
+        controlsBinding.controlPanelCloseButton.setOnClickListener(v -> hideControlPanel());
 
         audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
             long handle = getPlayerHandle();
@@ -328,6 +353,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 runNative("Reconnect Option", () -> applyReconnectOptions(handle));
             }
         });
+        hardwareDecodeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            updateThermalControlsEnabledState();
+        });
         transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
             long handle = getPlayerHandle();
             if (handle != 0) {
@@ -340,6 +371,237 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 runNative("Latency Mode", () -> applyLatencyMode(handle));
             }
         });
+
+        bindThermalControls();
+    }
+
+    private void bindThermalControls() {
+        controlsBinding.thermalEnabledSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            if (isChecked) {
+                if (!isThermalSupported()) {
+                    thermalUiUpdating = true;
+                    controlsBinding.thermalEnabledSwitch.setChecked(false);
+                    thermalUiUpdating = false;
+                    String current = TextUtils.isEmpty(currentRenderMode)
+                            ? (hardwareDecodeSwitch.isChecked() ? "mediacodec_nv12_gl" : "software_yuv_gl")
+                            : currentRenderMode;
+                    Log.w(TAG, "Thermal blocked: requires software_yuv_gl/mediacodec_nv12_gl, current=" + current);
+                    Toast.makeText(this,
+                            "Thermal requires software_yuv_gl or mediacodec_nv12_gl. Switch render mode and restart playback.",
+                            Toast.LENGTH_LONG).show();
+                    updateThermalControlsEnabledState();
+                    return;
+                }
+                updateThermalControlsEnabledState();
+                long handle = getPlayerHandle();
+                if (handle == 0) {
+                    return;
+                }
+                callThermalApi("Thermal Enable", () -> applyThermalOptionsToPlayer(handle));
+            } else {
+                updateThermalControlsEnabledState();
+                long handle = getPlayerHandle();
+                if (handle != 0) {
+                    callThermalApi("Thermal Disable", () -> FFmpegNative.setThermalEnabled(handle, false));
+                }
+            }
+        });
+
+        controlsBinding.thermalPaletteRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            int palette = checkedId == R.id.thermalIronbowRadio
+                    ? FFmpegNative.THERMAL_PALETTE_IRONBOW
+                    : FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+            if (palette == thermalPalette) {
+                return;
+            }
+            thermalPalette = palette;
+            long handle = getPlayerHandle();
+            if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                callThermalApi("Thermal Palette", () -> FFmpegNative.setThermalPalette(handle, thermalPalette));
+            }
+        });
+
+        controlsBinding.thermalAgcSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (thermalUiUpdating) {
+                return;
+            }
+            updateThermalControlsEnabledState();
+            long handle = getPlayerHandle();
+            if (handle == 0 || !controlsBinding.thermalEnabledSwitch.isChecked()) {
+                return;
+            }
+            callThermalApi("Thermal AGC", () -> FFmpegNative.setThermalAgcEnabled(handle, isChecked));
+        });
+
+        controlsBinding.thermalGammaSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                float gamma = 0.5f + progress / 100.0f;
+                if (Math.abs(gamma - thermalGamma) < 0.001f) {
+                    return;
+                }
+                thermalGamma = gamma;
+                controlsBinding.thermalGammaValueText.setText(String.format(Locale.US, "%.2f", gamma));
+                long handle = getPlayerHandle();
+                if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                    callThermalApi("Thermal Gamma", () -> FFmpegNative.setThermalGamma(handle, thermalGamma));
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+
+        controlsBinding.thermalBlackPointSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                thermalBlackPoint = clampBlackPoint(progress / 100.0f);
+                syncWindowControls();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+
+        controlsBinding.thermalWhitePointSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (thermalUiUpdating) {
+                    return;
+                }
+                thermalWhitePoint = clampWhitePoint(progress / 100.0f);
+                syncWindowControls();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+            }
+        });
+    }
+
+    private float clampBlackPoint(float black) {
+        float maxBlack = Math.max(0.0f, thermalWhitePoint - MIN_WINDOW_SPAN);
+        return Math.max(0.0f, Math.min(black, maxBlack));
+    }
+
+    private float clampWhitePoint(float white) {
+        float minWhite = Math.min(1.0f, thermalBlackPoint + MIN_WINDOW_SPAN);
+        return Math.max(minWhite, Math.min(white, 1.0f));
+    }
+
+    private void syncWindowControls() {
+        thermalUiUpdating = true;
+        try {
+            controlsBinding.thermalBlackPointSeekBar.setProgress(Math.round(thermalBlackPoint * 100.0f));
+            controlsBinding.thermalWhitePointSeekBar.setProgress(Math.round(thermalWhitePoint * 100.0f));
+            updateThermalValueTexts();
+        } finally {
+            thermalUiUpdating = false;
+        }
+        long handle = getPlayerHandle();
+        if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
+            callThermalApi("Thermal Window", () -> FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint));
+        }
+    }
+
+    private void updateThermalValueTexts() {
+        controlsBinding.thermalGammaValueText.setText(String.format(Locale.US, "%.2f", thermalGamma));
+        controlsBinding.thermalBlackPointValueText.setText(String.format(Locale.US, "%.2f", thermalBlackPoint));
+        controlsBinding.thermalWhitePointValueText.setText(String.format(Locale.US, "%.2f", thermalWhitePoint));
+    }
+
+    private boolean isThermalSupported() {
+        String mode = !TextUtils.isEmpty(currentRenderMode) ? currentRenderMode : intentRenderMode;
+        if (!TextUtils.isEmpty(mode)) {
+            // software_yuv_gl / mediacodec_nv12_gl / mediacodec_oes support thermal;
+            // software_rgba and mediacodec_surface do not.
+            return "software_yuv_gl".equals(mode)
+                    || "mediacodec_nv12_gl".equals(mode)
+                    || "mediacodec_oes".equals(mode);
+        }
+        // Pending: hardware ON -> mediacodec_nv12_gl, OFF -> software_yuv_gl (both thermal-capable).
+        return true;
+    }
+
+    private void updateThermalControlsEnabledState() {
+        boolean supported = isThermalSupported();
+        boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
+        // AGC applies to software_yuv_gl, mediacodec_oes, and mediacodec_nv12_gl.
+        boolean gammaSupported = supported;
+        boolean agcSupported = supported;
+        boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
+        // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
+        controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
+        for (int i = 0; i < controlsBinding.thermalPaletteRadioGroup.getChildCount(); i++) {
+            controlsBinding.thermalPaletteRadioGroup.getChildAt(i).setEnabled(thermalOn);
+        }
+        controlsBinding.thermalAgcSwitch.setEnabled(thermalOn && agcSupported);
+        controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn && gammaSupported);
+        controlsBinding.thermalGammaValueText.setAlpha(thermalOn && gammaSupported ? 1.0f : 0.4f);
+        // Manual window disabled while AGC is ON (effective window comes from AGC).
+        boolean windowEnabled = thermalOn && !agcOn;
+        controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
+        controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
+        controlsBinding.thermalBlackPointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
+        controlsBinding.thermalWhitePointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
+    }
+
+    private String applyThermalOptionsToPlayer(long handle) {
+        if (handle == 0) {
+            return jsonError("player handle is 0");
+        }
+        String paletteResult = FFmpegNative.setThermalPalette(handle, thermalPalette);
+        String gammaResult = FFmpegNative.setThermalGamma(handle, thermalGamma);
+        String windowResult = FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint);
+        String agcResult = FFmpegNative.setThermalAgcEnabled(handle, controlsBinding.thermalAgcSwitch.isChecked());
+        String enableResult = FFmpegNative.setThermalEnabled(handle, controlsBinding.thermalEnabledSwitch.isChecked());
+        return "palette=" + paletteResult
+                + "\ngamma=" + gammaResult
+                + "\nwindow=" + windowResult
+                + "\nagc=" + agcResult
+                + "\nenable=" + enableResult;
+    }
+
+    private void callThermalApi(String title, NativeAction action) {
+        if (destroyed) {
+            return;
+        }
+        try {
+            String result = action.run();
+            if (result != null && result.contains("\"success\":false")) {
+                Log.w(TAG, title + " failed: " + result);
+            } else {
+                Log.d(TAG, title + " " + result);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, title + " failed", t);
+        }
     }
 
     private void bindSurfaceForExistingPlayer(String title) {
@@ -347,7 +609,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle != 0) {
             runNative(title, () -> bindSurfaceIfReady(handle));
         } else {
-            appendLog(title + ": no player yet");
+            logDebug(title + ": no player yet");
         }
     }
 
@@ -437,6 +699,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long reconnectAttempt = stats.optLong("reconnectAttempt", stats.optLong("reconnectAttemptCount", 0));
             String reconnectError = stats.optString("reconnectLastError", stats.optString("lastReconnectError", ""));
             String mode = stats.optString("renderMode", "unknown");
+            String renderInputType = stats.optString("renderInputType", "none");
             String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
             String frameFormat = stats.optString("frameFormat", "");
             long dropped = stats.optLong("droppedVideoFrameCount", 0);
@@ -452,22 +715,114 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stateDisplay += " reconnecting";
             }
 
+            int videoWidth = stats.optInt("videoWidth", 0);
+            int videoHeight = stats.optInt("videoHeight", 0);
+            int frameYStride = stats.optInt("frameYStride", 0);
+            String frameColorRange = stats.optString("frameColorRange", "unknown");
+            long yuvGlRendered = stats.optLong("yuvGlRenderedFrameCount", 0);
+            long yuvGlFallback = stats.optLong("yuvGlFallbackFrameCount", 0);
+            String resolution = videoWidth > 0 && videoHeight > 0
+                    ? videoWidth + "x" + videoHeight
+                    : "--";
+
+            boolean thermalEnabled = stats.optBoolean("thermalEnabled", false);
+            boolean thermalAgcEnabled = stats.optBoolean("thermalAgcEnabled", false);
+            String thermalPalette = stats.optString("thermalPalette", "original");
+            float thermalGamma = (float) stats.optDouble("thermalGamma", 1.0);
+            String thermalRenderMode = stats.optString("thermalRenderMode", "normal");
+            float thermalBlackPoint = (float) stats.optDouble("thermalBlackPoint", 0.0);
+            float thermalWhitePoint = (float) stats.optDouble("thermalWhitePoint", 1.0);
+            boolean thermalAgcValid = stats.optBoolean("thermalAgcValid", false);
+            float thermalAgcBlackPoint = (float) stats.optDouble("thermalAgcBlackPoint", 0.0);
+            float thermalAgcWhitePoint = (float) stats.optDouble("thermalAgcWhitePoint", 1.0);
+            float windowBlack = thermalAgcValid ? thermalAgcBlackPoint : thermalBlackPoint;
+            float windowWhite = thermalAgcValid ? thermalAgcWhitePoint : thermalWhitePoint;
+
+            currentRenderMode = mode;
+            updateThermalControlsEnabledState();
+
+            boolean mediaCodecSurfaceMode = "mediacodec_surface".equals(mode);
+            boolean oesMode = "mediacodec_oes".equals(mode);
+            boolean nv12GlMode = "mediacodec_nv12_gl".equals(mode);
+            String thermalInputType = stats.optString("thermalInputType", "none");
+            String windowLine;
+            if (mediaCodecSurfaceMode) {
+                windowLine = "";
+            } else if (oesMode) {
+                // OES window lives in luminance 0..1 domain; AGC effective window shown when valid.
+                windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
+                        + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF");
+            } else if (nv12GlMode) {
+                // NV12 GL window in intensity 0..1 domain; AGC effective window shown when valid.
+                windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
+                        + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF");
+            } else {
+                windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
+                        + " - " + String.format(Locale.US, "%.2f", windowWhite)
+                        + " | Range " + frameColorRange;
+            }
+            String thermalDisplay;
+            if (mediaCodecSurfaceMode) {
+                thermalDisplay = "Thermal: UNAVAILABLE | " + mode;
+            } else if (oesMode) {
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US)
+                        + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
+            } else if (nv12GlMode) {
+                // NV12 GL: Original / White Hot / Ironbow with Gamma, Window, and AGC.
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US)
+                        + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
+            } else {
+                thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
+                        + " | " + thermalPalette
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF")
+                        + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)
+                        + " | render " + thermalRenderMode.toUpperCase(Locale.US);
+            }
+
+            String oesLine = "";
+            if ("mediacodec_oes".equals(mode)) {
+                long oesAvailable = stats.optLong("oesFrameAvailableCount", 0);
+                long oesRendered = stats.optLong("oesFrameRenderedCount", 0);
+                oesLine = "\nOES available=" + oesAvailable
+                        + " rendered=" + oesRendered;
+            }
+
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | " + mode
+                            + " | " + renderInputType
                             + " | " + codec
+                            + "\n" + resolution
+                            + " | " + frameFormat
+                            + " | Y stride=" + frameYStride
+                            + " | range=" + frameColorRange
                             + "\ndecode " + formatFps(decodeFps)
                             + " fps  render " + formatFps(renderFps)
                             + " fps  dropped " + dropped
                             + "\nbitrate " + formatKbps(videoKbps)
                             + "  transfer " + formatKbPerSec(transferKbPerSec)
                             + "  nominal " + nominalBitrate
-                            + "\nformat " + frameFormat
+                            + "\nyuv-gl rendered=" + yuvGlRendered
+                            + " fallback=" + yuvGlFallback
                             + "  packets " + stats.optLong("readPacketCount", 0)
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt
                             + " event=" + (TextUtils.isEmpty(lastPlayerEventText) ? "--" : lastPlayerEventText)
-                            + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError));
+                            + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
+                            + "\n" + thermalDisplay
+                            + oesLine
+                            + windowLine);
+            if (++statsLogCounter % 5 == 0) {
+                Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
+            }
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
         }
@@ -520,11 +875,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
             }
             if (playerHandle == 0) {
                 playerHandle = FFmpegNative.createPlayer();
-                Log.d(TAG, "createPlayer handle=" + playerHandle);
+                Log.d(TAG, "playerHandle=" + playerHandle);
                 if (playerHandle != 0) {
                     Log.d(TAG, "setPlayerEventListener=" + FFmpegNative.setPlayerEventListener(playerHandle, playerEventListener));
                 }
-                postHandleLabel();
             }
             return playerHandle;
         }
@@ -540,7 +894,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
         synchronized (handleLock) {
             long handle = playerHandle;
             playerHandle = 0;
-            postHandleLabel();
             return handle;
         }
     }
@@ -600,10 +953,23 @@ public class MediaPlayerActivity extends AppCompatActivity {
         if (handle == 0) {
             return jsonError("player handle is 0");
         }
-        boolean hardwareDecode = hardwareDecodeSwitch.isChecked();
+        boolean hardwareDecode = "mediacodec_oes".equals(intentRenderMode)
+                || "mediacodec_nv12_gl".equals(intentRenderMode)
+                || hardwareDecodeSwitch.isChecked();
         String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
-        String renderMode = hardwareDecode ? "mediacodec_surface" : "software_rgba";
+        // setHardwareDecode(false) may reset software render mode to software_rgba,
+        // so apply the explicit render mode afterwards.
+        String renderMode;
+        if ("mediacodec_oes".equals(intentRenderMode)) {
+            renderMode = "mediacodec_oes";
+        } else if ("mediacodec_surface".equals(intentRenderMode)) {
+            renderMode = "mediacodec_surface";
+        } else {
+            // Revised Phase 2 main path: Hardware Decode ON -> NV12 GL.
+            renderMode = hardwareDecode ? "mediacodec_nv12_gl" : "software_yuv_gl";
+        }
         String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
+        currentRenderMode = renderMode;
         return "hardwareDecode=" + decodeResult
                 + "\nrenderMode=" + renderModeResult;
     }
@@ -634,7 +1000,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireUrl() {
-        String url = urlEditText.getText().toString().trim();
+        String url = controlsBinding.urlEditText.getText().toString().trim();
         if (TextUtils.isEmpty(url)) {
             throw new IllegalArgumentException("Please enter RTSP/URL");
         }
@@ -642,7 +1008,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private int readTimeoutMs() {
-        String value = timeoutEditText.getText().toString().trim();
+        String value = controlsBinding.timeoutEditText.getText().toString().trim();
         if (TextUtils.isEmpty(value)) {
             return DEFAULT_TIMEOUT_MS;
         }
@@ -654,27 +1020,27 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private String requireRecordPath() {
-        String path = recordPathEditText.getText().toString().trim();
+        String path = controlsBinding.recordPathEditText.getText().toString().trim();
         if (TextUtils.isEmpty(path)) {
             path = defaultFilePath("record_av_test.ts");
-            recordPathEditText.setText(path);
+            controlsBinding.recordPathEditText.setText(path);
         }
         ensureParentExists(path);
         return path;
     }
 
     private String requireSegmentPattern() {
-        String pattern = segmentPatternEditText.getText().toString().trim();
+        String pattern = controlsBinding.segmentPatternEditText.getText().toString().trim();
         if (TextUtils.isEmpty(pattern)) {
             pattern = defaultFilePath("record_segment_%03d.ts");
-            segmentPatternEditText.setText(pattern);
+            controlsBinding.segmentPatternEditText.setText(pattern);
         }
         ensureParentExists(pattern.replace("%03d", "000"));
         return pattern;
     }
 
     private String requireRecordFormat() {
-        String format = recordFormatEditText.getText().toString().trim();
+        String format = controlsBinding.recordFormatEditText.getText().toString().trim();
         if (TextUtils.isEmpty(format)) {
             return "auto";
         }
@@ -803,7 +1169,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return;
         }
         hideKeyboard();
-        appendLog(">>> " + title);
+        logDebug(">>> " + title);
         worker.execute(() -> {
             String result;
             try {
@@ -814,7 +1180,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             }
             String finalResult = result;
             mainHandler.post(() -> {
-                appendLog(title + "\n" + finalResult);
+                logDebug(title + "\n" + finalResult);
                 if (!destroyed && finalResult.contains("\"success\":false")) {
                     Toast.makeText(this, title + " failed", Toast.LENGTH_SHORT).show();
                 }
@@ -829,22 +1195,41 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
     }
 
-    private void appendLog(String message) {
-        String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-        String old = logTextView.getText().toString();
-        String next = old + "\n[" + time + "] " + message + "\n";
-        if (next.length() > 20000) {
-            next = next.substring(next.length() - 20000);
+    private void logDebug(String message) {
+        Log.d(TAG, message);
+    }
+
+    private void toggleControlPanel() {
+        if (binding.playerControlPanel.getRoot().getVisibility() == View.VISIBLE) {
+            hideControlPanel();
+        } else {
+            showControlPanel();
         }
-        logTextView.setText(next.trim());
     }
 
-    private void postHandleLabel() {
-        mainHandler.post(this::updateHandleLabel);
+    private void showControlPanel() {
+        View panel = binding.playerControlPanel.getRoot();
+        panel.setVisibility(View.VISIBLE);
+        panel.setAlpha(0f);
+        panel.setTranslationX(Math.max(1, panel.getWidth()));
+        panel.animate()
+                .translationX(0f)
+                .alpha(1f)
+                .setDuration(180)
+                .start();
     }
 
-    private void updateHandleLabel() {
-        handleTextView.setText("handle: " + getPlayerHandle());
+    private void hideControlPanel() {
+        View panel = binding.playerControlPanel.getRoot();
+        if (panel.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        panel.animate()
+                .translationX(Math.max(1, panel.getWidth()))
+                .alpha(0f)
+                .setDuration(150)
+                .withEndAction(() -> panel.setVisibility(View.GONE))
+                .start();
     }
 
     private String jsonError(String message) {

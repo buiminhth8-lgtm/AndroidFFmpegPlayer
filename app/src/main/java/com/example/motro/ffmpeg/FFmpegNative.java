@@ -1,5 +1,6 @@
 package com.example.motro.ffmpeg;
 
+import android.graphics.SurfaceTexture;
 import android.util.Log;
 import android.view.Surface;
 
@@ -25,9 +26,32 @@ public final class FFmpegNative {
     public static final String EVENT_RECONNECT_SUCCESS = "reconnect_success";
     public static final String EVENT_RECONNECT_EXHAUSTED = "reconnect_exhausted";
 
+    public static final int THERMAL_PALETTE_ORIGINAL = 0;
+    public static final int THERMAL_PALETTE_WHITE_HOT = 1;
+    public static final int THERMAL_PALETTE_IRONBOW = 2;
+
     public interface PlayerEventListener {
         void onPlayerEvent(long handle, String event, String eventJson);
     }
+
+    /**
+     * Receives MediaCodec SurfaceTexture frame-available callbacks and only
+     * signals the native side (sets an atomic pending flag). No GL calls here.
+     */
+    public static final class OesFrameListener implements SurfaceTexture.OnFrameAvailableListener {
+        private final long handle;
+
+        public OesFrameListener(long handle) {
+            this.handle = handle;
+        }
+
+        @Override
+        public void onFrameAvailable(SurfaceTexture surfaceTexture) {
+            FFmpegNative.nativeNotifyOesFrameAvailable(handle);
+        }
+    }
+
+    private static native void nativeNotifyOesFrameAvailable(long handle);
 
     private static void loadRequired(String name) {
         System.loadLibrary(name);
@@ -102,13 +126,13 @@ public final class FFmpegNative {
      * FFmpegNative.preparePlayer(handle, rtspUrl, 3000000);
      * FFmpegNative.startPlayer(handle);
      *
-     * FFmpeg MediaCodec Surface low latency example:
+     * FFmpeg MediaCodec NV12 GL low latency example (Revised Phase 2 main path):
      * long handle = FFmpegNative.createPlayer();
      * FFmpegNative.setRtspTransport(handle, "udp");
      * FFmpegNative.setPlayerLatencyMode(handle, "ultra_low_latency");
      * FFmpegNative.setPlayerOption(handle, "ultra_latency_level", "normal");
      * FFmpegNative.setHardwareDecode(handle, true);
-     * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_surface");
+     * FFmpegNative.setHardwareRenderMode(handle, "mediacodec_nv12_gl");
      * FFmpegNative.enableAudio(handle, false);
      * FFmpegNative.setPlayerEventListener(handle, (playerHandle, event, eventJson) -> {
      *     // EVENT_RECONNECTING / EVENT_WAITING_SOURCE: show reconnect animation.
@@ -132,6 +156,16 @@ public final class FFmpegNative {
     public static native String setHardwareDecode(long handle, boolean enabled);
 
     public static native String setHardwareRenderMode(long handle, String mode);
+
+    public static native String setThermalEnabled(long handle, boolean enabled);
+
+    public static native String setThermalPalette(long handle, int palette);
+
+    public static native String setThermalAgcEnabled(long handle, boolean enabled);
+
+    public static native String setThermalGamma(long handle, float gamma);
+
+    public static native String setThermalWindow(long handle, float blackPoint, float whitePoint);
 
     public static native String getPlayerLatencyConfig(long handle);
 

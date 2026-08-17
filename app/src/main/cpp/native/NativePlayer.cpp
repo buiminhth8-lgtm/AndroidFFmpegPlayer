@@ -41,6 +41,18 @@ namespace {
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
+// AGC tuning constants.
+constexpr int kAgcUpdateIntervalFrames = 5;
+constexpr int kAgcPixelStep = 4;
+constexpr int kAgcRowStep = 4;
+constexpr float kAgcLowPercentile = 0.02f;
+constexpr float kAgcHighPercentile = 0.98f;
+constexpr float kAgcSmoothingAlpha = 0.15f;
+constexpr float kAgcMinSpan = 0.05f;
+
+// OES AGC downsample analysis interval (thermal frames).
+constexpr int kOesAgcUpdateIntervalFrames = 5;
+
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
     for (char c : value) {
@@ -126,6 +138,142 @@ const char *playerStateName(PlayerState state) {
 std::string codecName(AVCodecID codecId) {
     const char *name = avcodec_get_name(codecId);
     return name == nullptr ? "unknown" : name;
+}
+
+std::string colorRangeName(AVColorRange range) {
+    switch (range) {
+        case AVCOL_RANGE_MPEG: return "limited";
+        case AVCOL_RANGE_JPEG: return "full";
+        case AVCOL_RANGE_UNSPECIFIED: return "unspecified";
+        default: return "unknown";
+    }
+}
+
+// thermal render mode: 0 = normal, 1 = white_hot, 2 = ironbow
+const char *thermalRenderModeName(int mode) {
+    switch (mode) {
+        case 1: return "white_hot";
+        case 2: return "ironbow";
+        default: return "normal";
+    }
+}
+
+// frame output type: 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
+const char *frameOutputTypeName(int type) {
+    switch (type) {
+        case 1: return "yuv420p_cpu";
+        case 2: return "nv12_cpu";
+        case 3: return "direct_surface";
+        case 4: return "external_oes";
+        default: return "unknown";
+    }
+}
+
+// renderer: 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
+const char *rendererTypeName(int type) {
+    switch (type) {
+        case 1: return "rgba_nativewindow";
+        case 2: return "yuv_gl";
+        case 3: return "nv12_gl";
+        case 4: return "oes_gl";
+        default: return "unknown";
+    }
+}
+
+// Renderer input described from the actual frame output type.
+const char *renderInputNameFromOutputType(int outputType) {
+    switch (outputType) {
+        case 1: return "yuv_planes";
+        case 2: return "nv12_cpu";
+        case 3: return "direct_surface";
+        case 4: return "external_oes";
+        default: return "unknown";
+    }
+}
+
+// Renderer implied by the requested render mode.
+const char *rendererNameFromRenderMode(RenderMode renderMode) {
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA: return "rgba_nativewindow";
+        case RenderMode::SOFTWARE_YUV_GL: return "yuv_gl";
+        case RenderMode::MEDIACODEC_NV12_GL: return "nv12_gl";
+        case RenderMode::MEDIACODEC_OES: return "oes_gl";
+        case RenderMode::MEDIACODEC_SURFACE: return "direct_surface";
+        default: return "unknown";
+    }
+}
+
+// Render-fallback reason code -> readable string.
+const char *renderFallbackReasonName(int code) {
+    switch (code) {
+        case 1: return "nv12_gl render failed";
+        case 2: return "yuv_gl render failed";
+        default: return "";
+    }
+}
+
+struct AgcResult {
+    bool valid = false;
+    float blackPoint = 0.0f;
+    float whitePoint = 1.0f;
+};
+
+// Percentile-based AGC window from the raw 8-bit Y plane.
+// Converts raw percentile values to the same 0.0 ~ 1.0 normalized
+// thermal range used by the current YUV and NV12 thermal shaders.
+AgcResult computeAgcWindow(const uint8_t *yData, int yStride, int width, int height, AVColorRange colorRange) {
+    AgcResult result;
+    if (yData == nullptr || yStride <= 0 || width <= 0 || height <= 0) {
+        return result;
+    }
+    uint32_t histogram[256] = {};
+    uint64_t sampleCount = 0;
+    for (int y = 0; y < height; y += kAgcRowStep) {
+        const uint8_t *row = yData + static_cast<size_t>(y) * static_cast<size_t>(yStride);
+        for (int x = 0; x < width; x += kAgcPixelStep) {
+            ++histogram[row[x]];
+            ++sampleCount;
+        }
+    }
+    if (sampleCount == 0) {
+        return result;
+    }
+
+    const uint64_t targetLow = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcLowPercentile);
+    const uint64_t targetHigh = static_cast<uint64_t>(static_cast<double>(sampleCount) * kAgcHighPercentile);
+    uint64_t cumulative = 0;
+    int lowValue = 0;
+    int highValue = 255;
+    bool lowFound = false;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += histogram[i];
+        if (!lowFound && cumulative >= targetLow) {
+            lowValue = i;
+            lowFound = true;
+        }
+        if (cumulative >= targetHigh) {
+            highValue = i;
+            break;
+        }
+    }
+
+    const auto normalizeY = [colorRange](int rawValue) {
+        const float v = rawValue / 255.0f;
+        if (colorRange == AVCOL_RANGE_MPEG) {
+            return (v - 16.0f / 255.0f) / (219.0f / 255.0f);
+        }
+        return v;
+    };
+
+    float low = std::clamp(normalizeY(lowValue), 0.0f, 1.0f);
+    float high = std::clamp(normalizeY(highValue), 0.0f, 1.0f);
+    if (!std::isfinite(low) || !std::isfinite(high) || low >= high || (high - low) < kAgcMinSpan) {
+        return result;
+    }
+    result.blackPoint = low;
+    result.whitePoint = high;
+    result.valid = true;
+    return result;
 }
 
 double rationalToDouble(AVRational rational) {
@@ -244,10 +392,6 @@ const char *preferredHardwareDecoderName(AVCodecID codecId) {
     return nullptr;
 }
 
-bool isMediaCodecDecoderName(const std::string &name) {
-    return name == "h264_mediacodec" || name == "hevc_mediacodec";
-}
-
 std::string decoderName(const AVCodec *codec) {
     return codec != nullptr && codec->name != nullptr ? codec->name : "";
 }
@@ -336,11 +480,19 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
     LOGI("setSurface player=%p width=%d height=%d", this, width, height);
     const std::string rgbaResult = renderer_.setSurface(env, surface, width, height);
     const std::string glResult = yuvGlRenderer_.setSurface(env, surface, width, height);
+    const std::string oesResult = oesRenderer_.setSurface(env, surface, width, height);
+    const std::string nv12GlResult = nv12GlRenderer_.setSurface(env, surface, width, height);
     if (rgbaResult.find("\"success\":true") == std::string::npos) {
         return rgbaResult;
     }
     if (glResult.find("\"success\":true") == std::string::npos) {
         LOGE("setSurface GL YUV renderer failed: %s", glResult.c_str());
+    }
+    if (oesResult.find("\"success\":true") == std::string::npos) {
+        LOGE("setSurface OES renderer failed: %s", oesResult.c_str());
+    }
+    if (nv12GlResult.find("\"success\":true") == std::string::npos) {
+        LOGE("setSurface NV12 GL renderer failed: %s", nv12GlResult.c_str());
     }
     return rgbaResult;
 }
@@ -352,6 +504,8 @@ std::string NativePlayer::clearSurface() {
     LOGI("clearPlayerSurface player=%p", this);
     renderer_.release();
     yuvGlRenderer_.release();
+    oesRenderer_.release();
+    nv12GlRenderer_.clearSurface();
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env == nullptr) {
@@ -525,7 +679,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     const AVCodecID videoCodecId = videoStream->codecpar->codec_id;
     const char *hardwareDecoderName = preferredHardwareDecoderName(videoCodecId);
     const bool hardwareModeRequested = optionsSnapshot.enableHardwareDecode
-                                       && optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                       && (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES
+                                           || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL)
                                        && hardwareDecoderName != nullptr;
     const std::string requestedDecoderName = hardwareModeRequested ? hardwareDecoderName : codecName(videoCodecId);
 
@@ -608,7 +764,35 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 closeCurrentVideoDecoder();
                 return -1;
             }
-            {
+
+            if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES) {
+                if (!oesRenderer_.isPrepared()) {
+                    bool attached = false;
+                    JNIEnv *env = getJniEnvForCurrentThread(attached);
+                    std::string oesError;
+                    const bool prepared = env != nullptr
+                                          && oesRenderer_.prepareForOesDecode(env,
+                                                                               reinterpret_cast<intptr_t>(this),
+                                                                               oesError);
+                    detachCurrentThreadIfNeeded(attached);
+                    if (!prepared) {
+                        openError = "mediacodec_oes prepare failed: " + oesError;
+                        LOGE("%s", openError.c_str());
+                        av_free(mediaCodecCtx);
+                        closeCurrentVideoDecoder();
+                        return -1;
+                    }
+                }
+                jobject decoderSurface = oesRenderer_.getDecoderSurfaceGlobalRef();
+                if (decoderSurface == nullptr) {
+                    openError = "mediacodec_oes decoder Surface is null";
+                    LOGE("%s", openError.c_str());
+                    av_free(mediaCodecCtx);
+                    closeCurrentVideoDecoder();
+                    return -1;
+                }
+                openResult = av_mediacodec_default_init(videoCodecContext_, mediaCodecCtx, decoderSurface);
+            } else {
                 std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
                 if (surfaceGlobalRef_ == nullptr) {
                     openError = "mediacodec_surface requires valid Surface before prepare";
@@ -626,7 +810,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 return openResult;
             }
             mediaCodecContextInitialized_ = true;
-            LOGI("MediaCodec surface init success");
+            LOGI("MediaCodec surface init success renderMode=%s", renderModeName(optionsSnapshot.renderMode).c_str());
         }
 
         openResult = avcodec_open2(videoCodecContext_, decoder, nullptr);
@@ -651,14 +835,16 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     int decoderOpenResult = -1;
     bool fallbackUsed = false;
     std::string fallbackError;
-    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE && optionsSnapshot.enableHardwareDecode) {
+    if ((optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
+         || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL)
+        && optionsSnapshot.enableHardwareDecode) {
         bool hasSurfaceRef = false;
         {
             std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
             hasSurfaceRef = surfaceGlobalRef_ != nullptr;
         }
         if (!hasSurfaceRef) {
-            errorMessage = "mediacodec_surface requires valid Surface before prepare";
+            errorMessage = "mediacodec_surface/mediacodec_nv12_gl requires valid Surface before prepare";
             LOGE("%s", errorMessage.c_str());
             releaseFfmpegResources();
             return -1;
@@ -711,13 +897,12 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                         fallbackUsed ? fallbackError : "", softwareRenderMode);
     } else {
         setDecoderState(requestedDecoderName, decoderName(videoCodecContext_->codec), true, false, "",
-                        RenderMode::MEDIACODEC_SURFACE);
+                        optionsSnapshot.renderMode);
         lastSwsScaleCostUs_.store(-1);
         lastRenderLockCostUs_.store(-1);
         lastRenderCopyCostUs_.store(-1);
         lastRenderPostCostUs_.store(-1);
     }
-
     packet_ = av_packet_alloc();
     decodedFrame_ = av_frame_alloc();
     latestFrame_ = av_frame_alloc();
@@ -1070,6 +1255,8 @@ std::string NativePlayer::stop() {
     remuxRecorder_.stop();
 
     releaseFfmpegResources();
+    oesRenderer_.release();
+    oesFramePending_.store(false);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Released) {
@@ -1112,6 +1299,12 @@ std::string NativePlayer::getStats() {
         preferUdpInAuto = preferUdpTransport_.load();
     }
 
+    ThermalConfig thermalConfig;
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig = thermalConfig_;
+    }
+
     int frameWidth = 0;
     int frameHeight = 0;
     bool hasFrame = false;
@@ -1130,12 +1323,60 @@ std::string NativePlayer::getStats() {
     const int64_t avgRenderCostUs = averageUs(totalRenderCostUs_.load(), renderCostSampleCount_.load());
     const int64_t avgFrameProcessCostUs = averageUs(totalFrameProcessCostUs_.load(), frameProcessCostSampleCount_.load());
     const int64_t avgVideoDelayUs = averageUs(totalVideoDelayUs_.load(), videoDelaySampleCount_.load());
-    const bool swsScaleEnabled = optionsSnapshot.renderMode == RenderMode::SOFTWARE_RGBA
-                                 || (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_SURFACE
-                                     && !optionsSnapshot.usingHardwareDecoder);
+    const int frameOutputType = lastFrameOutputType_.load();
+    const int rendererType = lastRendererType_.load();
+    // sws_scale -> RGBA is the renderer actually in use for rgba_nativewindow frames.
+    const bool swsScaleEnabled = rendererType == 1;
     const bool snapshotSupported = swsScaleEnabled;
+    const std::string decodeBackend = optionsSnapshot.usingHardwareDecoder ? "mediacodec" : "software";
+    const char *frameOutputTypeValue = frameOutputTypeName(frameOutputType);
+    const char *rendererValue = rendererTypeName(rendererType);
+    const char *renderInputValue = renderInputNameFromOutputType(frameOutputType);
+    const char *requestedRendererValue = rendererNameFromRenderMode(optionsSnapshot.renderMode);
+    const bool glRendererRequested = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL
+                                     || optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL
+                                     || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES;
+    const bool renderFallbackUsed = glRendererRequested
+                                    && std::string(requestedRendererValue) != std::string(rendererValue);
+    const char *renderFallbackReasonValue = renderFallbackReasonName(renderFallbackReasonCode_.load());
 
-    LOGI("getPlayerStats player=%p", this);
+    std::string effectiveThermalRenderMode;
+    std::string thermalInputType;
+    const bool oesRenderMode = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES;
+    const bool nv12GlRenderMode = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL;
+    if (oesRenderMode) {
+        switch (lastOesThermalRenderMode_.load()) {
+            case 1: effectiveThermalRenderMode = "white_hot"; break;
+            case 2: effectiveThermalRenderMode = "ironbow"; break;
+            default: effectiveThermalRenderMode = "normal"; break;
+        }
+        thermalInputType = "oes_luminance";
+    } else if (nv12GlRenderMode) {
+        switch (lastNv12ThermalRenderMode_.load()) {
+            case 1: effectiveThermalRenderMode = "white_hot"; break;
+            case 2: effectiveThermalRenderMode = "ironbow"; break;
+            default: effectiveThermalRenderMode = "normal"; break;
+        }
+        thermalInputType = "nv12_y";
+    } else {
+        effectiveThermalRenderMode = thermalRenderModeName(lastThermalRenderMode_.load());
+        thermalInputType = (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL
+                            || optionsSnapshot.renderMode == RenderMode::SOFTWARE_RGBA)
+                           ? "yuv_planes"
+                           : "none";
+    }
+    const bool agcValidEffective = oesRenderMode ? oesRenderer_.isAgcValid()
+                                  : (nv12GlRenderMode ? nv12AgcValid_.load() : agcValid_.load());
+    const float agcBlackEffective = agcValidEffective
+                                    ? (oesRenderMode ? oesRenderer_.getAgcBlackPoint()
+                                       : (nv12GlRenderMode ? nv12AgcBlackPoint_.load() : agcBlackPoint_.load()))
+                                    : 0.0f;
+    const float agcWhiteEffective = agcValidEffective
+                                    ? (oesRenderMode ? oesRenderer_.getAgcWhitePoint()
+                                       : (nv12GlRenderMode ? nv12AgcWhitePoint_.load() : agcWhitePoint_.load()))
+                                    : 1.0f;
+    const bool thermalWindowApplied = effectiveThermalRenderMode != "normal";
+
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\","
@@ -1151,6 +1392,12 @@ std::string NativePlayer::getStats() {
         << "\"frameFormat\":\"" << escapeJson(frameFormatName.empty() ? (swsScaleEnabled ? "unknown" : "mediacodec") : frameFormatName) << "\","
         << "\"enableHardwareDecode\":" << (optionsSnapshot.enableHardwareDecode ? "true" : "false") << ","
         << "\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\","
+        << "\"decodeBackend\":\"" << decodeBackend << "\","
+        << "\"frameOutputType\":\"" << frameOutputTypeValue << "\","
+        << "\"renderer\":\"" << rendererValue << "\","
+        << "\"requestedRenderer\":\"" << requestedRendererValue << "\","
+        << "\"renderFallbackUsed\":" << (renderFallbackUsed ? "true" : "false") << ","
+        << "\"renderFallbackReason\":\"" << renderFallbackReasonValue << "\","
         << "\"hardwareDecodeAllowFallback\":" << (optionsSnapshot.hardwareDecodeAllowFallback ? "true" : "false") << ","
         << "\"requestedDecoderName\":\"" << escapeJson(optionsSnapshot.requestedDecoderName) << "\","
         << "\"actualDecoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
@@ -1164,6 +1411,21 @@ std::string NativePlayer::getStats() {
         << "\"softwareRenderedFrameCount\":" << softwareRenderedFrameCount_.load() << ","
         << "\"yuvGlRenderedFrameCount\":" << yuvGlRenderedFrameCount_.load() << ","
         << "\"yuvGlFallbackFrameCount\":" << yuvGlFallbackFrameCount_.load() << ","
+        << "\"nv12GlRenderedFrameCount\":" << nv12GlRenderedFrameCount_.load() << ","
+        << "\"nv12GlFallbackFrameCount\":" << nv12GlFallbackFrameCount_.load() << ","
+        << "\"nv12ThermalRenderedFrameCount\":" << nv12ThermalRenderedCount_.load() << ","
+        << "\"lastNv12GlRenderCostUs\":" << nv12GlLastRenderCostUs_.load() << ","
+        << "\"avgNv12GlRenderCostUs\":" << averageUs(nv12GlTotalRenderCostUs_.load(), nv12GlRenderCostSampleCount_.load()) << ","
+        << "\"maxNv12GlRenderCostUs\":" << nv12GlMaxRenderCostUs_.load() << ","
+        << "\"lastNv12GlUploadCostUs\":" << nv12GlLastUploadCostUs_.load() << ","
+        << "\"avgNv12GlUploadCostUs\":" << averageUs(nv12GlTotalUploadCostUs_.load(), nv12GlUploadCostSampleCount_.load()) << ","
+        << "\"maxNv12GlUploadCostUs\":" << nv12GlMaxUploadCostUs_.load() << ","
+        << "\"renderInputType\":\"" << renderInputValue << "\","
+        << "\"oesFrameAvailableCount\":" << oesFrameAvailableCount_.load() << ","
+        << "\"oesFrameRenderedCount\":" << oesFrameRenderedCount_.load() << ","
+        << "\"oesUpdateTexImageErrorCount\":" << oesRenderer_.getUpdateTexImageErrorCount() << ","
+        << "\"oesSurfaceRecreateCount\":" << oesRenderer_.getSurfaceRecreateCount() << ","
+        << "\"oesContextRecreateCount\":" << oesRenderer_.getContextRecreateCount() << ","
         << "\"swsScaleEnabled\":" << (swsScaleEnabled ? "true" : "false") << ","
         << "\"snapshotSupported\":" << (snapshotSupported ? "true" : "false") << ","
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
@@ -1182,6 +1444,9 @@ std::string NativePlayer::getStats() {
         << "\"fps\":" << fps_ << ","
         << "\"videoWidth\":" << videoWidth_ << ","
         << "\"videoHeight\":" << videoHeight_ << ","
+        << "\"frameColorRange\":\"" << colorRangeName(static_cast<AVColorRange>(lastFrameColorRange_.load())) << "\","
+        << "\"frameColorRangeValue\":" << lastFrameColorRange_.load() << ","
+        << "\"frameYStride\":" << lastFrameYStride_.load() << ","
         << "\"videoFrameCount\":" << videoFrameCount_.load() << ","
         << "\"audioFrameCount\":" << audioFrameCount_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
@@ -1285,7 +1550,28 @@ std::string NativePlayer::getStats() {
         << "\"reconnectLastErrorCode\":" << lastReconnectErrorCode_.load() << ","
         << "\"reconnectExhausted\":" << (reconnectExhausted_.load() ? "true" : "false") << ","
         << "\"reconnectLastError\":\"" << escapeJson(reconnectError) << "\","
-        << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\"}";
+        << "\"lastReconnectError\":\"" << escapeJson(reconnectError) << "\","
+        << "\"thermalEnabled\":" << (thermalConfig.enabled ? "true" : "false") << ","
+        << "\"thermalPalette\":\"" << thermalPaletteName(thermalConfig.palette) << "\","
+        << "\"thermalPaletteValue\":" << static_cast<int>(thermalConfig.palette) << ","
+        << "\"thermalAgcEnabled\":" << (thermalConfig.agcEnabled ? "true" : "false") << ","
+        << "\"thermalAgcValid\":" << (agcValidEffective ? "true" : "false") << ","
+        << "\"thermalAgcBlackPoint\":" << agcBlackEffective << ","
+        << "\"thermalAgcWhitePoint\":" << agcWhiteEffective << ","
+        << "\"thermalAgcUpdateCount\":" << agcUpdateCount_.load() << ","
+        << "\"nv12AgcUpdateCount\":" << nv12AgcUpdateCount_.load() << ","
+        << "\"nv12AgcInvalidCount\":" << nv12AgcInvalidCount_.load() << ","
+        << "\"oesAgcUpdateCount\":" << oesRenderer_.getAgcUpdateCount() << ","
+        << "\"oesAgcReadbackErrorCount\":" << oesRenderer_.getAgcReadbackErrorCount() << ","
+        << "\"thermalGamma\":" << thermalConfig.gamma << ","
+        << "\"thermalBlackPoint\":" << thermalConfig.blackPoint << ","
+        << "\"thermalWhitePoint\":" << thermalConfig.whitePoint << ","
+        << "\"thermalWindowApplied\":" << (thermalWindowApplied ? "true" : "false") << ","
+        << "\"thermalRenderMode\":\"" << effectiveThermalRenderMode << "\","
+        << "\"thermalInputType\":\"" << thermalInputType << "\","
+        << "\"oesThermalRenderedCount\":" << oesThermalRenderedCount_.load() << ","
+        << "\"whiteHotRenderedFrameCount\":" << whiteHotRenderedFrameCount_.load() << ","
+        << "\"ironbowRenderedFrameCount\":" << ironbowRenderedFrameCount_.load() << "}";
     return out.str();
 }
 
@@ -1609,7 +1895,7 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
 
     RenderMode parsedMode;
     if (!parseRenderMode(mode, parsedMode)) {
-        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, or mediacodec_surface");
+        return jsonError(-1, "hardware_render_mode must be software_rgba, software_yuv_gl, mediacodec_surface, mediacodec_oes, or mediacodec_nv12_gl");
     }
 
     PlayerOptions optionsSnapshot;
@@ -1635,6 +1921,101 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
          optionsSnapshot.enableHardwareDecode ? 1 : 0, renderModeName(optionsSnapshot.renderMode).c_str());
     std::ostringstream out;
     out << "{\"success\":true,\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\"}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalEnabled(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.enabled = enabled;
+    }
+    LOGI("setThermalEnabled enabled=%d", enabled ? 1 : 0);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalEnabled\":" << (enabled ? "true" : "false") << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalPalette(int palette) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    ThermalPaletteMode parsedMode;
+    if (!parseThermalPalette(palette, parsedMode)) {
+        return jsonError(-1, "thermal palette must be 0 (original), 1 (white_hot), or 2 (ironbow)");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.palette = parsedMode;
+    }
+    LOGI("setThermalPalette palette=%s", thermalPaletteName(parsedMode).c_str());
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalPalette\":\"" << thermalPaletteName(parsedMode)
+        << "\",\"thermalPaletteValue\":" << static_cast<int>(parsedMode) << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalAgcEnabled(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.agcEnabled = enabled;
+    }
+    // Reset AGC state so a re-enable re-initializes quickly from the new scene.
+    agcValid_.store(false);
+    agcFrameCounter_.store(0);
+    oesRenderer_.resetAgc();
+    oesAgcFrameCounter_.store(0);
+    nv12AgcValid_.store(false);
+    nv12AgcFrameCounter_.store(0);
+    LOGI("setThermalAgcEnabled agc=%d", enabled ? 1 : 0);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalAgcEnabled\":" << (enabled ? "true" : "false") << "}";
+    return out.str();
+}
+
+std::string NativePlayer::setThermalGamma(float gamma) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (!isValidThermalGamma(gamma)) {
+        return jsonError(-1, "thermal gamma must be finite and in range 0.5 ~ 2.0");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.gamma = gamma;
+    }
+    LOGI("setThermalGamma gamma=%.3f", gamma);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalGamma\":" << gamma << "}";
+    return out.str();
+}
+
+ThermalConfig NativePlayer::getThermalConfig() const {
+    std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+    return thermalConfig_;
+}
+
+std::string NativePlayer::setThermalWindow(float blackPoint, float whitePoint) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+    if (!isValidThermalWindow(blackPoint, whitePoint)) {
+        return jsonError(-1, "thermal window must satisfy finite, 0.0 <= blackPoint < whitePoint <= 1.0, min span 0.01");
+    }
+    {
+        std::lock_guard<std::mutex> lock(thermalConfigMutex_);
+        thermalConfig_.blackPoint = blackPoint;
+        thermalConfig_.whitePoint = whitePoint;
+    }
+    LOGI("setThermalWindow blackPoint=%.3f whitePoint=%.3f", blackPoint, whitePoint);
+    std::ostringstream out;
+    out << "{\"success\":true,\"thermalBlackPoint\":" << blackPoint
+        << ",\"thermalWhitePoint\":" << whitePoint << "}";
     return out.str();
 }
 
@@ -1667,6 +2048,10 @@ std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
         if (playerOptions_.renderMode == RenderMode::SOFTWARE_YUV_GL) {
             LOGE("snapshot unsupported in software_yuv_gl");
             return jsonError(-1, "Snapshot is not supported in software_yuv_gl mode yet. Use software_rgba mode or PixelCopy.");
+        }
+        if (playerOptions_.renderMode == RenderMode::MEDIACODEC_OES) {
+            LOGE("snapshot unsupported in mediacodec_oes");
+            return jsonError(-1, "Snapshot is not supported in mediacodec_oes mode yet. Use software_rgba mode or PixelCopy.");
         }
     }
 
@@ -1820,6 +2205,8 @@ std::string NativePlayer::release() {
     detachCurrentThreadIfNeeded(attached);
     clearLastFrame();
     releaseFfmpegResources();
+    oesRenderer_.release();
+    nv12GlRenderer_.release();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2498,31 +2885,16 @@ void NativePlayer::playbackLoop() {
             break;
         }
 
-        const int64_t packetCount = readPacketCount_.fetch_add(1) + 1;
+        readPacketCount_.fetch_add(1);
         const int packetSize = std::max(packet_->size, 0);
         inputPacketBytes_.fetch_add(packetSize);
         ++sessionReadPacketCount;
-        if (packetCount == 1 || packetCount % 250 == 0) {
-            LOGI("read packet count=%lld stream=%d size=%d pts=%lld dts=%lld flags=0x%x",
-                 static_cast<long long>(packetCount), packet_->stream_index, packet_->size,
-                 static_cast<long long>(packet_->pts), static_cast<long long>(packet_->dts), packet_->flags);
-        }
         if (packet_->stream_index == videoStreamIndex_) {
-            const int64_t videoPackets = videoPacketCount_.fetch_add(1) + 1;
+            videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
-            if (videoPackets == 1 || videoPackets % 100 == 0) {
-                LOGI("video packet count=%lld size=%d pts=%lld key=%d",
-                     static_cast<long long>(videoPackets), packet_->size,
-                     static_cast<long long>(packet_->pts), (packet_->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
-            }
         } else if (packet_->stream_index == audioStreamIndex_) {
-            const int64_t audioPackets = audioPacketCount_.fetch_add(1) + 1;
+            audioPacketCount_.fetch_add(1);
             audioPacketBytes_.fetch_add(packetSize);
-            if (audioPackets == 1 || audioPackets % 100 == 0) {
-                LOGI("audio packet count=%lld size=%d pts=%lld",
-                     static_cast<long long>(audioPackets), packet_->size,
-                     static_cast<long long>(packet_->pts));
-            }
             lastAudioFrameTimeMs_.store(nowMs());
             if (formatContext_ != nullptr && audioStreamIndex_ >= 0 && packet_->pts != AV_NOPTS_VALUE) {
                 audioClockUs_.store(av_rescale_q(packet_->pts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
@@ -2591,19 +2963,14 @@ void NativePlayer::playbackLoop() {
             bool hasLatestFrame = false;
 
             auto processDecodedVideoFrame = [&](AVFrame *frame, int64_t frameProcessStartUs) {
+                if (frame != nullptr && frame->format != AV_PIX_FMT_MEDIACODEC) {
+                    lastFrameYStride_.store(frame->linesize[0] > 0 ? frame->linesize[0] : 0);
+                    lastFrameColorRange_.store(frame->color_range);
+                }
                 if (renderFrame(frame)) {
-                    int64_t ptsUs = 0;
-                    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                        ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
-                    }
                     recordCost(lastFrameProcessCostUs_, totalFrameProcessCostUs_, frameProcessCostSampleCount_, maxFrameProcessCostUs_,
                                steadyNowUs() - frameProcessStartUs);
-                    const int64_t frames = videoFrameCount_.fetch_add(1) + 1;
-                    if (frames == 1 || frames % 100 == 0) {
-                        LOGI("decoded video frame count=%lld width=%d height=%d format=%d ptsUs=%lld",
-                             static_cast<long long>(frames), frame->width, frame->height,
-                             frame->format, static_cast<long long>(ptsUs));
-                    }
+                    videoFrameCount_.fetch_add(1);
                 }
             };
 
@@ -2648,6 +3015,8 @@ void NativePlayer::playbackLoop() {
             }
         }
 
+        renderOesPendingFrameIfReady();
+
         av_packet_unref(packet_);
     }
 
@@ -2658,12 +3027,87 @@ void NativePlayer::playbackLoop() {
     LOGI("playback thread ended player=%p", this);
 }
 
+void NativePlayer::notifyOesFrameAvailable() {
+    oesFramePending_.store(true);
+    oesFrameAvailableCount_.fetch_add(1);
+}
+
+void NativePlayer::renderOesPendingFrameIfReady() {
+    if (!oesRenderer_.isPrepared() || !oesFramePending_.load()) {
+        return;
+    }
+    PlayerOptions snapshot;
+    int frameWidth = 0;
+    int frameHeight = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot = playerOptions_;
+        frameWidth = videoWidth_;
+        frameHeight = videoHeight_;
+    }
+    if (snapshot.renderMode != RenderMode::MEDIACODEC_OES) {
+        oesFramePending_.store(false);
+        return;
+    }
+    if (!oesFramePending_.exchange(false)) {
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        oesFramePending_.store(true);
+        return;
+    }
+
+    const ThermalConfig thermal = getThermalConfig();
+    int oesThermalMode = 0;  // original
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            oesThermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            oesThermalMode = 2;
+        }
+    }
+    lastOesThermalRenderMode_.store(oesThermalMode);
+
+    const bool agcEnabled = thermal.enabled && thermal.agcEnabled && oesThermalMode != 0;
+    bool runAgc = false;
+    if (agcEnabled) {
+        const int frame = oesAgcFrameCounter_.fetch_add(1) + 1;
+        if (frame >= kOesAgcUpdateIntervalFrames) {
+            oesAgcFrameCounter_.store(0);
+            runAgc = true;
+        }
+    }
+
+    if (oesRenderer_.renderOesFrame(env, frameWidth, frameHeight, oesThermalMode,
+                                    thermal.gamma, thermal.blackPoint, thermal.whitePoint,
+                                    agcEnabled, runAgc)) {
+        oesFrameRenderedCount_.fetch_add(1);
+        lastRendererType_.store(4);  // oes_gl
+        if (oesThermalMode != 0) {
+            oesThermalRenderedCount_.fetch_add(1);
+        }
+        lastRenderTimeMs_.store(nowMs());
+    } else {
+        const int64_t fails = oesRenderFailCount_.fetch_add(1) + 1;
+        if (fails == 1 || fails % 100 == 0) {
+            LOGE("OES render frame failed count=%lld updateTexImageErrors=%lld contextRecreates=%lld",
+                 static_cast<long long>(fails),
+                 static_cast<long long>(oesRenderer_.getUpdateTexImageErrorCount()),
+                 static_cast<long long>(oesRenderer_.getContextRecreateCount()));
+        }
+    }
+    detachCurrentThreadIfNeeded(attached);
+}
+
 bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
     if (frame == nullptr) {
         return false;
     }
 
     hardwareDecodedFrameCount_.fetch_add(1);
+    lastFrameOutputType_.store(3);  // direct_surface
     lastSwsScaleCostUs_.store(-1);
     lastRenderLockCostUs_.store(-1);
     lastRenderCopyCostUs_.store(-1);
@@ -2714,16 +3158,8 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
         return true;
     }
 
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
-    const int64_t hardwareRendered = hardwareRenderedFrameCount_.fetch_add(1) + 1;
-    if (hardwareRendered == 1 || hardwareRendered % 100 == 0) {
-        LOGI("receive AV_PIX_FMT_MEDIACODEC frame count=%lld ptsUs=%lld",
-             static_cast<long long>(hardwareRenderedFrameCount_.load()),
-             static_cast<long long>(ptsUs));
-        LOGI("release mediacodec buffer render=1 count=%lld renderedFrameCount=%lld",
-             static_cast<long long>(hardwareRendered),
-             static_cast<long long>(renderedFrames));
-    }
+    renderedFrameCount_.fetch_add(1);
+    hardwareRenderedFrameCount_.fetch_add(1);
     lastRenderTimeMs_.store(nowMs());
     return true;
 }
@@ -2732,7 +3168,132 @@ bool NativePlayer::isSoftwareYuvGlFrameSupported(int frameFormat) const {
     return frameFormat == AV_PIX_FMT_YUV420P || frameFormat == AV_PIX_FMT_YUVJ420P;
 }
 
-bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
+void NativePlayer::updateAgcState(AVFrame *frame, const ThermalConfig &thermal) {
+    if (!thermal.agcEnabled || frame == nullptr) {
+        return;
+    }
+    const int frameCount = agcFrameCounter_.fetch_add(1) + 1;
+    if (frameCount < kAgcUpdateIntervalFrames) {
+        return;
+    }
+    agcFrameCounter_.store(0);
+    const AgcResult detected = computeAgcWindow(frame->data[0], frame->linesize[0],
+                                                frame->width, frame->height,
+                                                static_cast<AVColorRange>(frame->color_range));
+    if (!detected.valid) {
+        return;
+    }
+    if (!agcValid_.load()) {
+        agcBlackPoint_.store(detected.blackPoint);
+        agcWhitePoint_.store(detected.whitePoint);
+        agcValid_.store(true);
+        LOGI("AGC initialized blackPoint=%.3f whitePoint=%.3f", detected.blackPoint, detected.whitePoint);
+    } else {
+        const float oldBlack = agcBlackPoint_.load();
+        const float oldWhite = agcWhitePoint_.load();
+        agcBlackPoint_.store(oldBlack * (1.0f - kAgcSmoothingAlpha) + detected.blackPoint * kAgcSmoothingAlpha);
+        agcWhitePoint_.store(oldWhite * (1.0f - kAgcSmoothingAlpha) + detected.whitePoint * kAgcSmoothingAlpha);
+    }
+    agcUpdateCount_.fetch_add(1);
+}
+
+bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
+    if (frame == nullptr || frame->data[0] == nullptr || frame->data[1] == nullptr
+        || frame->linesize[0] <= 0 || frame->linesize[1] <= 0) {
+        return false;
+    }
+
+    const ThermalConfig thermal = getThermalConfig();
+    int nv12ThermalMode = 0;  // original
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            nv12ThermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            nv12ThermalMode = 2;
+        }
+    }
+    lastNv12ThermalRenderMode_.store(nv12ThermalMode);
+
+    // NV12 AGC: analyze the CPU-visible Y plane (data[0]) with the shared Phase 1
+    // luma8 helper (4x4 sampling, 256-bin histogram, P2/P98, range normalize).
+    if (frameWidth != nv12AgcLastFrameWidth_.load() || frameHeight != nv12AgcLastFrameHeight_.load()) {
+        // Resolution change / new stream: drop stale AGC validity for a fresh scene.
+        nv12AgcValid_.store(false);
+        nv12AgcFrameCounter_.store(0);
+        nv12AgcLastFrameWidth_.store(frameWidth);
+        nv12AgcLastFrameHeight_.store(frameHeight);
+    }
+    float effectiveBlack = thermal.blackPoint;
+    float effectiveWhite = thermal.whitePoint;
+    if (nv12ThermalMode != 0 && thermal.agcEnabled) {
+        const int frameCount = nv12AgcFrameCounter_.fetch_add(1) + 1;
+        if (frameCount >= kAgcUpdateIntervalFrames) {
+            nv12AgcFrameCounter_.store(0);
+            const AgcResult detected = computeAgcWindow(frame->data[0], frame->linesize[0],
+                                                        frameWidth, frameHeight,
+                                                        static_cast<AVColorRange>(frame->color_range));
+            if (detected.valid) {
+                if (!nv12AgcValid_.load()) {
+                    nv12AgcBlackPoint_.store(detected.blackPoint);
+                    nv12AgcWhitePoint_.store(detected.whitePoint);
+                    nv12AgcValid_.store(true);
+                } else {
+                    const float oldBlack = nv12AgcBlackPoint_.load();
+                    const float oldWhite = nv12AgcWhitePoint_.load();
+                    nv12AgcBlackPoint_.store(oldBlack * (1.0f - kAgcSmoothingAlpha) + detected.blackPoint * kAgcSmoothingAlpha);
+                    nv12AgcWhitePoint_.store(oldWhite * (1.0f - kAgcSmoothingAlpha) + detected.whitePoint * kAgcSmoothingAlpha);
+                }
+                nv12AgcUpdateCount_.fetch_add(1);
+            } else {
+                nv12AgcInvalidCount_.fetch_add(1);
+            }
+        }
+        if (nv12AgcValid_.load()) {
+            effectiveBlack = nv12AgcBlackPoint_.load();
+            effectiveWhite = nv12AgcWhitePoint_.load();
+        }
+    }
+
+    const RenderResult result = nv12GlRenderer_.renderNv12(frame->data[0], frame->linesize[0],
+                                                           frame->data[1], frame->linesize[1],
+                                                           frameWidth, frameHeight,
+                                                           static_cast<int>(frame->color_range),
+                                                           static_cast<int>(frame->colorspace),
+                                                           nv12ThermalMode, thermal.gamma,
+                                                           effectiveBlack, effectiveWhite);
+    if (result.stats.copyCostUs > 0) {
+        recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
+                   nv12GlMaxUploadCostUs_, result.stats.copyCostUs);
+    }
+    if (result.success) {
+        lastRendererType_.store(3);  // nv12_gl
+        // sws_scale is not used on the NV12 GL path: explicit disabled sentinel.
+        lastSwsScaleCostUs_.store(-1);
+        // Report the mode actually applied by the renderer (e.g. ironbow -> white hot fallback).
+        lastNv12ThermalRenderMode_.store(nv12GlRenderer_.getLastAppliedThermalMode());
+        nv12GlRenderedFrameCount_.fetch_add(1);
+        renderedFrameCount_.fetch_add(1);
+        if (nv12ThermalMode != 0) {
+            nv12ThermalRenderedCount_.fetch_add(1);
+        }
+        if (result.stats.totalCostUs > 0) {
+            lastRenderCostUs_.store(result.stats.totalCostUs);
+            recordCost(nv12GlLastRenderCostUs_, nv12GlTotalRenderCostUs_, nv12GlRenderCostSampleCount_,
+                       nv12GlMaxRenderCostUs_, result.stats.totalCostUs);
+        }
+        lastRenderTimeMs_.store(nowMs());
+        return true;
+    }
+    const int64_t fallback = nv12GlFallbackFrameCount_.fetch_add(1) + 1;
+    if (fallback == 1 || fallback % 100 == 0) {
+        LOGE("NV12 GL render failed, fallback RGBA count=%lld error=%s",
+             static_cast<long long>(fallback), result.errorMessage.c_str());
+    }
+    renderFallbackReasonCode_.store(1);
+    return false;
+}
+
+bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight) {
     if (frame == nullptr || !isSoftwareYuvGlFrameSupported(frame->format)) {
         return false;
     }
@@ -2741,10 +3302,37 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
         return false;
     }
 
+    const ThermalConfig thermal = getThermalConfig();
+    int thermalMode = 0;  // normal
+    if (thermal.enabled) {
+        if (thermal.palette == ThermalPaletteMode::WHITE_HOT) {
+            thermalMode = 1;
+        } else if (thermal.palette == ThermalPaletteMode::IRONBOW) {
+            thermalMode = 2;
+        }
+    }
+    lastThermalRenderMode_.store(thermalMode);
+
+    ThermalRenderParams renderParams;
+    renderParams.gamma = thermal.gamma;
+    renderParams.blackPoint = thermal.blackPoint;
+    renderParams.whitePoint = thermal.whitePoint;
+    if (frame->color_range == AVCOL_RANGE_MPEG) {
+        renderParams.yMin = 16.0f / 255.0f;
+        renderParams.yScale = 255.0f / 219.0f;
+    }
+    if (thermalMode == 1 || thermalMode == 2) {
+        updateAgcState(frame, thermal);
+        if (thermal.agcEnabled && agcValid_.load()) {
+            renderParams.blackPoint = agcBlackPoint_.load();
+            renderParams.whitePoint = agcWhitePoint_.load();
+        }
+    }
+
     const RenderResult result = yuvGlRenderer_.renderI420(frame->data[0], frame->linesize[0],
                                                           frame->data[1], frame->linesize[1],
                                                           frame->data[2], frame->linesize[2],
-                                                          frameWidth, frameHeight);
+                                                          frameWidth, frameHeight, thermalMode, renderParams);
     lastSwsScaleCostUs_.store(-1);
     lastRenderCostUs_.store(result.stats.totalCostUs);
     lastRenderLockCostUs_.store(-1);
@@ -2764,17 +3352,18 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
         return false;
     }
 
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    renderedFrameCount_.fetch_add(1);
     softwareRenderedFrameCount_.fetch_add(1);
-    const int64_t yuvGlRendered = yuvGlRenderedFrameCount_.fetch_add(1) + 1;
+    yuvGlRenderedFrameCount_.fetch_add(1);
+    lastRendererType_.store(2);  // yuv_gl
+    if (thermalMode == 1) {
+        whiteHotRenderedFrameCount_.fetch_add(1);
+    } else if (thermalMode == 2) {
+        ironbowRenderedFrameCount_.fetch_add(1);
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastFrameFormatName_ = "yuv420p_gl";
-    }
-    if (yuvGlRendered == 1 || yuvGlRendered % 100 == 0) {
-        LOGI("GL YUV render success count=%lld renderedFrameCount=%lld width=%d height=%d ptsUs=%lld",
-             static_cast<long long>(yuvGlRendered), static_cast<long long>(renderedFrames),
-             frameWidth, frameHeight, static_cast<long long>(ptsUs));
     }
     lastRenderTimeMs_.store(nowMs());
     return true;
@@ -2806,11 +3395,25 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         return renderMediaCodecFrame(frame, ptsUs);
     }
 
-    softwareDecodedFrameCount_.fetch_add(1);
     const char *formatName = av_get_pix_fmt_name(sourceFormat);
+    bool hardwareBackend = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastFrameFormatName_ = formatName == nullptr ? "unknown" : formatName;
+        // The decoder backend, not the requested render mode, decides the counter.
+        hardwareBackend = playerOptions_.usingHardwareDecoder;
+    }
+    if (sourceFormat == AV_PIX_FMT_NV12) {
+        lastFrameOutputType_.store(2);
+    } else if (sourceFormat == AV_PIX_FMT_YUV420P || sourceFormat == AV_PIX_FMT_YUVJ420P) {
+        lastFrameOutputType_.store(1);
+    } else {
+        lastFrameOutputType_.store(0);
+    }
+    if (hardwareBackend) {
+        hardwareDecodedFrameCount_.fetch_add(1);
+    } else {
+        softwareDecodedFrameCount_.fetch_add(1);
     }
     if (shouldDropRealtimeFrame(ptsUs)) {
         return true;
@@ -2821,8 +3424,18 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         optionsSnapshot = playerOptions_;
     }
+    if (optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL
+        && sourceFormat == AV_PIX_FMT_NV12
+        && optionsSnapshot.usingHardwareDecoder
+        && nv12GlRenderer_.isReady()) {
+        // NV12 GL success bypasses sws_scale / RGBA / ANativeWindow entirely.
+        if (renderNv12GlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+            return true;
+        }
+        // render failure falls through to the safe sws/RGBA path (counted + logged in renderNv12GlFrame).
+    }
     if (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL) {
-        if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+        if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight)) {
             return true;
         }
         if (!isSoftwareYuvGlFrameSupported(frame->format)) {
@@ -2832,6 +3445,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
                      frame->format, static_cast<long long>(fallbackCount));
             }
         }
+        renderFallbackReasonCode_.store(2);
     }
 
     if (swsContext_ == nullptr || swsSourceFormat_ != frame->format || videoWidth_ != frameWidth || videoHeight_ != frameHeight) {
@@ -2900,13 +3514,9 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         frameDropBeforeRenderCount_.fetch_add(1);
         return true;
     }
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    renderedFrameCount_.fetch_add(1);
     softwareRenderedFrameCount_.fetch_add(1);
-    if (renderedFrames == 1 || renderedFrames % 100 == 0) {
-        LOGI("render success count=%lld width=%d height=%d rgbaLineSize=%d ptsUs=%lld",
-             static_cast<long long>(renderedFrames), frameWidth, frameHeight,
-             rgbaFrame_->linesize[0], static_cast<long long>(ptsUs));
-    }
+    lastRendererType_.store(1);  // rgba_nativewindow
     lastRenderTimeMs_.store(nowMs());
     return true;
 }
@@ -2979,6 +3589,39 @@ void NativePlayer::resetStats() {
     softwareRenderedFrameCount_.store(0);
     yuvGlRenderedFrameCount_.store(0);
     yuvGlFallbackFrameCount_.store(0);
+    nv12GlRenderedFrameCount_.store(0);
+    nv12GlFallbackFrameCount_.store(0);
+    nv12ThermalRenderedCount_.store(0);
+    lastNv12ThermalRenderMode_.store(0);
+    nv12AgcValid_.store(false);
+    nv12AgcBlackPoint_.store(0.0f);
+    nv12AgcWhitePoint_.store(1.0f);
+    nv12AgcUpdateCount_.store(0);
+    nv12AgcInvalidCount_.store(0);
+    nv12AgcFrameCounter_.store(0);
+    nv12AgcLastFrameWidth_.store(0);
+    nv12AgcLastFrameHeight_.store(0);
+    nv12GlLastRenderCostUs_.store(0);
+    nv12GlTotalRenderCostUs_.store(0);
+    nv12GlRenderCostSampleCount_.store(0);
+    nv12GlMaxRenderCostUs_.store(0);
+    nv12GlLastUploadCostUs_.store(0);
+    nv12GlTotalUploadCostUs_.store(0);
+    nv12GlUploadCostSampleCount_.store(0);
+    nv12GlMaxUploadCostUs_.store(0);
+    lastFrameYStride_.store(0);
+    lastFrameColorRange_.store(0);
+    lastFrameOutputType_.store(0);
+    lastRendererType_.store(0);
+    renderFallbackReasonCode_.store(0);
+    oesFrameAvailableCount_.store(0);
+    oesFrameRenderedCount_.store(0);
+    oesRenderFailCount_.store(0);
+    oesThermalRenderedCount_.store(0);
+    lastOesThermalRenderMode_.store(0);
+    oesAgcFrameCounter_.store(0);
+    oesRenderer_.resetDiagnostics();
+    oesRenderer_.resetAgc();
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);

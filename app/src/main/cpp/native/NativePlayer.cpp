@@ -3340,6 +3340,8 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
     }
     if (result.success) {
         lastRendererType_.store(3);  // nv12_gl
+        // sws_scale is not used on the NV12 GL path: explicit disabled sentinel.
+        lastSwsScaleCostUs_.store(-1);
         // Report the mode actually applied by the renderer (e.g. ironbow -> white hot fallback).
         lastNv12ThermalRenderMode_.store(nv12GlRenderer_.getLastAppliedThermalMode());
         nv12GlRenderedFrameCount_.fetch_add(1);
@@ -3348,6 +3350,7 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
             nv12ThermalRenderedCount_.fetch_add(1);
         }
         if (result.stats.totalCostUs > 0) {
+            lastRenderCostUs_.store(result.stats.totalCostUs);
             recordCost(nv12GlLastRenderCostUs_, nv12GlTotalRenderCostUs_, nv12GlRenderCostSampleCount_,
                        nv12GlMaxRenderCostUs_, result.stats.totalCostUs);
         }

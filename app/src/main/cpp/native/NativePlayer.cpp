@@ -116,6 +116,17 @@ const char *stateName(PlayerState state) {
     return "unknown";
 }
 
+std::string snapshotError(const std::string &errorCode,
+                          const std::string &message,
+                          const std::string &captureMode) {
+    std::ostringstream out;
+    out << "{\"success\":false,\"errorCode\":\"" << escapeJson(errorCode) << "\","
+        << "\"message\":\"" << escapeJson(message) << "\","
+        << "\"errorMessage\":\"" << escapeJson(message) << "\","
+        << "\"snapshotCaptureMode\":\"" << escapeJson(captureMode) << "\"}";
+    return out.str();
+}
+
 const char *playerStateName(PlayerState state) {
     switch (state) {
         case PlayerState::Idle: return "IDLE";
@@ -345,6 +356,26 @@ bool isNetworkUrl(const std::string &url) {
            || lower.rfind("rtmp://", 0) == 0
            || lower.rfind("tcp://", 0) == 0
            || lower.rfind("udp://", 0) == 0;
+}
+
+const char *snapshotCaptureModeName(RenderMode renderMode, int rendererType) {
+    // GL and direct-Surface modes use the final displayed Surface as the
+    // snapshot source even when their current implementation happens to pass
+    // through the RGBA NativeWindow renderer. This preserves display-space
+    // transforms and keeps the capability contract stable across fallbacks.
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA:
+            return rendererType == 2 || rendererType == 3 || rendererType == 4
+                    ? "surface_pixelcopy"
+                    : "native_rgba";
+        case RenderMode::SOFTWARE_YUV_GL:
+        case RenderMode::MEDIACODEC_NV12_GL:
+        case RenderMode::MEDIACODEC_SURFACE:
+        case RenderMode::MEDIACODEC_OES:
+            return "surface_pixelcopy";
+        default:
+            return "unsupported";
+    }
 }
 
 std::string lowerTrimCopy(std::string value) {
@@ -1377,7 +1408,9 @@ std::string NativePlayer::getStats() {
     const int rendererType = lastRendererType_.load();
     // sws_scale -> RGBA is the renderer actually in use for rgba_nativewindow frames.
     const bool swsScaleEnabled = rendererType == 1;
-    const bool snapshotSupported = swsScaleEnabled;
+    const char *snapshotCaptureMode = snapshotCaptureModeName(optionsSnapshot.renderMode, rendererType);
+    const bool nativeSnapshotSupported = std::strcmp(snapshotCaptureMode, "native_rgba") == 0;
+    const bool snapshotSupported = std::strcmp(snapshotCaptureMode, "unsupported") != 0;
     const std::string decodeBackend = optionsSnapshot.usingHardwareDecoder ? "mediacodec" : "software";
     const char *frameOutputTypeValue = frameOutputTypeName(frameOutputType);
     const char *rendererValue = rendererTypeName(rendererType);
@@ -1493,6 +1526,8 @@ std::string NativePlayer::getStats() {
         << "\"oesContextRecreateCount\":" << oesRenderer_.getContextRecreateCount() << ","
         << "\"swsScaleEnabled\":" << (swsScaleEnabled ? "true" : "false") << ","
         << "\"snapshotSupported\":" << (snapshotSupported ? "true" : "false") << ","
+        << "\"nativeSnapshotSupported\":" << (nativeSnapshotSupported ? "true" : "false") << ","
+        << "\"snapshotCaptureMode\":\"" << snapshotCaptureMode << "\","
         << "\"audioCodec\":\"" << escapeJson(audioCodec_) << "\","
         << "\"audioSampleRate\":" << audioSampleRate_ << ","
         << "\"audioChannels\":" << audioChannels_ << ","
@@ -2115,22 +2150,27 @@ std::string NativePlayer::getLatencyConfig() {
 
 std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
     if (isReleased()) {
-        return jsonError(-1, "player is released");
+        return snapshotError("SNAPSHOT_PLAYER_RELEASED", "player is released", "unsupported");
     }
+
+    RenderMode renderMode = RenderMode::SOFTWARE_RGBA;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (playerOptions_.renderMode == RenderMode::MEDIACODEC_SURFACE && playerOptions_.usingHardwareDecoder) {
-            LOGE("snapshot unsupported in mediacodec_surface");
-            return jsonError(-1, "Snapshot is not supported in mediacodec_surface mode yet. Use software_rgba mode or implement PixelCopy.");
-        }
-        if (playerOptions_.renderMode == RenderMode::SOFTWARE_YUV_GL) {
-            LOGE("snapshot unsupported in software_yuv_gl");
-            return jsonError(-1, "Snapshot is not supported in software_yuv_gl mode yet. Use software_rgba mode or PixelCopy.");
-        }
-        if (playerOptions_.renderMode == RenderMode::MEDIACODEC_OES) {
-            LOGE("snapshot unsupported in mediacodec_oes");
-            return jsonError(-1, "Snapshot is not supported in mediacodec_oes mode yet. Use software_rgba mode or PixelCopy.");
-        }
+        renderMode = playerOptions_.renderMode;
+    }
+
+    const int rendererType = lastRendererType_.load();
+    const std::string captureMode = snapshotCaptureModeName(renderMode, rendererType);
+    LOGI("snapshot route=%s requestedRenderer=%s actualRenderer=%s",
+         captureMode.c_str(), rendererNameFromRenderMode(renderMode), rendererTypeName(rendererType));
+    if (captureMode == "surface_pixelcopy") {
+        return snapshotError(
+                "SNAPSHOT_REQUIRES_SURFACE_CAPTURE",
+                "Snapshot is not supported by the native RGBA frame cache; use surface capture",
+                captureMode);
+    }
+    if (captureMode != "native_rgba") {
+        return snapshotError("SNAPSHOT_UNSUPPORTED", "Snapshot is not supported", captureMode);
     }
 
     std::vector<uint8_t> frameCopy;
@@ -2142,7 +2182,7 @@ std::string NativePlayer::takeSnapshot(const std::string &outputPath) {
         std::lock_guard<std::mutex> lock(lastFrameMutex_);
         if (!hasLastFrame_ || lastRgbaFrame_.empty()) {
             LOGE("takePlayerSnapshot failed: no video frame available");
-            return jsonError(-1, "no video frame available");
+            return snapshotError("SNAPSHOT_NO_FRAME", "no video frame available", captureMode);
         }
         frameCopy = lastRgbaFrame_;
         width = lastFrameWidth_;

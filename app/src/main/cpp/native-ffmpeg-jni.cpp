@@ -300,6 +300,15 @@ bool wasPlayerHandleIssued(jlong handle) {
     return handle > 0 && handle < g_next_player_handle.load();
 }
 
+std::string snapshotJniError(const std::string &errorCode, const std::string &message) {
+    std::ostringstream out;
+    out << "{\"success\":false,\"errorCode\":\"" << escapeJson(errorCode) << "\","
+        << "\"message\":\"" << escapeJson(message) << "\","
+        << "\"errorMessage\":\"" << escapeJson(message) << "\","
+        << "\"snapshotCaptureMode\":\"unsupported\"}";
+    return out.str();
+}
+
 PlayerOperationGuard acquirePlayer(jlong handle, std::string &errorMessage) {
     if (handle == 0) {
         errorMessage = "player handle is 0";
@@ -719,15 +728,15 @@ jstring nativeTakePlayerSnapshot(JNIEnv *env, jclass, jlong handle, jstring outp
     PlayerOperationGuard guard = acquirePlayer(handle, error);
     NativePlayer *player = guard.player();
     if (player == nullptr) {
-        return toJString(env, jsonError(-1, error));
+        return toJString(env, snapshotJniError("SNAPSHOT_PLAYER_RELEASED", error));
     }
     if (outputPath == nullptr) {
-        return toJString(env, jsonError(-1, "outputPath is null"));
+        return toJString(env, snapshotJniError("SNAPSHOT_IO_ERROR", "outputPath is null"));
     }
 
     const char *chars = env->GetStringUTFChars(outputPath, nullptr);
     if (chars == nullptr) {
-        return toJString(env, jsonError(-1, "failed to read outputPath"));
+        return toJString(env, snapshotJniError("SNAPSHOT_IO_ERROR", "failed to read outputPath"));
     }
     std::string outputPathValue(chars);
     env->ReleaseStringUTFChars(outputPath, chars);

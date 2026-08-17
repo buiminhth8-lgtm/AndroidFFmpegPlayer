@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 extern "C" {
 #include "libavutil/pixfmt.h"
@@ -20,6 +22,10 @@ extern "C" {
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+int64_t currentThreadId() {
+    return static_cast<int64_t>(syscall(__NR_gettid));
+}
 
 std::string jsonSuccess(const std::string &message) {
     std::ostringstream out;
@@ -192,23 +198,18 @@ std::string NativeNv12GlRenderer::setSurface(JNIEnv *env, jobject surface, int w
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT) {
-        // Surface recreated: keep EGL context / program / textures, rebuild only
-        // the EGL window surface. Resolution change reallocates textures on the
-        // next render (glTexImage2D on size change).
-        if (!rebindEglSurfaceLocked(newWindow, width, height)) {
-            LOGI("NV12 GL EGLSurface rebind failed, full teardown on next render");
-            releaseGlLocked();
-        }
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
     }
-    if (window_ != nullptr) {
-        ANativeWindow_release(window_);
-    }
-    window_ = newWindow;
-    surfaceWidth_ = width;
-    surfaceHeight_ = height;
-    LOGI("setSurface NV12 GL success surface=%dx%d", width, height);
-    return jsonSuccess("nv12 gl surface set");
+    pendingWindow_ = newWindow;
+    pendingSurfaceWidth_ = width;
+    pendingSurfaceHeight_ = height;
+    pendingSurfaceAction_ = PendingSurfaceAction::ATTACH;
+    ++surfaceGeneration_;
+    LOGI("NV12 GL surface request attach generation=%llu thread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()), width, height);
+    return jsonSuccess("nv12 gl surface attach requested");
 }
 
 RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
@@ -221,8 +222,9 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    applyPendingSurfaceLocked();
     if (window_ == nullptr) {
-        return {false, -1, "Surface is not set", {}};
+        return {false, kRenderErrorNoSurface, "Surface is not set", {}};
     }
 
     RenderStats stats;
@@ -449,6 +451,26 @@ RenderResult NativeNv12GlRenderer::renderNv12(const uint8_t *yData, int yStride,
 
 void NativeNv12GlRenderer::clearSurface() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::DETACH;
+    ++surfaceGeneration_;
+    LOGI("NV12 GL surface request detach generation=%llu thread=%lld",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()));
+}
+
+void NativeNv12GlRenderer::release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
     releaseGlLocked();
     if (window_ != nullptr) {
         ANativeWindow_release(window_);
@@ -462,17 +484,101 @@ void NativeNv12GlRenderer::clearSurface() {
     uvStaging_.clear();
 }
 
-void NativeNv12GlRenderer::release() {
-    clearSurface();
+bool NativeNv12GlRenderer::syncSurface() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applyPendingSurfaceLocked();
+    return window_ != nullptr;
 }
 
 bool NativeNv12GlRenderer::isReady() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingSurfaceAction_ == PendingSurfaceAction::ATTACH) {
+        return pendingWindow_ != nullptr;
+    }
+    if (pendingSurfaceAction_ == PendingSurfaceAction::DETACH) {
+        return false;
+    }
     return window_ != nullptr;
+}
+
+int64_t NativeNv12GlRenderer::getEglContextCreateCount() const {
+    return eglContextCreateCount_.load();
+}
+
+int64_t NativeNv12GlRenderer::getEglSurfaceCreateCount() const {
+    return eglSurfaceCreateCount_.load();
+}
+
+int64_t NativeNv12GlRenderer::getEglOwnerThreadId() const {
+    return eglOwnerThreadId_.load();
+}
+
+uint64_t NativeNv12GlRenderer::getSurfaceGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return surfaceGeneration_;
+}
+
+uint64_t NativeNv12GlRenderer::getAppliedSurfaceGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return appliedSurfaceGeneration_;
 }
 
 int NativeNv12GlRenderer::getLastAppliedThermalMode() const {
     return lastAppliedThermalMode_.load();
+}
+
+void NativeNv12GlRenderer::applyPendingSurfaceLocked() {
+    if (pendingSurfaceAction_ == PendingSurfaceAction::NONE) {
+        return;
+    }
+
+    const PendingSurfaceAction action = pendingSurfaceAction_;
+    ANativeWindow *newWindow = pendingWindow_;
+    const int newWidth = pendingSurfaceWidth_;
+    const int newHeight = pendingSurfaceHeight_;
+    const uint64_t generation = surfaceGeneration_;
+    pendingWindow_ = nullptr;
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+
+    if (action == PendingSurfaceAction::DETACH) {
+        releaseEglSurfaceLocked();
+        if (window_ != nullptr) {
+            ANativeWindow_release(window_);
+            window_ = nullptr;
+        }
+        surfaceWidth_ = 0;
+        surfaceHeight_ = 0;
+        appliedSurfaceGeneration_ = generation;
+        eglOwnerThreadId_.store(currentThreadId());
+        LOGI("NV12 GL surface apply detach generation=%llu ownerThread=%lld contextPreserved=%d",
+             static_cast<unsigned long long>(generation),
+             static_cast<long long>(currentThreadId()),
+             eglContext_ != EGL_NO_CONTEXT ? 1 : 0);
+        return;
+    }
+
+    if (newWindow == nullptr) {
+        appliedSurfaceGeneration_ = generation;
+        return;
+    }
+    if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT
+        && !rebindEglSurfaceLocked(newWindow, newWidth, newHeight)) {
+        LOGE("NV12 GL EGLSurface rebind failed; owner thread will rebuild GL on next render");
+        releaseGlLocked();
+    }
+    if (window_ != nullptr) {
+        ANativeWindow_release(window_);
+    }
+    window_ = newWindow;
+    surfaceWidth_ = newWidth;
+    surfaceHeight_ = newHeight;
+    appliedSurfaceGeneration_ = generation;
+    eglOwnerThreadId_.store(currentThreadId());
+    LOGI("NV12 GL surface apply attach generation=%llu ownerThread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(generation),
+         static_cast<long long>(currentThreadId()), newWidth, newHeight);
 }
 
 bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {
@@ -528,6 +634,11 @@ bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {
         releaseGlLocked();
         return false;
     }
+    eglContextCreateCount_.fetch_add(1);
+    eglOwnerThreadId_.store(currentThreadId());
+    LOGI("NV12 GL EGL context created ownerThread=%lld count=%lld",
+         static_cast<long long>(currentThreadId()),
+         static_cast<long long>(eglContextCreateCount_.load()));
 
     eglSurface_ = eglCreateWindowSurface(eglDisplay_, eglConfig_, window_, nullptr);
     if (eglSurface_ == EGL_NO_SURFACE) {
@@ -535,6 +646,7 @@ bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {
         releaseGlLocked();
         return false;
     }
+    eglSurfaceCreateCount_.fetch_add(1);
     if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
         errorMessage = eglErrorString("eglMakeCurrent");
         releaseGlLocked();
@@ -566,15 +678,20 @@ bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {
 
 void NativeNv12GlRenderer::releaseGlLocked() {
     if (eglDisplay_ != EGL_NO_DISPLAY) {
+        bool glContextCurrent = false;
         if (eglSurface_ != EGL_NO_SURFACE && eglContext_ != EGL_NO_CONTEXT) {
-            eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_);
+            glContextCurrent = eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) == EGL_TRUE;
         }
         if (textures_[0] != 0 || textures_[1] != 0) {
-            glDeleteTextures(2, textures_);
+            if (glContextCurrent) {
+                glDeleteTextures(2, textures_);
+            }
             textures_[0] = textures_[1] = 0;
         }
         if (program_ != 0) {
-            glDeleteProgram(program_);
+            if (glContextCurrent) {
+                glDeleteProgram(program_);
+            }
             program_ = 0;
         }
         yMinLocation_ = -1;
@@ -583,7 +700,9 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         positionLocation_ = -1;
         texCoordLocation_ = -1;
         if (whiteHotProgram_ != 0) {
-            glDeleteProgram(whiteHotProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(whiteHotProgram_);
+            }
             whiteHotProgram_ = 0;
         }
         whiteHotYMinLocation_ = -1;
@@ -594,11 +713,15 @@ void NativeNv12GlRenderer::releaseGlLocked() {
         whiteHotPositionLocation_ = -1;
         whiteHotTexCoordLocation_ = -1;
         if (ironbowTexture_ != 0) {
-            glDeleteTextures(1, &ironbowTexture_);
+            if (glContextCurrent) {
+                glDeleteTextures(1, &ironbowTexture_);
+            }
             ironbowTexture_ = 0;
         }
         if (ironbowProgram_ != 0) {
-            glDeleteProgram(ironbowProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(ironbowProgram_);
+            }
             ironbowProgram_ = 0;
         }
         ironbowYMinLocation_ = -1;
@@ -630,6 +753,8 @@ bool NativeNv12GlRenderer::rebindEglSurfaceLocked(ANativeWindow *newWindow, int 
         LOGE("NV12 GL recreate EGLSurface failed eglError=0x%x", eglGetError());
         return false;
     }
+    eglSurfaceCreateCount_.fetch_add(1);
+    eglOwnerThreadId_.store(currentThreadId());
     if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
         LOGE("NV12 GL recreate EGLSurface makeCurrent failed eglError=0x%x", eglGetError());
         return false;

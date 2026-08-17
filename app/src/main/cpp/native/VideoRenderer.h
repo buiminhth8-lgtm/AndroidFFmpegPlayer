@@ -42,4 +42,7 @@ private:
     int height_ = 0;
 };
 
+// Surface absence is a temporary lifecycle state, not a renderer failure.
+constexpr int kRenderErrorNoSurface = -2;
+
 #endif // MOTRO_VIDEO_RENDERER_H

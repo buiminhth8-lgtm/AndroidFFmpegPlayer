@@ -10,12 +10,18 @@
 #include <chrono>
 #include <cstring>
 #include <sstream>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define LOG_TAG "FFmpegNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+int64_t currentThreadId() {
+    return static_cast<int64_t>(syscall(__NR_gettid));
+}
 
 std::string jsonSuccess(const std::string &message) {
     std::ostringstream out;
@@ -180,15 +186,18 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    releaseGlLocked();
-    if (window_ != nullptr) {
-        ANativeWindow_release(window_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
     }
-    window_ = newWindow;
-    surfaceWidth_ = width;
-    surfaceHeight_ = height;
-    LOGI("setSurface GL YUV success surface=%dx%d", width, height);
-    return jsonSuccess("gl yuv surface set");
+    pendingWindow_ = newWindow;
+    pendingSurfaceWidth_ = width;
+    pendingSurfaceHeight_ = height;
+    pendingSurfaceAction_ = PendingSurfaceAction::ATTACH;
+    ++surfaceGeneration_;
+    LOGI("GL YUV surface request attach generation=%llu thread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()), width, height);
+    return jsonSuccess("gl yuv surface attach requested");
 }
 
 RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
@@ -203,8 +212,9 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    applyPendingSurfaceLocked();
     if (window_ == nullptr) {
-        return {false, -1, "Surface is not set", {}};
+        return {false, kRenderErrorNoSurface, "Surface is not set", {}};
     }
 
     RenderStats stats;
@@ -308,8 +318,28 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     return {true, 0, "", stats};
 }
 
+void NativeYuvGlRenderer::clearSurface() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::DETACH;
+    ++surfaceGeneration_;
+    LOGI("GL YUV surface request detach generation=%llu thread=%lld",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()));
+}
+
 void NativeYuvGlRenderer::release() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
     releaseGlLocked();
     if (window_ != nullptr) {
         ANativeWindow_release(window_);
@@ -319,9 +349,97 @@ void NativeYuvGlRenderer::release() {
     surfaceHeight_ = 0;
 }
 
+bool NativeYuvGlRenderer::syncSurface() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applyPendingSurfaceLocked();
+    return window_ != nullptr;
+}
+
 bool NativeYuvGlRenderer::hasSurface() const {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingSurfaceAction_ == PendingSurfaceAction::ATTACH) {
+        return pendingWindow_ != nullptr;
+    }
+    if (pendingSurfaceAction_ == PendingSurfaceAction::DETACH) {
+        return false;
+    }
     return window_ != nullptr;
+}
+
+int64_t NativeYuvGlRenderer::getEglContextCreateCount() const {
+    return eglContextCreateCount_.load();
+}
+
+int64_t NativeYuvGlRenderer::getEglSurfaceCreateCount() const {
+    return eglSurfaceCreateCount_.load();
+}
+
+int64_t NativeYuvGlRenderer::getEglOwnerThreadId() const {
+    return eglOwnerThreadId_.load();
+}
+
+uint64_t NativeYuvGlRenderer::getSurfaceGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return surfaceGeneration_;
+}
+
+uint64_t NativeYuvGlRenderer::getAppliedSurfaceGeneration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return appliedSurfaceGeneration_;
+}
+
+void NativeYuvGlRenderer::applyPendingSurfaceLocked() {
+    if (pendingSurfaceAction_ == PendingSurfaceAction::NONE) {
+        return;
+    }
+
+    const PendingSurfaceAction action = pendingSurfaceAction_;
+    ANativeWindow *newWindow = pendingWindow_;
+    const int newWidth = pendingSurfaceWidth_;
+    const int newHeight = pendingSurfaceHeight_;
+    const uint64_t generation = surfaceGeneration_;
+    pendingWindow_ = nullptr;
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+
+    if (action == PendingSurfaceAction::DETACH) {
+        releaseEglSurfaceLocked();
+        if (window_ != nullptr) {
+            ANativeWindow_release(window_);
+            window_ = nullptr;
+        }
+        surfaceWidth_ = 0;
+        surfaceHeight_ = 0;
+        appliedSurfaceGeneration_ = generation;
+        eglOwnerThreadId_.store(currentThreadId());
+        LOGI("GL YUV surface apply detach generation=%llu ownerThread=%lld contextPreserved=%d",
+             static_cast<unsigned long long>(generation),
+             static_cast<long long>(currentThreadId()),
+             eglContext_ != EGL_NO_CONTEXT ? 1 : 0);
+        return;
+    }
+
+    if (newWindow == nullptr) {
+        appliedSurfaceGeneration_ = generation;
+        return;
+    }
+    if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT
+        && !rebindEglSurfaceLocked(newWindow, newWidth, newHeight)) {
+        LOGE("GL YUV EGLSurface rebind failed; owner thread will rebuild GL on next render");
+        releaseGlLocked();
+    }
+    if (window_ != nullptr) {
+        ANativeWindow_release(window_);
+    }
+    window_ = newWindow;
+    surfaceWidth_ = newWidth;
+    surfaceHeight_ = newHeight;
+    appliedSurfaceGeneration_ = generation;
+    eglOwnerThreadId_.store(currentThreadId());
+    LOGI("GL YUV surface apply attach generation=%llu ownerThread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(generation),
+         static_cast<long long>(currentThreadId()), newWidth, newHeight);
 }
 
 bool NativeYuvGlRenderer::ensureGlLocked(std::string &errorMessage) {
@@ -368,6 +486,11 @@ bool NativeYuvGlRenderer::ensureGlLocked(std::string &errorMessage) {
         releaseGlLocked();
         return false;
     }
+    eglContextCreateCount_.fetch_add(1);
+    eglOwnerThreadId_.store(currentThreadId());
+    LOGI("GL YUV EGL context created ownerThread=%lld count=%lld",
+         static_cast<long long>(currentThreadId()),
+         static_cast<long long>(eglContextCreateCount_.load()));
 
     eglSurface_ = eglCreateWindowSurface(eglDisplay_, eglConfig_, window_, nullptr);
     if (eglSurface_ == EGL_NO_SURFACE) {
@@ -375,6 +498,7 @@ bool NativeYuvGlRenderer::ensureGlLocked(std::string &errorMessage) {
         releaseGlLocked();
         return false;
     }
+    eglSurfaceCreateCount_.fetch_add(1);
     if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
         errorMessage = eglErrorString("eglMakeCurrent");
         releaseGlLocked();
@@ -389,37 +513,44 @@ bool NativeYuvGlRenderer::ensureGlLocked(std::string &errorMessage) {
 
 void NativeYuvGlRenderer::releaseGlLocked() {
     if (eglDisplay_ != EGL_NO_DISPLAY) {
+        bool glContextCurrent = false;
         if (eglSurface_ != EGL_NO_SURFACE && eglContext_ != EGL_NO_CONTEXT) {
-            eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_);
+            glContextCurrent = eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) == EGL_TRUE;
         }
         if (textures_[0] != 0 || textures_[1] != 0 || textures_[2] != 0) {
-            glDeleteTextures(3, textures_);
+            if (glContextCurrent) {
+                glDeleteTextures(3, textures_);
+            }
             textures_[0] = textures_[1] = textures_[2] = 0;
         }
         if (normalProgram_ != 0) {
-            glDeleteProgram(normalProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(normalProgram_);
+            }
             normalProgram_ = 0;
         }
         if (whiteHotProgram_ != 0) {
-            glDeleteProgram(whiteHotProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(whiteHotProgram_);
+            }
             whiteHotProgram_ = 0;
         }
         whiteHotUniforms_ = ThermalUniformSet{};
         if (ironbowTexture_ != 0) {
-            glDeleteTextures(1, &ironbowTexture_);
+            if (glContextCurrent) {
+                glDeleteTextures(1, &ironbowTexture_);
+            }
             ironbowTexture_ = 0;
         }
         if (ironbowProgram_ != 0) {
-            glDeleteProgram(ironbowProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(ironbowProgram_);
+            }
             ironbowProgram_ = 0;
         }
         ironbowUniforms_ = ThermalUniformSet{};
         ironbowPaletteLocation_ = -1;
-        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (eglSurface_ != EGL_NO_SURFACE) {
-            eglDestroySurface(eglDisplay_, eglSurface_);
-            eglSurface_ = EGL_NO_SURFACE;
-        }
+        releaseEglSurfaceLocked();
         if (eglContext_ != EGL_NO_CONTEXT) {
             eglDestroyContext(eglDisplay_, eglContext_);
             eglContext_ = EGL_NO_CONTEXT;
@@ -428,6 +559,37 @@ void NativeYuvGlRenderer::releaseGlLocked() {
         eglDisplay_ = EGL_NO_DISPLAY;
     }
     eglConfig_ = nullptr;
+}
+
+bool NativeYuvGlRenderer::rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height) {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglContext_ == EGL_NO_CONTEXT || newWindow == nullptr) {
+        return false;
+    }
+    releaseEglSurfaceLocked();
+    eglSurface_ = eglCreateWindowSurface(eglDisplay_, eglConfig_, newWindow, nullptr);
+    if (eglSurface_ == EGL_NO_SURFACE) {
+        LOGE("GL YUV recreate EGLSurface failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    eglSurfaceCreateCount_.fetch_add(1);
+    eglOwnerThreadId_.store(currentThreadId());
+    if (eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) != EGL_TRUE) {
+        LOGE("GL YUV recreate EGLSurface makeCurrent failed eglError=0x%x", eglGetError());
+        return false;
+    }
+    glViewport(0, 0, width > 0 ? width : 1, height > 0 ? height : 1);
+    return true;
+}
+
+void NativeYuvGlRenderer::releaseEglSurfaceLocked() {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglSurface_ == EGL_NO_SURFACE) {
+        return;
+    }
+    if (eglContext_ != EGL_NO_CONTEXT) {
+        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    eglDestroySurface(eglDisplay_, eglSurface_);
+    eglSurface_ = EGL_NO_SURFACE;
 }
 
 bool NativeYuvGlRenderer::compileProgramLocked(std::string &errorMessage) {

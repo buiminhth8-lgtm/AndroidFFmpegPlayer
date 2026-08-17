@@ -106,6 +106,9 @@ private:
                            const std::string &errorMessage);
     void beginStartupKeyFrameWait(const char *reason);
     void finishStartupKeyFrameWait(const char *reason);
+    bool commitDecodedVideoFormatIfChanged(int frameWidth, int frameHeight, int frameFormat,
+                                           int yStride, int colorRange);
+    void resetRealtimeClockForFormatDiscontinuity();
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
@@ -170,6 +173,8 @@ private:
     std::atomic<int64_t> videoDelaySampleCount_{0};
     std::atomic<int64_t> maxVideoDelayUs_{0};
     std::atomic<int64_t> wallClockUs_{0};
+    std::atomic<int64_t> decodedFormatChangeCount_{0};
+    std::atomic<int64_t> realtimeClockFormatResetCount_{0};
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;
@@ -195,6 +200,10 @@ private:
     std::string audioDecodeError_;
     std::string audioPlayError_;
     int swsSourceFormat_ = -1;
+    int swsSourceWidth_ = 0;
+    int swsSourceHeight_ = 0;
+    int decodedFrameFormat_ = -1;
+    uint64_t decodedFormatGeneration_ = 0;
     double fps_ = 25.0;
     std::string videoCodec_;
     std::string audioCodec_;
@@ -228,8 +237,10 @@ private:
     std::atomic<int64_t> softwareRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlRenderedFrameCount_{0};
     std::atomic<int64_t> yuvGlFallbackFrameCount_{0};
+    std::atomic<int64_t> yuvGlNoSurfaceFrameCount_{0};
     std::atomic<int64_t> nv12GlRenderedFrameCount_{0};
     std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
+    std::atomic<int64_t> nv12GlNoSurfaceFrameCount_{0};
     std::atomic<int64_t> nv12ThermalRenderedCount_{0};
     std::atomic<int> lastNv12ThermalRenderMode_{0};
     std::atomic<bool> nv12AgcValid_{false};

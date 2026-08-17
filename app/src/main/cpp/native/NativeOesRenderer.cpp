@@ -12,12 +12,18 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #define LOG_TAG "FFmpegNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+int64_t currentThreadId() {
+    return static_cast<int64_t>(syscall(__NR_gettid));
+}
 
 JavaVM *g_oes_java_vm = nullptr;
 jclass g_oes_frame_listener_class = nullptr;  // global ref, cached at JNI_OnLoad
@@ -221,26 +227,18 @@ std::string NativeOesRenderer::setSurface(JNIEnv *env, jobject surface, int widt
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (prepared_.load()) {
-        // Surface recreated during OES playback: keep SurfaceTexture / OES texture /
-        // program (decoder output unchanged); only rebuild the EGL window surface.
-        if (!rebindEglSurfaceLocked(newWindow, width, height)) {
-            LOGE("OES EGL surface rebind failed, full teardown; re-prepare required");
-            releaseGlLocked();
-            releaseJavaLocked(env);
-            prepared_.store(false);
-        } else {
-            surfaceRecreateCount_.fetch_add(1);
-        }
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
     }
-    if (window_ != nullptr) {
-        ANativeWindow_release(window_);
-    }
-    window_ = newWindow;
-    surfaceWidth_ = width;
-    surfaceHeight_ = height;
-    LOGI("setSurface OES success surface=%dx%d", width, height);
-    return jsonSuccess("oes surface set");
+    pendingWindow_ = newWindow;
+    pendingSurfaceWidth_ = width;
+    pendingSurfaceHeight_ = height;
+    pendingSurfaceAction_ = PendingSurfaceAction::ATTACH;
+    ++surfaceGeneration_;
+    LOGI("OES surface request attach generation=%llu thread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()), width, height);
+    return jsonSuccess("oes surface attach requested");
 }
 
 bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage) {
@@ -249,6 +247,10 @@ bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::s
         return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!applyPendingSurfaceLocked(env)) {
+        errorMessage = "OES pending Surface apply failed";
+        return false;
+    }
     if (prepared_.load()) {
         return true;
     }
@@ -392,6 +394,9 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
         return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!applyPendingSurfaceLocked(env) || window_ == nullptr || eglSurface_ == EGL_NO_SURFACE) {
+        return false;
+    }
     if (!prepared_.load()) {
         return false;
     }
@@ -575,8 +580,28 @@ bool NativeOesRenderer::renderOesFrame(JNIEnv *env, int frameWidth, int frameHei
     return true;
 }
 
+void NativeOesRenderer::clearSurface() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::DETACH;
+    ++surfaceGeneration_;
+    LOGI("OES surface request detach generation=%llu thread=%lld",
+         static_cast<unsigned long long>(surfaceGeneration_),
+         static_cast<long long>(currentThreadId()));
+}
+
 void NativeOesRenderer::release() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingWindow_ != nullptr) {
+        ANativeWindow_release(pendingWindow_);
+        pendingWindow_ = nullptr;
+    }
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
     if (g_oes_java_vm != nullptr) {
         JNIEnv *env = nullptr;
         const jint getEnvResult = g_oes_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
@@ -603,6 +628,75 @@ void NativeOesRenderer::release() {
 
 bool NativeOesRenderer::isPrepared() const {
     return prepared_.load();
+}
+
+bool NativeOesRenderer::hasSurface() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (pendingSurfaceAction_ == PendingSurfaceAction::ATTACH) {
+        return pendingWindow_ != nullptr;
+    }
+    if (pendingSurfaceAction_ == PendingSurfaceAction::DETACH) {
+        return window_ != nullptr;
+    }
+    return window_ != nullptr;
+}
+
+bool NativeOesRenderer::applyPendingSurfaceLocked(JNIEnv *env) {
+    if (pendingSurfaceAction_ == PendingSurfaceAction::NONE) {
+        return true;
+    }
+
+    const PendingSurfaceAction action = pendingSurfaceAction_;
+    ANativeWindow *newWindow = pendingWindow_;
+    const int newWidth = pendingSurfaceWidth_;
+    const int newHeight = pendingSurfaceHeight_;
+    const uint64_t generation = surfaceGeneration_;
+    pendingWindow_ = nullptr;
+    pendingSurfaceWidth_ = 0;
+    pendingSurfaceHeight_ = 0;
+    pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+
+    if (action == PendingSurfaceAction::DETACH) {
+        releaseEglSurfaceLocked();
+        if (window_ != nullptr) {
+            ANativeWindow_release(window_);
+            window_ = nullptr;
+        }
+        surfaceWidth_ = 0;
+        surfaceHeight_ = 0;
+        appliedSurfaceGeneration_ = generation;
+        LOGI("OES surface apply detach generation=%llu ownerThread=%lld contextPreserved=%d",
+             static_cast<unsigned long long>(generation),
+             static_cast<long long>(currentThreadId()),
+             eglContext_ != EGL_NO_CONTEXT ? 1 : 0);
+        return true;
+    }
+
+    if (newWindow == nullptr) {
+        appliedSurfaceGeneration_ = generation;
+        return true;
+    }
+    if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT
+        && !rebindEglSurfaceLocked(newWindow, newWidth, newHeight)) {
+        LOGE("OES EGL surface rebind failed on owner thread; re-prepare required");
+        releaseGlLocked();
+        releaseJavaLocked(env);
+        prepared_.store(false);
+    } else if (eglContext_ != EGL_NO_CONTEXT) {
+        surfaceRecreateCount_.fetch_add(1);
+    }
+    if (window_ != nullptr) {
+        ANativeWindow_release(window_);
+    }
+    window_ = newWindow;
+    surfaceWidth_ = newWidth;
+    surfaceHeight_ = newHeight;
+    appliedSurfaceGeneration_ = generation;
+    LOGI("OES surface apply attach generation=%llu ownerThread=%lld surface=%dx%d",
+         static_cast<unsigned long long>(generation),
+         static_cast<long long>(currentThreadId()), newWidth, newHeight);
+    return eglDisplay_ == EGL_NO_DISPLAY || eglContext_ == EGL_NO_CONTEXT
+           || eglSurface_ != EGL_NO_SURFACE;
 }
 
 jobject NativeOesRenderer::getDecoderSurfaceGlobalRef() const {
@@ -732,22 +826,29 @@ void NativeOesRenderer::releaseEglSurfaceLocked() {
 
 void NativeOesRenderer::releaseGlLocked() {
     if (eglDisplay_ != EGL_NO_DISPLAY) {
+        bool glContextCurrent = false;
         if (eglSurface_ != EGL_NO_SURFACE && eglContext_ != EGL_NO_CONTEXT) {
-            eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_);
+            glContextCurrent = eglMakeCurrent(eglDisplay_, eglSurface_, eglSurface_, eglContext_) == EGL_TRUE;
         }
         if (oesTexture_ != 0) {
-            glDeleteTextures(1, &oesTexture_);
+            if (glContextCurrent) {
+                glDeleteTextures(1, &oesTexture_);
+            }
             oesTexture_ = 0;
         }
         if (program_ != 0) {
-            glDeleteProgram(program_);
+            if (glContextCurrent) {
+                glDeleteProgram(program_);
+            }
             program_ = 0;
         }
         stMatrixLocation_ = -1;
         positionLocation_ = -1;
         texCoordLocation_ = -1;
         if (whiteHotProgram_ != 0) {
-            glDeleteProgram(whiteHotProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(whiteHotProgram_);
+            }
             whiteHotProgram_ = 0;
         }
         whiteHotStMatrixLocation_ = -1;
@@ -757,11 +858,15 @@ void NativeOesRenderer::releaseGlLocked() {
         whiteHotBlackPointLocation_ = -1;
         whiteHotWhitePointLocation_ = -1;
         if (ironbowTexture_ != 0) {
-            glDeleteTextures(1, &ironbowTexture_);
+            if (glContextCurrent) {
+                glDeleteTextures(1, &ironbowTexture_);
+            }
             ironbowTexture_ = 0;
         }
         if (ironbowProgram_ != 0) {
-            glDeleteProgram(ironbowProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(ironbowProgram_);
+            }
             ironbowProgram_ = 0;
         }
         ironbowStMatrixLocation_ = -1;
@@ -772,18 +877,24 @@ void NativeOesRenderer::releaseGlLocked() {
         ironbowWhitePointLocation_ = -1;
         ironbowPaletteLocation_ = -1;
         if (agcProgram_ != 0) {
-            glDeleteProgram(agcProgram_);
+            if (glContextCurrent) {
+                glDeleteProgram(agcProgram_);
+            }
             agcProgram_ = 0;
         }
         agcStMatrixLocation_ = -1;
         agcPositionLocation_ = -1;
         agcTexCoordLocation_ = -1;
         if (agcFbo_ != 0) {
-            glDeleteFramebuffers(1, &agcFbo_);
+            if (glContextCurrent) {
+                glDeleteFramebuffers(1, &agcFbo_);
+            }
             agcFbo_ = 0;
         }
         if (agcTexture_ != 0) {
-            glDeleteTextures(1, &agcTexture_);
+            if (glContextCurrent) {
+                glDeleteTextures(1, &agcTexture_);
+            }
             agcTexture_ = 0;
         }
         agcReadbackBuffer_.clear();

@@ -29,10 +29,6 @@ dependencyResolutionManagement {
         maven {
             url "https://maven.mozilla.org/maven2/"
         }
-        flatDir {
-            dirs './repo'
-        }
-
     }
 }
 rootProject.name = "AndroidFFmpegPlayer"

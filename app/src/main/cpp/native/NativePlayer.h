@@ -233,6 +233,14 @@ private:
     std::atomic<int64_t> nv12GlFallbackFrameCount_{0};
     std::atomic<int64_t> nv12ThermalRenderedCount_{0};
     std::atomic<int> lastNv12ThermalRenderMode_{0};
+    std::atomic<bool> nv12AgcValid_{false};
+    std::atomic<float> nv12AgcBlackPoint_{0.0f};
+    std::atomic<float> nv12AgcWhitePoint_{1.0f};
+    std::atomic<int64_t> nv12AgcUpdateCount_{0};
+    std::atomic<int64_t> nv12AgcInvalidCount_{0};
+    std::atomic<int> nv12AgcFrameCounter_{0};
+    std::atomic<int> nv12AgcLastFrameWidth_{0};
+    std::atomic<int> nv12AgcLastFrameHeight_{0};
     std::atomic<int64_t> nv12GlLastRenderCostUs_{0};
     std::atomic<int64_t> nv12GlTotalRenderCostUs_{0};
     std::atomic<int64_t> nv12GlRenderCostSampleCount_{0};

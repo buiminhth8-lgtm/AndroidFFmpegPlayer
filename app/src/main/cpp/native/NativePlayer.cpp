@@ -1367,12 +1367,15 @@ std::string NativePlayer::getStats() {
                            ? "yuv_planes"
                            : "none";
     }
-    const bool agcValidEffective = oesRenderMode ? oesRenderer_.isAgcValid() : agcValid_.load();
+    const bool agcValidEffective = oesRenderMode ? oesRenderer_.isAgcValid()
+                                  : (nv12GlRenderMode ? nv12AgcValid_.load() : agcValid_.load());
     const float agcBlackEffective = agcValidEffective
-                                    ? (oesRenderMode ? oesRenderer_.getAgcBlackPoint() : agcBlackPoint_.load())
+                                    ? (oesRenderMode ? oesRenderer_.getAgcBlackPoint()
+                                       : (nv12GlRenderMode ? nv12AgcBlackPoint_.load() : agcBlackPoint_.load()))
                                     : 0.0f;
     const float agcWhiteEffective = agcValidEffective
-                                    ? (oesRenderMode ? oesRenderer_.getAgcWhitePoint() : agcWhitePoint_.load())
+                                    ? (oesRenderMode ? oesRenderer_.getAgcWhitePoint()
+                                       : (nv12GlRenderMode ? nv12AgcWhitePoint_.load() : agcWhitePoint_.load()))
                                     : 1.0f;
     const bool thermalWindowApplied = effectiveThermalRenderMode != "normal";
 
@@ -1556,6 +1559,8 @@ std::string NativePlayer::getStats() {
         << "\"thermalAgcBlackPoint\":" << agcBlackEffective << ","
         << "\"thermalAgcWhitePoint\":" << agcWhiteEffective << ","
         << "\"thermalAgcUpdateCount\":" << agcUpdateCount_.load() << ","
+        << "\"nv12AgcUpdateCount\":" << nv12AgcUpdateCount_.load() << ","
+        << "\"nv12AgcInvalidCount\":" << nv12AgcInvalidCount_.load() << ","
         << "\"oesAgcUpdateCount\":" << oesRenderer_.getAgcUpdateCount() << ","
         << "\"oesAgcReadbackErrorCount\":" << oesRenderer_.getAgcReadbackErrorCount() << ","
         << "\"thermalGamma\":" << thermalConfig.gamma << ","
@@ -1965,6 +1970,8 @@ std::string NativePlayer::setThermalAgcEnabled(bool enabled) {
     agcFrameCounter_.store(0);
     oesRenderer_.resetAgc();
     oesAgcFrameCounter_.store(0);
+    nv12AgcValid_.store(false);
+    nv12AgcFrameCounter_.store(0);
     LOGI("setThermalAgcEnabled agc=%d", enabled ? 1 : 0);
     std::ostringstream out;
     out << "{\"success\":true,\"thermalAgcEnabled\":" << (enabled ? "true" : "false") << "}";
@@ -3249,13 +3256,53 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
     }
     lastNv12ThermalRenderMode_.store(nv12ThermalMode);
 
+    // NV12 AGC: analyze the CPU-visible Y plane (data[0]) with the shared Phase 1
+    // luma8 helper (4x4 sampling, 256-bin histogram, P2/P98, range normalize).
+    if (frameWidth != nv12AgcLastFrameWidth_.load() || frameHeight != nv12AgcLastFrameHeight_.load()) {
+        // Resolution change / new stream: drop stale AGC validity for a fresh scene.
+        nv12AgcValid_.store(false);
+        nv12AgcFrameCounter_.store(0);
+        nv12AgcLastFrameWidth_.store(frameWidth);
+        nv12AgcLastFrameHeight_.store(frameHeight);
+    }
+    float effectiveBlack = thermal.blackPoint;
+    float effectiveWhite = thermal.whitePoint;
+    if (nv12ThermalMode != 0 && thermal.agcEnabled) {
+        const int frameCount = nv12AgcFrameCounter_.fetch_add(1) + 1;
+        if (frameCount >= kAgcUpdateIntervalFrames) {
+            nv12AgcFrameCounter_.store(0);
+            const AgcResult detected = computeAgcWindow(frame->data[0], frame->linesize[0],
+                                                        frameWidth, frameHeight,
+                                                        static_cast<AVColorRange>(frame->color_range));
+            if (detected.valid) {
+                if (!nv12AgcValid_.load()) {
+                    nv12AgcBlackPoint_.store(detected.blackPoint);
+                    nv12AgcWhitePoint_.store(detected.whitePoint);
+                    nv12AgcValid_.store(true);
+                } else {
+                    const float oldBlack = nv12AgcBlackPoint_.load();
+                    const float oldWhite = nv12AgcWhitePoint_.load();
+                    nv12AgcBlackPoint_.store(oldBlack * (1.0f - kAgcSmoothingAlpha) + detected.blackPoint * kAgcSmoothingAlpha);
+                    nv12AgcWhitePoint_.store(oldWhite * (1.0f - kAgcSmoothingAlpha) + detected.whitePoint * kAgcSmoothingAlpha);
+                }
+                nv12AgcUpdateCount_.fetch_add(1);
+            } else {
+                nv12AgcInvalidCount_.fetch_add(1);
+            }
+        }
+        if (nv12AgcValid_.load()) {
+            effectiveBlack = nv12AgcBlackPoint_.load();
+            effectiveWhite = nv12AgcWhitePoint_.load();
+        }
+    }
+
     const RenderResult result = nv12GlRenderer_.renderNv12(frame->data[0], frame->linesize[0],
                                                            frame->data[1], frame->linesize[1],
                                                            frameWidth, frameHeight,
                                                            static_cast<int>(frame->color_range),
                                                            static_cast<int>(frame->colorspace),
                                                            nv12ThermalMode, thermal.gamma,
-                                                           thermal.blackPoint, thermal.whitePoint);
+                                                           effectiveBlack, effectiveWhite);
     if (result.stats.copyCostUs > 0) {
         recordCost(nv12GlLastUploadCostUs_, nv12GlTotalUploadCostUs_, nv12GlUploadCostSampleCount_,
                    nv12GlMaxUploadCostUs_, result.stats.copyCostUs);
@@ -3593,6 +3640,14 @@ void NativePlayer::resetStats() {
     nv12GlFallbackFrameCount_.store(0);
     nv12ThermalRenderedCount_.store(0);
     lastNv12ThermalRenderMode_.store(0);
+    nv12AgcValid_.store(false);
+    nv12AgcBlackPoint_.store(0.0f);
+    nv12AgcWhitePoint_.store(1.0f);
+    nv12AgcUpdateCount_.store(0);
+    nv12AgcInvalidCount_.store(0);
+    nv12AgcFrameCounter_.store(0);
+    nv12AgcLastFrameWidth_.store(0);
+    nv12AgcLastFrameHeight_.store(0);
     nv12GlLastRenderCostUs_.store(0);
     nv12GlTotalRenderCostUs_.store(0);
     nv12GlRenderCostSampleCount_.store(0);

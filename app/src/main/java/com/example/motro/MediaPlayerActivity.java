@@ -551,11 +551,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private void updateThermalControlsEnabledState() {
         boolean supported = isThermalSupported();
         boolean thermalOn = supported && controlsBinding.thermalEnabledSwitch.isChecked();
-        // NV12 GL supports palette + Gamma + Manual Window; AGC is not implemented
-        // for the NV12 GL path in this slice.
-        boolean nv12GlMode = "mediacodec_nv12_gl".equals(currentRenderMode);
+        // AGC applies to software_yuv_gl, mediacodec_oes, and mediacodec_nv12_gl.
         boolean gammaSupported = supported;
-        boolean agcSupported = supported && !nv12GlMode;
+        boolean agcSupported = supported;
         boolean agcOn = thermalOn && agcSupported && controlsBinding.thermalAgcSwitch.isChecked();
         // The main Thermal switch stays clickable even when unsupported so the user gets a Toast explanation.
         controlsBinding.thermalPaletteRadioGroup.setEnabled(thermalOn);
@@ -565,7 +563,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.thermalAgcSwitch.setEnabled(thermalOn && agcSupported);
         controlsBinding.thermalGammaSeekBar.setEnabled(thermalOn && gammaSupported);
         controlsBinding.thermalGammaValueText.setAlpha(thermalOn && gammaSupported ? 1.0f : 0.4f);
-        // Manual window supported for software_yuv_gl / mediacodec_oes / mediacodec_nv12_gl.
+        // Manual window disabled while AGC is ON (effective window comes from AGC).
         boolean windowEnabled = thermalOn && !agcOn;
         controlsBinding.thermalBlackPointSeekBar.setEnabled(windowEnabled);
         controlsBinding.thermalWhitePointSeekBar.setEnabled(windowEnabled);
@@ -752,10 +750,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + " - " + String.format(Locale.US, "%.2f", windowWhite)
                         + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF");
             } else if (nv12GlMode) {
-                // NV12 GL window in intensity 0..1 domain; AGC N/A.
+                // NV12 GL window in intensity 0..1 domain; AGC effective window shown when valid.
                 windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
                         + " - " + String.format(Locale.US, "%.2f", windowWhite)
-                        + " | AGC: N/A";
+                        + " | AGC " + (thermalAgcEnabled ? "ON" : "OFF");
             } else {
                 windowLine = "\nWindow " + String.format(Locale.US, "%.2f", windowBlack)
                         + " - " + String.format(Locale.US, "%.2f", windowWhite)

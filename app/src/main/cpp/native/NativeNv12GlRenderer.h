@@ -15,7 +15,7 @@
 
 struct ANativeWindow;
 
-// MediaCodec NV12 -> OpenGL renderer (Revised Phase 2 Slice 1).
+// Revised Phase 2 hardware mainline renderer: MediaCodec CPU NV12 -> OpenGL.
 // Input: AV_PIX_FMT_NV12 (Y plane + interleaved UV), stride-aware.
 // Output: current SurfaceView via EGL; no sws_scale, no RGBA CPU conversion.
 //
@@ -32,9 +32,7 @@ public:
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     void clearSurface();
     void release();
-    bool hasSurface() const;
     bool isReady() const;
-    bool supportsFrameFormat(int frameFormat) const;
     // Actual thermal mode applied on the last successful render (0 original, 1 white_hot, 2 ironbow).
     int getLastAppliedThermalMode() const;
 

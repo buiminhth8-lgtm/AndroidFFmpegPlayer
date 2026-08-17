@@ -109,7 +109,7 @@ private:
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
-    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
+    bool renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight);
     void renderOesPendingFrameIfReady();
     bool isSoftwareYuvGlFrameSupported(int frameFormat) const;
     void updateAgcState(AVFrame *frame, const ThermalConfig &thermal);
@@ -162,7 +162,6 @@ private:
     bool dropUntilKeyFrame_ = false;
     bool startupKeyFrameWait_ = false;
     int64_t startupKeyFrameWaitStartMs_ = 0;
-    int64_t maxRealtimeLatencyUs_ = 250000;
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
     std::atomic<bool> transportSwitchRequested_{false};

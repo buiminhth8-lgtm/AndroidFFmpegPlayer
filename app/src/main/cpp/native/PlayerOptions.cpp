@@ -193,28 +193,6 @@ std::string renderModeName(RenderMode renderMode) {
     return "software_rgba";
 }
 
-VideoRenderInputType videoRenderInputType(RenderMode renderMode) {
-    switch (renderMode) {
-        case RenderMode::SOFTWARE_RGBA:
-        case RenderMode::SOFTWARE_YUV_GL:
-            return VideoRenderInputType::YUV_PLANES;
-        case RenderMode::MEDIACODEC_SURFACE:
-            return VideoRenderInputType::DIRECT_SURFACE;
-        case RenderMode::MEDIACODEC_OES:
-            return VideoRenderInputType::EXTERNAL_OES;
-    }
-    return VideoRenderInputType::NONE;
-}
-
-const char *videoRenderInputTypeName(VideoRenderInputType type) {
-    switch (type) {
-        case VideoRenderInputType::YUV_PLANES: return "yuv_planes";
-        case VideoRenderInputType::DIRECT_SURFACE: return "direct_surface";
-        case VideoRenderInputType::EXTERNAL_OES: return "external_oes";
-        default: return "none";
-    }
-}
-
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto) {
     if (options.rtspTransport == RtspTransport::AUTO) {
         return preferUdpInAuto ? "udp" : "tcp";
@@ -478,7 +456,7 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
             return false;
         }
         if (renderMode == RenderMode::MEDIACODEC_NV12_GL) {
-            // Allowed: NV12 GL renders NV12 AVFrames via OpenGL (Slice 1).
+            // NV12 GL renders CPU-visible NV12 AVFrames on the hardware mainline.
         }
         options.renderMode = renderMode;
         if (renderMode != RenderMode::MEDIACODEC_SURFACE) {
@@ -775,11 +753,13 @@ std::string latencyReportHelpJson() {
 
 std::string hardwareDecodeHelpJson() {
     return "{\"success\":true,"
-           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_surface\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_surface\","
+           "\"enable\":\"call setHardwareDecode(handle,true) and setHardwareRenderMode(handle,\\\"mediacodec_nv12_gl\\\") before preparePlayer; setPlayerOption also supports enable_hardware_decode=true and hardware_render_mode=mediacodec_nv12_gl\","
            "\"software_rgba\":\"FFmpeg software decode, sws_scale to RGBA, ANativeWindow RGBA copy, native snapshot supported\","
            "\"software_yuv_gl\":\"FFmpeg software decode, render YUV420P/YUVJ420P frames with OpenGL ES shader, fallback to software_rgba for unsupported formats\","
-           "\"mediacodec_surface\":\"FFmpeg h264_mediacodec/hevc_mediacodec decode directly to Surface; no sws_scale and no RGBA memcpy\","
-           "\"snapshot\":\"native RGBA snapshot is not supported in mediacodec_surface or software_yuv_gl mode; the Java demo can use PixelCopy\","
+           "\"mediacodec_nv12_gl\":\"default hardware path: FFmpeg MediaCodec CPU NV12 output rendered by NativeNv12GlRenderer without sws_scale or RGBA conversion\","
+           "\"mediacodec_surface\":\"legacy direct-Surface compatibility mode\","
+           "\"mediacodec_oes\":\"experimental future zero-copy path; not the default\","
+           "\"snapshot\":\"native RGBA snapshot is not supported in GL or direct-Surface modes; the Java demo can use PixelCopy\","
            "\"fallback\":\"hardware decoder missing, MediaCodec surface init failure, or avcodec_open2 failure falls back to software decode when hardwareDecodeAllowFallback is true\","
            "\"hevc\":\"for low-latency HEVC preview, test RTSP UDP + ultra_low_latency + hevc_mediacodec first\","
            "\"compatibility\":\"if MediaCodec compatibility is poor on a device, disable enableHardwareDecode and use software_rgba\"}";

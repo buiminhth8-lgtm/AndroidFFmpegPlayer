@@ -9,10 +9,12 @@ Motro 当前是一套以 FFmpeg Native 为核心的 Android 音视频能力验�
 - FFmpeg JNI 基础信息查询：版本、编译参数、解码器、MediaCodec 解码器可用性。
 - URL 基础探测：通过 FFmpeg API 实现简化 ffprobe，不依赖外部 `ffprobe` 可执行文件。
 - Native 播放器：支持 RTSP、HLS、RTMP、HTTP 和本地文件等 FFmpeg 可识别输入源。
-- 视频播放：`av_read_frame -> avcodec_send_packet -> avcodec_receive_frame -> sws_scale -> ANativeWindow`，渲染到 Android `Surface`。
+- 当前硬解主链：RTSP/HEVC -> `hevc_mediacodec` -> CPU NV12 -> `NativeNv12GlRenderer` -> OpenGL ES -> `SurfaceView`；正常路径不经过 `sws_scale`。
+- Thermal 主链：NV12 Y -> Range Normalize -> Manual/AGC Window -> Gamma -> White Hot/Ironbow -> OpenGL ES。
+- `software_yuv_gl` 保留为软件解码/Phase 1 路径，`software_rgba` + `sws_scale` 保留为兼容与渲染 fallback；`mediacodec_surface` 为 legacy compatibility，OES 为 experimental/future zero-copy。
 - 播放时 remux 录制：复用同一路播放器已经打开的输入流，不重新打开 RTSP，不转码，不重新编码。
 - 分片录制：按输出 pattern 和分片时长进行 remux 分段。
-- 播放中截图：复用播放器最近一帧 RGBA 缓存，支持 `.png`，`.jpg/.jpeg` 依赖 FFmpeg 是否启用 MJPEG encoder。
+- 播放中截图：RGBA 路径复用最近一帧缓存；GL/direct-Surface 路径由 Demo 使用 `PixelCopy`，NV12 GL native snapshot 仍不支持。
 - 播放状态和统计：可查询 stream、帧数、packet 数、录制状态、Surface 状态、低延迟参数、断流重连状态等。
 - RTSP TCP/UDP 低延迟配置：支持 `tcp`、`udp`、`udp_multicast`、`auto`，支持 `low_latency`、`balanced`、`stable` 三档。
 - Surface 安全处理：支持 Surface 销毁后 `clearPlayerSurface`，播放线程可继续解码并跳过渲染。

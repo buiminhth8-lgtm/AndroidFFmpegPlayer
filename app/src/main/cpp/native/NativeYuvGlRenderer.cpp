@@ -187,8 +187,6 @@ std::string NativeYuvGlRenderer::setSurface(JNIEnv *env, jobject surface, int wi
     window_ = newWindow;
     surfaceWidth_ = width;
     surfaceHeight_ = height;
-    frameWidth_ = 0;
-    frameHeight_ = 0;
     LOGI("setSurface GL YUV success surface=%dx%d", width, height);
     return jsonSuccess("gl yuv surface set");
 }
@@ -307,14 +305,6 @@ RenderResult NativeYuvGlRenderer::renderI420(const uint8_t *yData, int yStride,
     stats.postCostUs = steadyNowUs() - swapStartUs;
     stats.totalCostUs = steadyNowUs() - renderStartUs;
 
-    frameWidth_ = width;
-    frameHeight_ = height;
-    ++renderCount_;
-    if (renderCount_ == 1 || renderCount_ % 100 == 0) {
-        LOGI("GL YUV render count=%lld frame=%dx%d surface=%dx%d uploadUs=%lld totalUs=%lld",
-             static_cast<long long>(renderCount_), width, height, viewportWidth, viewportHeight,
-             static_cast<long long>(stats.copyCostUs), static_cast<long long>(stats.totalCostUs));
-    }
     return {true, 0, "", stats};
 }
 
@@ -327,8 +317,6 @@ void NativeYuvGlRenderer::release() {
     }
     surfaceWidth_ = 0;
     surfaceHeight_ = 0;
-    frameWidth_ = 0;
-    frameHeight_ = 0;
 }
 
 bool NativeYuvGlRenderer::hasSurface() const {

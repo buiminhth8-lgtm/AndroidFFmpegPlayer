@@ -351,14 +351,6 @@ public class MediaPlayerActivity extends AppCompatActivity {
             if (thermalUiUpdating) {
                 return;
             }
-            if (isChecked && controlsBinding.thermalEnabledSwitch.isChecked()) {
-                thermalUiUpdating = true;
-                hardwareDecodeSwitch.setChecked(false);
-                thermalUiUpdating = false;
-                Log.w(TAG, "Hardware decode blocked: disable Thermal first");
-                Toast.makeText(this, "Disable Thermal before enabling hardware decoding.", Toast.LENGTH_SHORT).show();
-                return;
-            }
             updateThermalControlsEnabledState();
         });
         transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
@@ -772,7 +764,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + " | render " + thermalRenderMode.toUpperCase(Locale.US)
                         + "\nInput: " + thermalInputType.toUpperCase(Locale.US);
             } else if (nv12GlMode) {
-                // NV12 GL: palette (Original / White Hot / Ironbow) + Gamma; no window/AGC yet.
+                // NV12 GL: Original / White Hot / Ironbow with Gamma, Window, and AGC.
                 thermalDisplay = "Thermal " + (thermalEnabled ? "ON" : "OFF")
                         + " | " + thermalPalette
                         + " | gamma " + String.format(Locale.US, "%.2f", thermalGamma)

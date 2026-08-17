@@ -590,14 +590,15 @@ void NativeOesRenderer::release() {
         }
     }
     releaseGlLocked();
+    if (window_ != nullptr) {
+        ANativeWindow_release(window_);
+        window_ = nullptr;
+    }
+    surfaceWidth_ = 0;
+    surfaceHeight_ = 0;
     updateTexImageMethod_ = nullptr;
     getTransformMatrixMethod_ = nullptr;
     prepared_.store(false);
-}
-
-bool NativeOesRenderer::hasSurface() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return window_ != nullptr;
 }
 
 bool NativeOesRenderer::isPrepared() const {

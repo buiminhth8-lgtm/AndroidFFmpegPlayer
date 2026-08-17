@@ -73,9 +73,6 @@ private:
     GLuint textures_[3] = {0, 0, 0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;
-    int frameWidth_ = 0;
-    int frameHeight_ = 0;
-    int64_t renderCount_ = 0;
     std::vector<uint8_t> compactY_;
     std::vector<uint8_t> compactU_;
     std::vector<uint8_t> compactV_;

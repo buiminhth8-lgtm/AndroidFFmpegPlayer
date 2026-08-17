@@ -220,7 +220,7 @@ struct AgcResult {
 
 // Percentile-based AGC window from the raw 8-bit Y plane.
 // Converts raw percentile values to the same 0.0 ~ 1.0 normalized
-// thermal range used by the Slice 5 shader range normalization.
+// thermal range used by the current YUV and NV12 thermal shaders.
 AgcResult computeAgcWindow(const uint8_t *yData, int yStride, int width, int height, AVColorRange colorRange) {
     AgcResult result;
     if (yData == nullptr || yStride <= 0 || width <= 0 || height <= 0) {
@@ -390,10 +390,6 @@ const char *preferredHardwareDecoderName(AVCodecID codecId) {
         return "hevc_mediacodec";
     }
     return nullptr;
-}
-
-bool isMediaCodecDecoderName(const std::string &name) {
-    return name == "h264_mediacodec" || name == "hevc_mediacodec";
 }
 
 std::string decoderName(const AVCodec *codec) {
@@ -762,16 +758,6 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
 
         if (useHardware) {
             LOGI("try hardware decoder name=%s", decoderName(decoder).c_str());
-            bool hwAttached = false;
-            JNIEnv *hwEnv = getJniEnvForCurrentThread(hwAttached);
-            const bool displaySurfaceValid = surfaceGlobalRef_ != nullptr
-                                             && (hwEnv == nullptr || !hwEnv->IsSameObject(surfaceGlobalRef_, nullptr));
-            LOGI("[HWCFG] begin decoder=%s renderMode=%s enableHardwareDecode=%d jniEnv=%s displaySurface=%s pixFmt=%d colorRange=%d colorSpace=%d",
-                 decoderName(decoder).c_str(), renderModeName(optionsSnapshot.renderMode).c_str(),
-                 optionsSnapshot.enableHardwareDecode ? 1 : 0,
-                 hwEnv ? "ok" : "null", displaySurfaceValid ? "valid" : "null",
-                 videoCodecContext_->pix_fmt, videoCodecContext_->color_range,
-                 videoCodecContext_->colorspace);
             AVMediaCodecContext *mediaCodecCtx = av_mediacodec_alloc_context();
             if (mediaCodecCtx == nullptr) {
                 openError = "av_mediacodec_alloc_context failed";
@@ -798,8 +784,6 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                     }
                 }
                 jobject decoderSurface = oesRenderer_.getDecoderSurfaceGlobalRef();
-                LOGI("[HWCFG] decoderSurfaceType=oes decoderSurface=%s",
-                     decoderSurface ? "valid" : "null");
                 if (decoderSurface == nullptr) {
                     openError = "mediacodec_oes decoder Surface is null";
                     LOGE("%s", openError.c_str());
@@ -818,9 +802,6 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                 }
                 openResult = av_mediacodec_default_init(videoCodecContext_, mediaCodecCtx, surfaceGlobalRef_);
             }
-            LOGI("[HWCFG] mediaCodecContext=%s surfaceInjected=%s beforeAvcodecOpen2=yes",
-                 mediaCodecCtx ? "created" : "null", openResult == 0 ? "yes" : "no");
-            detachCurrentThreadIfNeeded(hwAttached);
             if (openResult < 0) {
                 openError = "MediaCodec surface init failed: " + ffmpegErrorToString(openResult);
                 LOGE("MediaCodec surface init failed ret=%d", openResult);
@@ -833,8 +814,6 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         }
 
         openResult = avcodec_open2(videoCodecContext_, decoder, nullptr);
-        LOGI("[HWCFG] avcodecOpen2=%s decoder=%s", openResult < 0 ? "error" : "success",
-             decoderName(decoder).c_str());
         if (openResult < 0) {
             openError = ffmpegErrorToString(openResult);
             if (useHardware) {
@@ -924,15 +903,6 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         lastRenderCopyCostUs_.store(-1);
         lastRenderPostCostUs_.store(-1);
     }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        LOGI("[HWCFG] fallback=%s actualDecoder=%s actualRenderMode=%s usingHardware=%d",
-             fallbackUsed ? "yes" : "no",
-             playerOptions_.actualDecoderName.c_str(),
-             renderModeName(playerOptions_.renderMode).c_str(),
-             playerOptions_.usingHardwareDecoder ? 1 : 0);
-    }
-
     packet_ = av_packet_alloc();
     decodedFrame_ = av_frame_alloc();
     latestFrame_ = av_frame_alloc();
@@ -1407,7 +1377,6 @@ std::string NativePlayer::getStats() {
                                     : 1.0f;
     const bool thermalWindowApplied = effectiveThermalRenderMode != "normal";
 
-    LOGI("getPlayerStats player=%p", this);
     std::ostringstream out;
     out << "{\"success\":true,"
         << "\"state\":\"" << stateName(state) << "\","
@@ -2916,31 +2885,16 @@ void NativePlayer::playbackLoop() {
             break;
         }
 
-        const int64_t packetCount = readPacketCount_.fetch_add(1) + 1;
+        readPacketCount_.fetch_add(1);
         const int packetSize = std::max(packet_->size, 0);
         inputPacketBytes_.fetch_add(packetSize);
         ++sessionReadPacketCount;
-        if (packetCount == 1 || packetCount % 250 == 0) {
-            LOGI("read packet count=%lld stream=%d size=%d pts=%lld dts=%lld flags=0x%x",
-                 static_cast<long long>(packetCount), packet_->stream_index, packet_->size,
-                 static_cast<long long>(packet_->pts), static_cast<long long>(packet_->dts), packet_->flags);
-        }
         if (packet_->stream_index == videoStreamIndex_) {
-            const int64_t videoPackets = videoPacketCount_.fetch_add(1) + 1;
+            videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
-            if (videoPackets == 1 || videoPackets % 100 == 0) {
-                LOGI("video packet count=%lld size=%d pts=%lld key=%d",
-                     static_cast<long long>(videoPackets), packet_->size,
-                     static_cast<long long>(packet_->pts), (packet_->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
-            }
         } else if (packet_->stream_index == audioStreamIndex_) {
-            const int64_t audioPackets = audioPacketCount_.fetch_add(1) + 1;
+            audioPacketCount_.fetch_add(1);
             audioPacketBytes_.fetch_add(packetSize);
-            if (audioPackets == 1 || audioPackets % 100 == 0) {
-                LOGI("audio packet count=%lld size=%d pts=%lld",
-                     static_cast<long long>(audioPackets), packet_->size,
-                     static_cast<long long>(packet_->pts));
-            }
             lastAudioFrameTimeMs_.store(nowMs());
             if (formatContext_ != nullptr && audioStreamIndex_ >= 0 && packet_->pts != AV_NOPTS_VALUE) {
                 audioClockUs_.store(av_rescale_q(packet_->pts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
@@ -3012,30 +2966,11 @@ void NativePlayer::playbackLoop() {
                 if (frame != nullptr && frame->format != AV_PIX_FMT_MEDIACODEC) {
                     lastFrameYStride_.store(frame->linesize[0] > 0 ? frame->linesize[0] : 0);
                     lastFrameColorRange_.store(frame->color_range);
-                    const int64_t diagFrame = videoFrameCount_.load() + 1;
-                    if (diagFrame == 1 || diagFrame % 300 == 0) {
-                        const char *formatName = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
-                        LOGI("software frame diagnostic width=%d height=%d format=%s yStride=%d colorRange=%s renderMode=%s",
-                             frame->width, frame->height,
-                             formatName == nullptr ? "unknown" : formatName,
-                             frame->linesize[0],
-                             colorRangeName(static_cast<AVColorRange>(frame->color_range)).c_str(),
-                             renderModeName(optionsSnapshot.renderMode).c_str());
-                    }
                 }
                 if (renderFrame(frame)) {
-                    int64_t ptsUs = 0;
-                    if (formatContext_ != nullptr && videoStreamIndex_ >= 0 && frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                        ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
-                    }
                     recordCost(lastFrameProcessCostUs_, totalFrameProcessCostUs_, frameProcessCostSampleCount_, maxFrameProcessCostUs_,
                                steadyNowUs() - frameProcessStartUs);
-                    const int64_t frames = videoFrameCount_.fetch_add(1) + 1;
-                    if (frames == 1 || frames % 100 == 0) {
-                        LOGI("decoded video frame count=%lld width=%d height=%d format=%d ptsUs=%lld",
-                             static_cast<long long>(frames), frame->width, frame->height,
-                             frame->format, static_cast<long long>(ptsUs));
-                    }
+                    videoFrameCount_.fetch_add(1);
                 }
             };
 
@@ -3223,16 +3158,8 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
         return true;
     }
 
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
-    const int64_t hardwareRendered = hardwareRenderedFrameCount_.fetch_add(1) + 1;
-    if (hardwareRendered == 1 || hardwareRendered % 100 == 0) {
-        LOGI("receive AV_PIX_FMT_MEDIACODEC frame count=%lld ptsUs=%lld",
-             static_cast<long long>(hardwareRenderedFrameCount_.load()),
-             static_cast<long long>(ptsUs));
-        LOGI("release mediacodec buffer render=1 count=%lld renderedFrameCount=%lld",
-             static_cast<long long>(hardwareRendered),
-             static_cast<long long>(renderedFrames));
-    }
+    renderedFrameCount_.fetch_add(1);
+    hardwareRenderedFrameCount_.fetch_add(1);
     lastRenderTimeMs_.store(nowMs());
     return true;
 }
@@ -3366,7 +3293,7 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
     return false;
 }
 
-bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs) {
+bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int frameHeight) {
     if (frame == nullptr || !isSoftwareYuvGlFrameSupported(frame->format)) {
         return false;
     }
@@ -3425,9 +3352,9 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
         return false;
     }
 
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    renderedFrameCount_.fetch_add(1);
     softwareRenderedFrameCount_.fetch_add(1);
-    const int64_t yuvGlRendered = yuvGlRenderedFrameCount_.fetch_add(1) + 1;
+    yuvGlRenderedFrameCount_.fetch_add(1);
     lastRendererType_.store(2);  // yuv_gl
     if (thermalMode == 1) {
         whiteHotRenderedFrameCount_.fetch_add(1);
@@ -3437,11 +3364,6 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         lastFrameFormatName_ = "yuv420p_gl";
-    }
-    if (yuvGlRendered == 1 || yuvGlRendered % 100 == 0) {
-        LOGI("GL YUV render success count=%lld renderedFrameCount=%lld width=%d height=%d ptsUs=%lld",
-             static_cast<long long>(yuvGlRendered), static_cast<long long>(renderedFrames),
-             frameWidth, frameHeight, static_cast<long long>(ptsUs));
     }
     lastRenderTimeMs_.store(nowMs());
     return true;
@@ -3513,7 +3435,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         // render failure falls through to the safe sws/RGBA path (counted + logged in renderNv12GlFrame).
     }
     if (optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL) {
-        if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+        if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight)) {
             return true;
         }
         if (!isSoftwareYuvGlFrameSupported(frame->format)) {
@@ -3592,14 +3514,9 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         frameDropBeforeRenderCount_.fetch_add(1);
         return true;
     }
-    const int64_t renderedFrames = renderedFrameCount_.fetch_add(1) + 1;
+    renderedFrameCount_.fetch_add(1);
     softwareRenderedFrameCount_.fetch_add(1);
     lastRendererType_.store(1);  // rgba_nativewindow
-    if (renderedFrames == 1 || renderedFrames % 100 == 0) {
-        LOGI("render success count=%lld width=%d height=%d rgbaLineSize=%d ptsUs=%lld",
-             static_cast<long long>(renderedFrames), frameWidth, frameHeight,
-             rgbaFrame_->linesize[0], static_cast<long long>(ptsUs));
-    }
     lastRenderTimeMs_.store(nowMs());
     return true;
 }

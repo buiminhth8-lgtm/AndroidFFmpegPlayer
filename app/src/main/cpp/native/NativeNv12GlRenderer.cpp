@@ -466,11 +466,6 @@ void NativeNv12GlRenderer::release() {
     clearSurface();
 }
 
-bool NativeNv12GlRenderer::hasSurface() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return window_ != nullptr;
-}
-
 bool NativeNv12GlRenderer::isReady() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return window_ != nullptr;
@@ -478,10 +473,6 @@ bool NativeNv12GlRenderer::isReady() const {
 
 int NativeNv12GlRenderer::getLastAppliedThermalMode() const {
     return lastAppliedThermalMode_.load();
-}
-
-bool NativeNv12GlRenderer::supportsFrameFormat(int frameFormat) const {
-    return frameFormat == AV_PIX_FMT_NV12;
 }
 
 bool NativeNv12GlRenderer::ensureGlLocked(std::string &errorMessage) {

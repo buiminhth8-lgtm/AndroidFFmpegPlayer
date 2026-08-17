@@ -13,7 +13,7 @@
 
 struct ANativeWindow;
 
-// Phase 2 OES renderer: owns the EGL output to the SurfaceView and the
+// Experimental/future zero-copy OES renderer: owns the EGL output to the SurfaceView and the
 // MediaCodec decoder SurfaceTexture (GL_TEXTURE_EXTERNAL_OES) consumer.
 //
 // Lifecycle:
@@ -47,7 +47,6 @@ public:
                         float gamma, float blackPoint, float whitePoint,
                         bool agcEnabled, bool runAgc);
     void release();
-    bool hasSurface() const;
     bool isPrepared() const;
     jobject getDecoderSurfaceGlobalRef() const;
     int64_t getSurfaceRecreateCount() const;

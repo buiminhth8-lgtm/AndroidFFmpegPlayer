@@ -41,14 +41,6 @@ enum class RenderMode {
     MEDIACODEC_NV12_GL
 };
 
-// What kind of input the active render path consumes.
-enum class VideoRenderInputType {
-    NONE,
-    YUV_PLANES,
-    DIRECT_SURFACE,
-    EXTERNAL_OES
-};
-
 struct PlayerOptions {
     RtspTransport rtspTransport = RtspTransport::TCP;
     LatencyMode latencyMode = LatencyMode::BALANCED;
@@ -106,8 +98,6 @@ std::string syncMasterName(SyncMaster syncMaster);
 std::string sourceTypeName(SourceType sourceType);
 std::string renderModeName(RenderMode renderMode);
 std::string effectiveRtspTransportName(const PlayerOptions &options, bool preferUdpInAuto);
-VideoRenderInputType videoRenderInputType(RenderMode renderMode);
-const char *videoRenderInputTypeName(VideoRenderInputType type);
 
 bool parseRtspTransport(const std::string &value, RtspTransport &transport);
 bool parseLatencyMode(const std::string &value, LatencyMode &mode);

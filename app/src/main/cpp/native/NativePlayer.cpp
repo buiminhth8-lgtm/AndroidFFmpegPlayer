@@ -191,6 +191,27 @@ const char *renderInputNameFromOutputType(int outputType) {
     }
 }
 
+// Renderer implied by the requested render mode.
+const char *rendererNameFromRenderMode(RenderMode renderMode) {
+    switch (renderMode) {
+        case RenderMode::SOFTWARE_RGBA: return "rgba_nativewindow";
+        case RenderMode::SOFTWARE_YUV_GL: return "yuv_gl";
+        case RenderMode::MEDIACODEC_NV12_GL: return "nv12_gl";
+        case RenderMode::MEDIACODEC_OES: return "oes_gl";
+        case RenderMode::MEDIACODEC_SURFACE: return "direct_surface";
+        default: return "unknown";
+    }
+}
+
+// Render-fallback reason code -> readable string.
+const char *renderFallbackReasonName(int code) {
+    switch (code) {
+        case 1: return "nv12_gl render failed";
+        case 2: return "yuv_gl render failed";
+        default: return "";
+    }
+}
+
 struct AgcResult {
     bool valid = false;
     float blackPoint = 0.0f;
@@ -1341,6 +1362,13 @@ std::string NativePlayer::getStats() {
     const char *frameOutputTypeValue = frameOutputTypeName(frameOutputType);
     const char *rendererValue = rendererTypeName(rendererType);
     const char *renderInputValue = renderInputNameFromOutputType(frameOutputType);
+    const char *requestedRendererValue = rendererNameFromRenderMode(optionsSnapshot.renderMode);
+    const bool glRendererRequested = optionsSnapshot.renderMode == RenderMode::MEDIACODEC_NV12_GL
+                                     || optionsSnapshot.renderMode == RenderMode::SOFTWARE_YUV_GL
+                                     || optionsSnapshot.renderMode == RenderMode::MEDIACODEC_OES;
+    const bool renderFallbackUsed = glRendererRequested
+                                    && std::string(requestedRendererValue) != std::string(rendererValue);
+    const char *renderFallbackReasonValue = renderFallbackReasonName(renderFallbackReasonCode_.load());
 
     std::string effectiveThermalRenderMode;
     std::string thermalInputType;
@@ -1398,6 +1426,9 @@ std::string NativePlayer::getStats() {
         << "\"decodeBackend\":\"" << decodeBackend << "\","
         << "\"frameOutputType\":\"" << frameOutputTypeValue << "\","
         << "\"renderer\":\"" << rendererValue << "\","
+        << "\"requestedRenderer\":\"" << requestedRendererValue << "\","
+        << "\"renderFallbackUsed\":" << (renderFallbackUsed ? "true" : "false") << ","
+        << "\"renderFallbackReason\":\"" << renderFallbackReasonValue << "\","
         << "\"hardwareDecodeAllowFallback\":" << (optionsSnapshot.hardwareDecodeAllowFallback ? "true" : "false") << ","
         << "\"requestedDecoderName\":\"" << escapeJson(optionsSnapshot.requestedDecoderName) << "\","
         << "\"actualDecoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
@@ -3328,6 +3359,7 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
         LOGE("NV12 GL render failed, fallback RGBA count=%lld error=%s",
              static_cast<long long>(fallback), result.errorMessage.c_str());
     }
+    renderFallbackReasonCode_.store(1);
     return false;
 }
 
@@ -3488,6 +3520,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
                      frame->format, static_cast<long long>(fallbackCount));
             }
         }
+        renderFallbackReasonCode_.store(2);
     }
 
     if (swsContext_ == nullptr || swsSourceFormat_ != frame->format || videoWidth_ != frameWidth || videoHeight_ != frameHeight) {
@@ -3660,6 +3693,7 @@ void NativePlayer::resetStats() {
     lastFrameColorRange_.store(0);
     lastFrameOutputType_.store(0);
     lastRendererType_.store(0);
+    renderFallbackReasonCode_.store(0);
     oesFrameAvailableCount_.store(0);
     oesFrameRenderedCount_.store(0);
     oesRenderFailCount_.store(0);

@@ -275,6 +275,7 @@ private:
     std::atomic<int> lastFrameColorRange_{0};  // AVCOL_RANGE_UNSPECIFIED == 0
     std::atomic<int> lastFrameOutputType_{0};  // 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
     std::atomic<int> lastRendererType_{0};     // 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
+    std::atomic<int> renderFallbackReasonCode_{0};  // 0 none, 1 nv12_gl_failed, 2 yuv_gl_failed
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};

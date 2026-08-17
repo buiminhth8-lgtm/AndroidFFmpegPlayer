@@ -390,9 +390,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     String current = TextUtils.isEmpty(currentRenderMode)
                             ? (hardwareDecodeSwitch.isChecked() ? "mediacodec_nv12_gl" : "software_yuv_gl")
                             : currentRenderMode;
-                    Log.w(TAG, "Thermal blocked: requires software_yuv_gl, current=" + current);
+                    Log.w(TAG, "Thermal blocked: requires software_yuv_gl/mediacodec_nv12_gl, current=" + current);
                     Toast.makeText(this,
-                            "Thermal requires Software YUV GL. Disable hardware decoding and restart playback.",
+                            "Thermal requires software_yuv_gl or mediacodec_nv12_gl. Switch render mode and restart playback.",
                             Toast.LENGTH_LONG).show();
                     updateThermalControlsEnabledState();
                     return;
@@ -539,13 +539,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private boolean isThermalSupported() {
-        if (!TextUtils.isEmpty(currentRenderMode)) {
-            // software_yuv_gl, mediacodec_oes, mediacodec_nv12_gl support thermal
-            // (Phase 1 / OES / NV12 white hot); mediacodec_surface does not.
-            return !"mediacodec_surface".equals(currentRenderMode);
+        String mode = !TextUtils.isEmpty(currentRenderMode) ? currentRenderMode : intentRenderMode;
+        if (!TextUtils.isEmpty(mode)) {
+            // software_yuv_gl / mediacodec_nv12_gl / mediacodec_oes support thermal;
+            // software_rgba and mediacodec_surface do not.
+            return "software_yuv_gl".equals(mode)
+                    || "mediacodec_nv12_gl".equals(mode)
+                    || "mediacodec_oes".equals(mode);
         }
-        // Player not established yet: use the pending decode-mode choice.
-        return !"mediacodec_surface".equals(intentRenderMode);
+        // Pending: hardware ON -> mediacodec_nv12_gl, OFF -> software_yuv_gl (both thermal-capable).
+        return true;
     }
 
     private void updateThermalControlsEnabledState() {

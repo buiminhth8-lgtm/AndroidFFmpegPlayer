@@ -708,8 +708,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long reconnectAttempt = stats.optLong("reconnectAttempt", stats.optLong("reconnectAttemptCount", 0));
             String reconnectError = stats.optString("reconnectLastError", stats.optString("lastReconnectError", ""));
             String mode = stats.optString("renderMode", "unknown");
-            String renderInputType = stats.optString("renderInputType", "none");
             String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
+            String decodeBackend = stats.optString("decodeBackend", "unknown");
+            String frameOutputType = stats.optString("frameOutputType", "unknown");
+            String renderer = stats.optString("renderer", "unknown");
+            String requestedRenderer = stats.optString("requestedRenderer", "unknown");
+            boolean renderFallbackUsed = stats.optBoolean("renderFallbackUsed", false);
+            boolean decoderFallbackUsed = stats.optBoolean("hardwareDecodeFallbackUsed", false);
+            String renderFallbackReason = stats.optString("renderFallbackReason", "");
             String frameFormat = stats.optString("frameFormat", "");
             long dropped = stats.optLong("droppedVideoFrameCount", 0);
             long videoBitRate = stats.optLong("videoBitRate", 0);
@@ -728,8 +734,39 @@ public class MediaPlayerActivity extends AppCompatActivity {
             int videoHeight = stats.optInt("videoHeight", 0);
             int frameYStride = stats.optInt("frameYStride", 0);
             String frameColorRange = stats.optString("frameColorRange", "unknown");
-            long yuvGlRendered = stats.optLong("yuvGlRenderedFrameCount", 0);
-            long yuvGlFallback = stats.optLong("yuvGlFallbackFrameCount", 0);
+            long rendererFrames;
+            long rendererFallbackFrames;
+            switch (renderer) {
+                case "nv12_gl":
+                    rendererFrames = stats.optLong("nv12GlRenderedFrameCount", 0);
+                    rendererFallbackFrames = stats.optLong("nv12GlFallbackFrameCount", 0);
+                    break;
+                case "yuv_gl":
+                    rendererFrames = stats.optLong("yuvGlRenderedFrameCount", 0);
+                    rendererFallbackFrames = stats.optLong("yuvGlFallbackFrameCount", 0);
+                    break;
+                case "oes_gl":
+                    rendererFrames = stats.optLong("oesFrameRenderedCount", 0);
+                    rendererFallbackFrames = 0;
+                    break;
+                case "direct_surface":
+                    rendererFrames = stats.optLong("hardwareRenderedFrameCount", 0);
+                    rendererFallbackFrames = 0;
+                    break;
+                case "rgba_nativewindow":
+                    rendererFrames = stats.optLong("softwareRenderedFrameCount", 0);
+                    rendererFallbackFrames = "nv12_gl".equals(requestedRenderer)
+                            ? stats.optLong("nv12GlFallbackFrameCount", 0)
+                            : stats.optLong("yuvGlFallbackFrameCount", 0);
+                    break;
+                default:
+                    rendererFrames = 0;
+                    rendererFallbackFrames = 0;
+                    break;
+            }
+            String fallbackDisplay = renderFallbackUsed
+                    ? "render:" + (TextUtils.isEmpty(renderFallbackReason) ? "yes" : renderFallbackReason)
+                    : (decoderFallbackUsed ? "decoder" : "none");
             String resolution = videoWidth > 0 && videoHeight > 0
                     ? videoWidth + "x" + videoHeight
                     : "--";
@@ -806,9 +843,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
-                            + " | " + mode
-                            + " | " + renderInputType
-                            + " | " + codec
+                            + " | decoder=" + codec + " (" + decodeBackend + ")"
+                            + "\noutput=" + frameOutputType
+                            + " | renderer=" + renderer
+                            + " | requested=" + requestedRenderer
                             + "\n" + resolution
                             + " | " + frameFormat
                             + " | Y stride=" + frameYStride
@@ -819,8 +857,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "\nbitrate " + formatKbps(videoKbps)
                             + "  transfer " + formatKbPerSec(transferKbPerSec)
                             + "  nominal " + nominalBitrate
-                            + "\nyuv-gl rendered=" + yuvGlRendered
-                            + " fallback=" + yuvGlFallback
+                            + "\nrenderer frames=" + rendererFrames
+                            + " fallback frames=" + rendererFallbackFrames
+                            + " | fallback=" + fallbackDisplay
                             + "  packets " + stats.optLong("readPacketCount", 0)
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt

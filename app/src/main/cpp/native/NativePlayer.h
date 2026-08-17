@@ -184,8 +184,8 @@ private:
     std::atomic<int64_t> startupFreshnessFlushCount_{0};
     std::atomic<int64_t> startupFreshnessFlushErrorCount_{0};
     std::atomic<int64_t> preparedAtTimeMs_{0};
-    std::atomic<int64_t> lastPrepareCostUs_{0};
-    std::atomic<int64_t> lastPrepareToStartDelayMs_{0};
+    std::atomic<int64_t> lastPrepareCostUs_{-1};
+    std::atomic<int64_t> lastPrepareToStartDelayMs_{-1};
     std::atomic<int64_t> startToFirstFrameMs_{-1};
 
     AVFormatContext *formatContext_ = nullptr;
@@ -263,11 +263,11 @@ private:
     std::atomic<int> nv12AgcFrameCounter_{0};
     std::atomic<int> nv12AgcLastFrameWidth_{0};
     std::atomic<int> nv12AgcLastFrameHeight_{0};
-    std::atomic<int64_t> nv12GlLastRenderCostUs_{0};
+    std::atomic<int64_t> nv12GlLastRenderCostUs_{-1};
     std::atomic<int64_t> nv12GlTotalRenderCostUs_{0};
     std::atomic<int64_t> nv12GlRenderCostSampleCount_{0};
     std::atomic<int64_t> nv12GlMaxRenderCostUs_{0};
-    std::atomic<int64_t> nv12GlLastUploadCostUs_{0};
+    std::atomic<int64_t> nv12GlLastUploadCostUs_{-1};
     std::atomic<int64_t> nv12GlTotalUploadCostUs_{0};
     std::atomic<int64_t> nv12GlUploadCostSampleCount_{0};
     std::atomic<int64_t> nv12GlMaxUploadCostUs_{0};
@@ -296,34 +296,36 @@ private:
     std::atomic<int> lastFrameYStride_{0};
     std::atomic<int> lastFrameColorRange_{0};  // AVCOL_RANGE_UNSPECIFIED == 0
     std::atomic<int> lastFrameOutputType_{0};  // 1 yuv420p_cpu, 2 nv12_cpu, 3 direct_surface, 4 external_oes
-    std::atomic<int> lastRendererType_{0};     // 1 rgba_nativewindow, 2 yuv_gl, 3 nv12_gl, 4 oes_gl
-    std::atomic<int> renderFallbackReasonCode_{0};  // 0 none, 1 nv12_gl_failed, 2 yuv_gl_failed
+    // Packed so Stats observes actual renderer and fallback reason from one
+    // coherent runtime commit. Low byte: renderer (1 RGBA, 2 YUV GL, 3 NV12 GL,
+    // 4 OES GL, 5 direct Surface); next byte: fallback reason (1 NV12, 2 YUV).
+    std::atomic<uint32_t> rendererState_{0};
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};
-    std::atomic<int64_t> lastReadFrameCostUs_{0};
+    std::atomic<int64_t> lastReadFrameCostUs_{-1};
     std::atomic<int64_t> totalReadFrameCostUs_{0};
     std::atomic<int64_t> readFrameCostSampleCount_{0};
     std::atomic<int64_t> maxReadFrameCostUs_{0};
-    std::atomic<int64_t> lastSendPacketCostUs_{0};
-    std::atomic<int64_t> lastReceiveFrameCostUs_{0};
+    std::atomic<int64_t> lastSendPacketCostUs_{-1};
+    std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};
     std::atomic<int64_t> decodeCostSampleCount_{0};
     std::atomic<int64_t> maxDecodeCostUs_{0};
-    std::atomic<int64_t> lastSwsScaleCostUs_{0};
+    std::atomic<int64_t> lastSwsScaleCostUs_{-1};
     std::atomic<int64_t> totalSwsScaleCostUs_{0};
     std::atomic<int64_t> swsScaleCostSampleCount_{0};
     std::atomic<int64_t> maxSwsScaleCostUs_{0};
-    std::atomic<int64_t> lastRenderCostUs_{0};
-    std::atomic<int64_t> lastRenderLockCostUs_{0};
-    std::atomic<int64_t> lastRenderCopyCostUs_{0};
-    std::atomic<int64_t> lastRenderPostCostUs_{0};
+    std::atomic<int64_t> lastRenderCostUs_{-1};
+    std::atomic<int64_t> lastRenderLockCostUs_{-1};
+    std::atomic<int64_t> lastRenderCopyCostUs_{-1};
+    std::atomic<int64_t> lastRenderPostCostUs_{-1};
     std::atomic<int64_t> totalRenderCostUs_{0};
     std::atomic<int64_t> renderCostSampleCount_{0};
     std::atomic<int64_t> maxRenderCostUs_{0};
-    std::atomic<int64_t> lastFrameProcessCostUs_{0};
+    std::atomic<int64_t> lastFrameProcessCostUs_{-1};
     std::atomic<int64_t> totalFrameProcessCostUs_{0};
     std::atomic<int64_t> frameProcessCostSampleCount_{0};
     std::atomic<int64_t> maxFrameProcessCostUs_{0};

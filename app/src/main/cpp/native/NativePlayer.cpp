@@ -640,6 +640,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         return result;
     }
     LOGI("open input success sourceType=%s url=%s", sourceTypeName(sourceType).c_str(), url.c_str());
+    const int64_t inputOpenCount = inputOpenCount_.fetch_add(1) + 1;
+    LOGI("input session opened count=%lld sourceType=%s",
+         static_cast<long long>(inputOpenCount), sourceTypeName(sourceType).c_str());
 
     result = avformat_find_stream_info(formatContext_, nullptr);
     if (result < 0) {
@@ -842,6 +845,14 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         if (useHardware) {
             LOGI("avcodec_open2 hardware success decoder=%s", decoderName(decoder).c_str());
         }
+        const int64_t decoderOpenCount = videoDecoderOpenCount_.fetch_add(1) + 1;
+        const int64_t hardwareOpenCount = useHardware
+                                          ? hardwareDecoderOpenCount_.fetch_add(1) + 1
+                                          : hardwareDecoderOpenCount_.load();
+        LOGI("video decoder session opened count=%lld hardwareCount=%lld decoder=%s hardware=%d",
+             static_cast<long long>(decoderOpenCount),
+             static_cast<long long>(hardwareOpenCount),
+             decoderName(decoder).c_str(), useHardware ? 1 : 0);
         return 0;
     };
 
@@ -1090,6 +1101,7 @@ std::string NativePlayer::enableAudio(bool enabled) {
     return out.str();
 }
 std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
+    const int64_t prepareStartUs = steadyNowUs();
     if (isReleased()) {
         return jsonError(-1, "player is released");
     }
@@ -1129,12 +1141,20 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
 
     std::string error;
     const int result = openInput(url, timeoutMs_, true, error);
+    lastPrepareCostUs_.store(std::max<int64_t>(0, steadyNowUs() - prepareStartUs));
     if (result < 0) {
+        preparedAtTimeMs_.store(0);
         setState(PlayerState::Error, error);
         return jsonError(result, error);
     }
 
+    preparedAtTimeMs_.store(nowMs());
     setState(PlayerState::Prepared);
+    LOGI("prepare completed costUs=%lld inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld",
+         static_cast<long long>(lastPrepareCostUs_.load()),
+         static_cast<long long>(inputOpenCount_.load()),
+         static_cast<long long>(videoDecoderOpenCount_.load()),
+         static_cast<long long>(hardwareDecoderOpenCount_.load()));
 
     std::ostringstream out;
     out << "{\"success\":true,\"message\":\"player prepared\","
@@ -1178,7 +1198,7 @@ std::string NativePlayer::start() {
         return jsonError(-1, "Surface is not set");
     }
 
-    bool shouldRefreshRealtimeInput = false;
+    bool shouldPrepareRealtimeInput = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == PlayerState::Playing) {
@@ -1196,15 +1216,12 @@ std::string NativePlayer::start() {
         if (playbackThread_.joinable()) {
             return jsonError(-1, "playback thread is already running");
         }
-        shouldRefreshRealtimeInput = isRealtimeInput_ && !remuxRecorder_.isRecording();
-        if (shouldRefreshRealtimeInput) {
-            state_ = PlayerState::Preparing;
-        }
+        shouldPrepareRealtimeInput = isRealtimeInput_;
     }
 
-    if (shouldRefreshRealtimeInput && !refreshRealtimeInputForStart()) {
+    if (shouldPrepareRealtimeInput && !prepareRealtimeInputForStart()) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return jsonError(-1, errorMessage_.empty() ? "refresh realtime input failed" : errorMessage_);
+        return jsonError(-1, errorMessage_.empty() ? "prepared realtime input is invalid" : errorMessage_);
     }
 
     {
@@ -1217,10 +1234,16 @@ std::string NativePlayer::start() {
         resetRealtimeClock();
         beginStartupKeyFrameWait("start");
         startPlayTimeMs_.store(nowMs());
+        startToFirstFrameMs_.store(-1);
         state_ = PlayerState::Playing;
         playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
     }
-    LOGI("startPlayer player=%p", this);
+    LOGI("startPlayer player=%p inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld reused=%d",
+         this,
+         static_cast<long long>(inputOpenCount_.load()),
+         static_cast<long long>(videoDecoderOpenCount_.load()),
+         static_cast<long long>(hardwareDecoderOpenCount_.load()),
+         shouldPrepareRealtimeInput ? 1 : 0);
     return jsonSuccess("player started");
 }
 
@@ -1513,6 +1536,16 @@ std::string NativePlayer::getStats() {
         << "\"lastRenderTimeMs\":" << lastRenderTimeMs_.load() << ","
         << "\"lastSnapshotTimeMs\":" << lastSnapshotTimeMs_.load() << ","
         << "\"startPlayTimeMs\":" << startPlayTimeMs_.load() << ","
+        << "\"preparedAtTimeMs\":" << preparedAtTimeMs_.load() << ","
+        << "\"lastPrepareCostUs\":" << lastPrepareCostUs_.load() << ","
+        << "\"lastPrepareToStartDelayMs\":" << lastPrepareToStartDelayMs_.load() << ","
+        << "\"startToFirstFrameMs\":" << startToFirstFrameMs_.load() << ","
+        << "\"inputOpenCount\":" << inputOpenCount_.load() << ","
+        << "\"videoDecoderOpenCount\":" << videoDecoderOpenCount_.load() << ","
+        << "\"hardwareDecoderOpenCount\":" << hardwareDecoderOpenCount_.load() << ","
+        << "\"realtimeStartInputReuseCount\":" << realtimeStartInputReuseCount_.load() << ","
+        << "\"startupFreshnessFlushCount\":" << startupFreshnessFlushCount_.load() << ","
+        << "\"startupFreshnessFlushErrorCount\":" << startupFreshnessFlushErrorCount_.load() << ","
         << "\"lastError\":\"" << escapeJson(lastError) << "\"," 
         << "\"sourceType\":\"" << sourceTypeName(sourceType) << "\","
         << "\"latencyMode\":\"" << latencyModeName(optionsSnapshot.latencyMode) << "\","
@@ -2268,33 +2301,69 @@ int NativePlayer::interruptCallback(void *opaque) {
     return (player->stopRequested_.load() || player->transportSwitchRequested_.load()) ? 1 : 0;
 }
 
-bool NativePlayer::refreshRealtimeInputForStart() {
+bool NativePlayer::prepareRealtimeInputForStart() {
+    PlayerOptions optionsSnapshot;
+    SourceType sourceType = SourceType::OTHER;
     std::string currentUrl;
-    int currentTimeoutMs = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         currentUrl = url_;
-        currentTimeoutMs = timeoutMs_;
+        optionsSnapshot = playerOptions_;
+        sourceType = sourceType_;
         errorMessage_.clear();
     }
 
-    LOGI("refresh realtime input before start url=%s", currentUrl.c_str());
-    stopRequested_.store(false);
-    pauseRequested_.store(false);
-    resetRealtimeClock();
-    releaseFfmpegResources();
-    clearLastFrame();
-
-    std::string error;
-    const int result = openInput(currentUrl, currentTimeoutMs, true, error);
-    if (result < 0) {
+    if (formatContext_ == nullptr || videoCodecContext_ == nullptr || packet_ == nullptr
+        || decodedFrame_ == nullptr || latestFrame_ == nullptr || rgbaFrame_ == nullptr) {
+        const std::string error = "prepared realtime input resources are invalid";
         setState(PlayerState::Error, error);
-        LOGE("refresh realtime input failed url=%s error=%s", currentUrl.c_str(), error.c_str());
+        LOGE("realtime start reuse failed url=%s error=%s", currentUrl.c_str(), error.c_str());
         return false;
     }
 
-    setState(PlayerState::Prepared);
-    LOGI("refresh realtime input success url=%s", currentUrl.c_str());
+    const int64_t preparedAtMs = preparedAtTimeMs_.load();
+    const int64_t prepareToStartDelayMs = preparedAtMs > 0
+                                          ? std::max<int64_t>(0, nowMs() - preparedAtMs)
+                                          : 0;
+    lastPrepareToStartDelayMs_.store(prepareToStartDelayMs);
+    realtimeStartInputReuseCount_.fetch_add(1);
+
+    // Recording used to suppress the old close/reopen path. Preserve that
+    // behavior: reuse the prepared input without discarding probe buffers that
+    // may be needed by the remux session.
+    const bool recording = remuxRecorder_.isRecording();
+    const int64_t staleThresholdUs = std::max<int64_t>(0, optionsSnapshot.dropLateFrameThresholdUs);
+    const bool stalePreparedInput = isRtspSource(sourceType) && !recording
+                                    && prepareToStartDelayMs * 1000 > staleThresholdUs;
+    if (stalePreparedInput) {
+        // Drop only FFmpeg/AVIO read-side buffers. This keeps the RTSP socket,
+        // stream discovery, AVCodecContext and MediaCodec session intact. The
+        // existing startup keyframe gate then resumes decode on a valid GOP.
+        if (formatContext_->pb != nullptr) {
+            avio_flush(formatContext_->pb);
+        }
+        const int flushResult = avformat_flush(formatContext_);
+        if (flushResult < 0) {
+            startupFreshnessFlushErrorCount_.fetch_add(1);
+            LOGE("realtime start freshness flush failed delayMs=%lld error=%s",
+                 static_cast<long long>(prepareToStartDelayMs),
+                 ffmpegErrorToString(flushResult).c_str());
+        } else {
+            startupFreshnessFlushCount_.fetch_add(1);
+        }
+    }
+    if (!recording) {
+        clearLastFrame();
+    }
+    LOGI("realtime start reuses prepared input sourceType=%s delayMs=%lld staleThresholdUs=%lld freshnessFlush=%d recording=%d inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld",
+         sourceTypeName(sourceType).c_str(),
+         static_cast<long long>(prepareToStartDelayMs),
+         static_cast<long long>(staleThresholdUs),
+         stalePreparedInput ? 1 : 0,
+         recording ? 1 : 0,
+         static_cast<long long>(inputOpenCount_.load()),
+         static_cast<long long>(videoDecoderOpenCount_.load()),
+         static_cast<long long>(hardwareDecoderOpenCount_.load()));
     return true;
 }
 
@@ -3230,7 +3299,7 @@ void NativePlayer::renderOesPendingFrameIfReady() {
         if (oesThermalMode != 0) {
             oesThermalRenderedCount_.fetch_add(1);
         }
-        lastRenderTimeMs_.store(nowMs());
+        markFrameRendered();
     } else {
         const int64_t fails = oesRenderFailCount_.fetch_add(1) + 1;
         if (fails == 1 || fails % 100 == 0) {
@@ -3302,7 +3371,7 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
 
     renderedFrameCount_.fetch_add(1);
     hardwareRenderedFrameCount_.fetch_add(1);
-    lastRenderTimeMs_.store(nowMs());
+    markFrameRendered();
     return true;
 }
 
@@ -3424,7 +3493,7 @@ bool NativePlayer::renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHe
             recordCost(nv12GlLastRenderCostUs_, nv12GlTotalRenderCostUs_, nv12GlRenderCostSampleCount_,
                        nv12GlMaxRenderCostUs_, result.stats.totalCostUs);
         }
-        lastRenderTimeMs_.store(nowMs());
+        markFrameRendered();
         return true;
     }
     if (result.errorCode == kRenderErrorNoSurface) {
@@ -3518,7 +3587,7 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
         std::lock_guard<std::mutex> lock(mutex_);
         lastFrameFormatName_ = "yuv420p_gl";
     }
-    lastRenderTimeMs_.store(nowMs());
+    markFrameRendered();
     return true;
 }
 
@@ -3687,7 +3756,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     renderedFrameCount_.fetch_add(1);
     softwareRenderedFrameCount_.fetch_add(1);
     lastRendererType_.store(1);  // rgba_nativewindow
-    lastRenderTimeMs_.store(nowMs());
+    markFrameRendered();
     return true;
 }
 
@@ -3732,6 +3801,24 @@ void NativePlayer::clearLastFrame() {
     lastFrameStride_ = 0;
     lastFramePtsUs_ = 0;
     hasLastFrame_ = false;
+}
+
+void NativePlayer::markFrameRendered() {
+    const int64_t renderTimeMs = nowMs();
+    lastRenderTimeMs_.store(renderTimeMs);
+    const int64_t startTimeMs = startPlayTimeMs_.load();
+    if (startTimeMs <= 0) {
+        return;
+    }
+    int64_t unset = -1;
+    const int64_t startupCostMs = std::max<int64_t>(0, renderTimeMs - startTimeMs);
+    if (startToFirstFrameMs_.compare_exchange_strong(unset, startupCostMs)) {
+        LOGI("first frame rendered startToFirstFrameMs=%lld inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld",
+             static_cast<long long>(startupCostMs),
+             static_cast<long long>(inputOpenCount_.load()),
+             static_cast<long long>(videoDecoderOpenCount_.load()),
+             static_cast<long long>(hardwareDecoderOpenCount_.load()));
+    }
 }
 
 void NativePlayer::deleteSurfaceGlobalRefLocked(JNIEnv *env) {
@@ -3817,6 +3904,16 @@ void NativePlayer::resetStats() {
     maxVideoDelayUs_.store(0);
     decodedFormatChangeCount_.store(0);
     realtimeClockFormatResetCount_.store(0);
+    inputOpenCount_.store(0);
+    videoDecoderOpenCount_.store(0);
+    hardwareDecoderOpenCount_.store(0);
+    realtimeStartInputReuseCount_.store(0);
+    startupFreshnessFlushCount_.store(0);
+    startupFreshnessFlushErrorCount_.store(0);
+    preparedAtTimeMs_.store(0);
+    lastPrepareCostUs_.store(0);
+    lastPrepareToStartDelayMs_.store(0);
+    startToFirstFrameMs_.store(-1);
     lastReadFrameCostUs_.store(0);
     totalReadFrameCostUs_.store(0);
     readFrameCostSampleCount_.store(0);

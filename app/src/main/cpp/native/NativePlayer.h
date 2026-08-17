@@ -90,7 +90,7 @@ private:
 
     void playbackLoop();
     int openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage);
-    bool refreshRealtimeInputForStart();
+    bool prepareRealtimeInputForStart();
     bool reconnectInput(int readErrorCode);
     bool switchTransportInput();
     bool waitForReconnectDelay(int delayMs);
@@ -125,6 +125,7 @@ private:
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
+    void markFrameRendered();
     void deleteSurfaceGlobalRefLocked(JNIEnv *env);
     void resetStats();
     void releaseFfmpegResources();
@@ -175,6 +176,16 @@ private:
     std::atomic<int64_t> wallClockUs_{0};
     std::atomic<int64_t> decodedFormatChangeCount_{0};
     std::atomic<int64_t> realtimeClockFormatResetCount_{0};
+    std::atomic<int64_t> inputOpenCount_{0};
+    std::atomic<int64_t> videoDecoderOpenCount_{0};
+    std::atomic<int64_t> hardwareDecoderOpenCount_{0};
+    std::atomic<int64_t> realtimeStartInputReuseCount_{0};
+    std::atomic<int64_t> startupFreshnessFlushCount_{0};
+    std::atomic<int64_t> startupFreshnessFlushErrorCount_{0};
+    std::atomic<int64_t> preparedAtTimeMs_{0};
+    std::atomic<int64_t> lastPrepareCostUs_{0};
+    std::atomic<int64_t> lastPrepareToStartDelayMs_{0};
+    std::atomic<int64_t> startToFirstFrameMs_{-1};
 
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;

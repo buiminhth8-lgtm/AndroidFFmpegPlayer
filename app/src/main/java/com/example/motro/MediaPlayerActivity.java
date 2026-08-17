@@ -243,13 +243,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String decodeResult = newlyCreated
                     ? applyDecodeModeOption(handle)
                     : "{\"success\":true,\"message\":\"player already exists, decode mode unchanged until next prepare\"}";
+            String thermalResult = newlyCreated
+                    ? applyThermalOptionsToPlayer(handle)
+                    : "{\"success\":true,\"message\":\"player already exists, thermal config unchanged\"}";
             return "{\"success\":true,\"handle\":" + handle + "}"
                     + "\nsurface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
-                    + "\ndecode=" + decodeResult;
+                    + "\ndecode=" + decodeResult
+                    + "\nthermal=" + thermalResult;
         }));
 
         findViewById(R.id.infoButton).setOnClickListener(v -> runNative("FFmpeg Info", () ->
@@ -269,6 +273,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String reconnectResult = applyReconnectOptions(handle);
             String audioResult = applyAudioOption(handle);
             String decodeResult = applyDecodeModeOption(handle);
+            String thermalResult = applyThermalOptionsToPlayer(handle);
             String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
                     + "\ntransport=" + transportResult
@@ -276,6 +281,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
+                    + "\nthermal=" + thermalResult
                     + "\nprepare=" + prepareResult;
         }));
 
@@ -394,7 +400,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 if (handle == 0) {
                     return;
                 }
-                callThermalApi("Thermal Enable", () -> applyThermalConfig(handle));
+                callThermalApi("Thermal Enable", () -> applyThermalOptionsToPlayer(handle));
             } else {
                 updateThermalControlsEnabledState();
                 long handle = getPlayerHandle();
@@ -566,12 +572,15 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.thermalWhitePointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
     }
 
-    private String applyThermalConfig(long handle) throws Exception {
+    private String applyThermalOptionsToPlayer(long handle) {
+        if (handle == 0) {
+            return jsonError("player handle is 0");
+        }
         String paletteResult = FFmpegNative.setThermalPalette(handle, thermalPalette);
         String gammaResult = FFmpegNative.setThermalGamma(handle, thermalGamma);
         String windowResult = FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint);
         String agcResult = FFmpegNative.setThermalAgcEnabled(handle, controlsBinding.thermalAgcSwitch.isChecked());
-        String enableResult = FFmpegNative.setThermalEnabled(handle, true);
+        String enableResult = FFmpegNative.setThermalEnabled(handle, controlsBinding.thermalEnabledSwitch.isChecked());
         return "palette=" + paletteResult
                 + "\ngamma=" + gammaResult
                 + "\nwindow=" + windowResult

@@ -2,12 +2,17 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <sstream>
 #include <string>
-#include <unordered_set>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "native/NativePlayer.h"
@@ -31,9 +36,72 @@ namespace {
 
 JavaVM *g_java_vm = nullptr;
 bool g_jni_initialized = false;
-std::mutex g_player_mutex;
-std::unordered_set<NativePlayer *> g_active_players;
-std::unordered_set<uintptr_t> g_released_players;
+std::atomic<int64_t> g_next_player_handle{1};
+
+struct PlayerEntry {
+    PlayerEntry(jlong handleValue, std::unique_ptr<NativePlayer> playerValue)
+            : handle(handleValue), player(std::move(playerValue)) {
+    }
+
+    const jlong handle;
+    std::unique_ptr<NativePlayer> player;
+    std::mutex lifetimeMutex;
+    std::condition_variable lifetimeCv;
+    bool closing = false;
+    uint32_t activeOperations = 0;
+};
+
+// Lock order: registry mutex -> entry lifetime mutex. Player API calls and
+// release drain waits must hold neither lock.
+std::mutex g_player_registry_mutex;
+std::unordered_map<jlong, std::shared_ptr<PlayerEntry>> g_player_registry;
+
+class PlayerOperationGuard {
+public:
+    PlayerOperationGuard() = default;
+    explicit PlayerOperationGuard(std::shared_ptr<PlayerEntry> entry)
+            : entry_(std::move(entry)) {
+    }
+
+    PlayerOperationGuard(const PlayerOperationGuard &) = delete;
+    PlayerOperationGuard &operator=(const PlayerOperationGuard &) = delete;
+    PlayerOperationGuard(PlayerOperationGuard &&other) noexcept
+            : entry_(std::move(other.entry_)) {
+    }
+    PlayerOperationGuard &operator=(PlayerOperationGuard &&) = delete;
+
+    ~PlayerOperationGuard() {
+        if (entry_ == nullptr) {
+            return;
+        }
+        std::shared_ptr<PlayerEntry> entry = std::move(entry_);
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lock(entry->lifetimeMutex);
+            if (entry->activeOperations == 0) {
+                LOGE("player operation guard imbalance handle=%lld",
+                     static_cast<long long>(entry->handle));
+                return;
+            }
+            --entry->activeOperations;
+            drained = entry->activeOperations == 0;
+        }
+        if (drained) {
+            entry->lifetimeCv.notify_all();
+        }
+    }
+
+    explicit operator bool() const {
+        return entry_ != nullptr;
+    }
+
+    NativePlayer *player() const {
+        return entry_ == nullptr ? nullptr : entry_->player.get();
+    }
+
+private:
+    std::shared_ptr<PlayerEntry> entry_;
+};
 
 std::string escapeJson(const std::string &value) {
     std::ostringstream out;
@@ -228,25 +296,39 @@ std::vector<std::string> toStringVector(JNIEnv *env, jobjectArray args) {
     return values;
 }
 
-NativePlayer *getPlayer(jlong handle, std::string &errorMessage) {
+bool wasPlayerHandleIssued(jlong handle) {
+    return handle > 0 && handle < g_next_player_handle.load();
+}
+
+PlayerOperationGuard acquirePlayer(jlong handle, std::string &errorMessage) {
     if (handle == 0) {
         errorMessage = "player handle is 0";
-        return nullptr;
+        return {};
     }
 
-    auto *player = reinterpret_cast<NativePlayer *>(static_cast<intptr_t>(handle));
-    const uintptr_t rawHandle = reinterpret_cast<uintptr_t>(player);
-    std::lock_guard<std::mutex> lock(g_player_mutex);
-    if (g_active_players.find(player) != g_active_players.end()) {
-        return player;
+    std::shared_ptr<PlayerEntry> entry;
+    {
+        std::unique_lock<std::mutex> registryLock(g_player_registry_mutex);
+        const auto iterator = g_player_registry.find(handle);
+        if (iterator == g_player_registry.end()) {
+            errorMessage = wasPlayerHandleIssued(handle)
+                           ? "player already released"
+                           : "invalid player handle";
+            return {};
+        }
+        entry = iterator->second;
+
+        std::lock_guard<std::mutex> entryLock(entry->lifetimeMutex);
+        if (entry->closing || entry->player == nullptr) {
+            errorMessage = "player already released";
+            return {};
+        }
+        ++entry->activeOperations;
     }
-    if (g_released_players.find(rawHandle) != g_released_players.end()) {
-        errorMessage = "player already released";
-    } else {
-        errorMessage = "invalid player handle";
-    }
-    return nullptr;
+    return PlayerOperationGuard(std::move(entry));
 }
+
+std::string runPlayerLifetimeStressTest();
 
 jstring nativeGetFFmpegVersion(JNIEnv *env, jclass) {
     return toJString(env, av_version_info());
@@ -328,6 +410,9 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     if (first == "-hardware-decode-help") {
         return toJString(env, hardwareDecodeHelpJson());
     }
+    if (first == "-player-lifetime-stress") {
+        return toJString(env, runPlayerLifetimeStressTest());
+    }
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {
             return toJString(env, jsonError(-1, "-probe requires url"));
@@ -348,23 +433,45 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
                           + escapeJson(first) + "\"}");
 }
 
-jlong nativeCreatePlayer(JNIEnv *, jclass) {
-    auto *player = new (std::nothrow) NativePlayer();
+jlong createPlayerEntry() {
+    const jlong handle = static_cast<jlong>(g_next_player_handle.fetch_add(1));
+    if (handle <= 0) {
+        LOGE("createPlayer failed: handle space exhausted");
+        return 0;
+    }
+
+    std::unique_ptr<NativePlayer> player(new (std::nothrow) NativePlayer(handle));
     if (player == nullptr) {
         LOGE("createPlayer failed: allocation failed");
         return 0;
     }
 
-    std::lock_guard<std::mutex> lock(g_player_mutex);
-    g_active_players.insert(player);
-    g_released_players.erase(reinterpret_cast<uintptr_t>(player));
-    LOGI("createPlayer handle=%p", player);
-    return static_cast<jlong>(reinterpret_cast<intptr_t>(player));
+    try {
+        auto entry = std::make_shared<PlayerEntry>(handle, std::move(player));
+        size_t activePlayerCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_player_registry_mutex);
+            g_player_registry.emplace(handle, std::move(entry));
+            activePlayerCount = g_player_registry.size();
+        }
+        LOGI("createPlayer handle=%lld activePlayerCount=%zu",
+             static_cast<long long>(handle), activePlayerCount);
+        return handle;
+    } catch (const std::bad_alloc &) {
+        LOGE("createPlayer failed: registry allocation failed handle=%lld",
+             static_cast<long long>(handle));
+        return 0;
+    }
+}
+
+jlong nativeCreatePlayer(JNIEnv *, jclass) {
+    return createPlayerEntry();
 }
 
 jstring nativeSetPlayerSurface(JNIEnv *env, jclass, jlong handle, jobject surface) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -374,7 +481,8 @@ jstring nativeSetPlayerSurface(JNIEnv *env, jclass, jlong handle, jobject surfac
 
 jstring nativeSetAudioCallback(JNIEnv *env, jclass, jlong handle, jobject callback) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -383,7 +491,8 @@ jstring nativeSetAudioCallback(JNIEnv *env, jclass, jlong handle, jobject callba
 
 jstring nativeSetPlayerEventListener(JNIEnv *env, jclass, jlong handle, jobject listener) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -392,7 +501,8 @@ jstring nativeSetPlayerEventListener(JNIEnv *env, jclass, jlong handle, jobject 
 
 jstring nativeEnableAudio(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -400,7 +510,8 @@ jstring nativeEnableAudio(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
 }
 jstring nativePreparePlayer(JNIEnv *env, jclass, jlong handle, jstring url, jint timeoutMs) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -419,7 +530,8 @@ jstring nativePreparePlayer(JNIEnv *env, jclass, jlong handle, jstring url, jint
 
 jstring nativeStartPlayer(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -428,7 +540,8 @@ jstring nativeStartPlayer(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativePausePlayer(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -437,7 +550,8 @@ jstring nativePausePlayer(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeStopPlayer(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -446,7 +560,8 @@ jstring nativeStopPlayer(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeGetPlayerState(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -456,7 +571,8 @@ jstring nativeGetPlayerState(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeSetPlayerReconnectOptions(JNIEnv *env, jclass, jlong handle, jboolean enabled, jint maxRetryCount, jint retryDelayMs) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -465,7 +581,8 @@ jstring nativeSetPlayerReconnectOptions(JNIEnv *env, jclass, jlong handle, jbool
 
 jstring nativeGetPlayerReconnectState(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -474,7 +591,8 @@ jstring nativeGetPlayerReconnectState(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeSetPlayerRtspTransport(JNIEnv *env, jclass, jlong handle, jstring transport) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -493,7 +611,8 @@ jstring nativeSetPlayerRtspTransport(JNIEnv *env, jclass, jlong handle, jstring 
 
 jstring nativeGetPlayerRtspTransportState(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -506,7 +625,8 @@ jstring nativeSetRtspTransport(JNIEnv *env, jclass clazz, jlong handle, jstring 
 
 jstring nativeSetPlayerLatencyMode(JNIEnv *env, jclass, jlong handle, jstring mode) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -525,7 +645,8 @@ jstring nativeSetPlayerLatencyMode(JNIEnv *env, jclass, jlong handle, jstring mo
 
 jstring nativeSetPlayerOption(JNIEnv *env, jclass, jlong handle, jstring key, jstring value) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -555,7 +676,8 @@ jstring nativeSetPlayerOption(JNIEnv *env, jclass, jlong handle, jstring key, js
 
 jstring nativeSetHardwareDecode(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -564,7 +686,8 @@ jstring nativeSetHardwareDecode(JNIEnv *env, jclass, jlong handle, jboolean enab
 
 jstring nativeSetHardwareRenderMode(JNIEnv *env, jclass, jlong handle, jstring mode) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -583,7 +706,8 @@ jstring nativeSetHardwareRenderMode(JNIEnv *env, jclass, jlong handle, jstring m
 
 jstring nativeGetPlayerLatencyConfig(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -592,7 +716,8 @@ jstring nativeGetPlayerLatencyConfig(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeTakePlayerSnapshot(JNIEnv *env, jclass, jlong handle, jstring outputPath) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -611,7 +736,8 @@ jstring nativeTakePlayerSnapshot(JNIEnv *env, jclass, jlong handle, jstring outp
 
 jstring nativeGetPlayerStats(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -620,7 +746,8 @@ jstring nativeGetPlayerStats(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeClearPlayerSurface(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -628,7 +755,8 @@ jstring nativeClearPlayerSurface(JNIEnv *env, jclass, jlong handle) {
 }
 jstring nativeStartPlayerRecord(JNIEnv *env, jclass, jlong handle, jstring outputPath) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -648,7 +776,8 @@ jstring nativeStartPlayerRecord(JNIEnv *env, jclass, jlong handle, jstring outpu
 
 jstring nativeStartPlayerSegmentRecord(JNIEnv *env, jclass, jlong handle, jstring outputPattern, jint segmentDurationSec) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -667,7 +796,8 @@ jstring nativeStartPlayerSegmentRecord(JNIEnv *env, jclass, jlong handle, jstrin
 
 jstring nativeStartPlayerRecordWithConfig(JNIEnv *env, jclass, jlong handle, jstring outputPathOrPattern, jstring format, jint segmentDurationSec) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -697,7 +827,8 @@ jstring nativeStartPlayerRecordWithConfig(JNIEnv *env, jclass, jlong handle, jst
 
 jstring nativeStopPlayerRecord(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -706,7 +837,8 @@ jstring nativeStopPlayerRecord(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeGetPlayerRecordState(JNIEnv *env, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -715,7 +847,8 @@ jstring nativeGetPlayerRecordState(JNIEnv *env, jclass, jlong handle) {
 
 jstring nativeSetThermalEnabled(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -724,7 +857,8 @@ jstring nativeSetThermalEnabled(JNIEnv *env, jclass, jlong handle, jboolean enab
 
 jstring nativeSetThermalPalette(JNIEnv *env, jclass, jlong handle, jint palette) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -733,7 +867,8 @@ jstring nativeSetThermalPalette(JNIEnv *env, jclass, jlong handle, jint palette)
 
 jstring nativeSetThermalAgcEnabled(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -742,7 +877,8 @@ jstring nativeSetThermalAgcEnabled(JNIEnv *env, jclass, jlong handle, jboolean e
 
 jstring nativeSetThermalGamma(JNIEnv *env, jclass, jlong handle, jfloat gamma) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -751,7 +887,8 @@ jstring nativeSetThermalGamma(JNIEnv *env, jclass, jlong handle, jfloat gamma) {
 
 jstring nativeSetThermalWindow(JNIEnv *env, jclass, jlong handle, jfloat blackPoint, jfloat whitePoint) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player == nullptr) {
         return toJString(env, jsonError(-1, error));
     }
@@ -760,34 +897,261 @@ jstring nativeSetThermalWindow(JNIEnv *env, jclass, jlong handle, jfloat blackPo
 
 void nativeNotifyOesFrameAvailable(JNIEnv *, jclass, jlong handle) {
     std::string error;
-    NativePlayer *player = getPlayer(handle, error);
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
     if (player != nullptr) {
         player->notifyOesFrameAvailable();
     }
 }
 
-jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
+std::string releasePlayerEntry(jlong handle) {
     if (handle == 0) {
-        return toJString(env, jsonError(-1, "player handle is 0"));
+        return jsonError(-1, "player handle is 0");
     }
 
-    auto *player = reinterpret_cast<NativePlayer *>(static_cast<intptr_t>(handle));
-    const uintptr_t rawHandle = reinterpret_cast<uintptr_t>(player);
+    std::shared_ptr<PlayerEntry> entry;
+    uint32_t activeOperations = 0;
+    size_t remainingPlayerCount = 0;
     {
-        std::lock_guard<std::mutex> lock(g_player_mutex);
-        if (g_released_players.find(rawHandle) != g_released_players.end()) {
-            return toJString(env, jsonSuccess("player already released"));
+        std::unique_lock<std::mutex> registryLock(g_player_registry_mutex);
+        const auto iterator = g_player_registry.find(handle);
+        if (iterator == g_player_registry.end()) {
+            return wasPlayerHandleIssued(handle)
+                   ? jsonSuccess("player already released")
+                   : jsonError(-1, "invalid player handle");
         }
-        if (g_active_players.find(player) == g_active_players.end()) {
-            return toJString(env, jsonError(-1, "invalid player handle"));
+        entry = iterator->second;
+        {
+            std::lock_guard<std::mutex> entryLock(entry->lifetimeMutex);
+            entry->closing = true;
+            activeOperations = entry->activeOperations;
         }
-        g_active_players.erase(player);
-        g_released_players.insert(rawHandle);
+        g_player_registry.erase(iterator);
+        remainingPlayerCount = g_player_registry.size();
     }
 
-    const std::string result = player->release();
-    delete player;
-    return toJString(env, result);
+    LOGI("release begin handle=%lld activeOperations=%u remainingPlayerCount=%zu",
+         static_cast<long long>(handle), activeOperations, remainingPlayerCount);
+    {
+        std::unique_lock<std::mutex> entryLock(entry->lifetimeMutex);
+        if (entry->activeOperations > 0) {
+            LOGI("release waiting handle=%lld activeOperations=%u",
+                 static_cast<long long>(handle), entry->activeOperations);
+        }
+        entry->lifetimeCv.wait(entryLock, [&entry] {
+            return entry->activeOperations == 0;
+        });
+    }
+    LOGI("release operations drained handle=%lld", static_cast<long long>(handle));
+
+    const std::string result = entry->player->release();
+    entry->player.reset();
+    LOGI("release completed handle=%lld remainingPlayerCount=%zu",
+         static_cast<long long>(handle), remainingPlayerCount);
+    return result;
+}
+
+jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
+    return toJString(env, releasePlayerEntry(handle));
+}
+
+std::string runPlayerLifetimeStressTest() {
+    constexpr int kCreateReleaseCycles = 100;
+    constexpr int kConcurrentReleaseCycles = 20;
+    constexpr int kConcurrentOperations = 4;
+    const auto succeeded = [](const std::string &result) {
+        return result.find("\"success\":true") != std::string::npos;
+    };
+
+    bool createReleasePassed = true;
+    bool uniqueHandles = true;
+    bool staleHandleSafe = true;
+    bool duplicateReleaseSafe = true;
+    std::vector<jlong> issuedHandles;
+    issuedHandles.reserve(kCreateReleaseCycles + kConcurrentReleaseCycles + 2);
+
+    for (int cycle = 0; cycle < kCreateReleaseCycles; ++cycle) {
+        const jlong handle = createPlayerEntry();
+        if (handle == 0
+            || std::find(issuedHandles.begin(), issuedHandles.end(), handle) != issuedHandles.end()) {
+            createReleasePassed = false;
+            uniqueHandles = false;
+            break;
+        }
+        issuedHandles.push_back(handle);
+
+        std::string acquireError;
+        {
+            PlayerOperationGuard guard = acquirePlayer(handle, acquireError);
+            if (!guard || !succeeded(guard.player()->getState())) {
+                createReleasePassed = false;
+            }
+        }
+        if (!succeeded(releasePlayerEntry(handle))) {
+            createReleasePassed = false;
+        }
+        if (!succeeded(releasePlayerEntry(handle))) {
+            duplicateReleaseSafe = false;
+        }
+        std::string staleError;
+        PlayerOperationGuard staleGuard = acquirePlayer(handle, staleError);
+        if (staleGuard || staleError != "player already released") {
+            staleHandleSafe = false;
+        }
+    }
+
+    const jlong oldHandle = issuedHandles.empty() ? 0 : issuedHandles.front();
+    const jlong newHandle = createPlayerEntry();
+    bool oldHandleCannotTargetNewPlayer = oldHandle > 0 && newHandle > 0 && oldHandle != newHandle;
+    if (newHandle > 0) {
+        issuedHandles.push_back(newHandle);
+        {
+            std::string oldError;
+            PlayerOperationGuard oldGuard = acquirePlayer(oldHandle, oldError);
+            std::string newError;
+            PlayerOperationGuard newGuard = acquirePlayer(newHandle, newError);
+            oldHandleCannotTargetNewPlayer = oldHandleCannotTargetNewPlayer
+                                             && !oldGuard && newGuard;
+        }
+        if (!succeeded(releasePlayerEntry(newHandle))) {
+            createReleasePassed = false;
+        }
+    } else {
+        createReleasePassed = false;
+        oldHandleCannotTargetNewPlayer = false;
+    }
+
+    bool releaseWaitedForActiveOperation = false;
+    bool closingRejectedNewOperations = false;
+    const jlong drainHandle = createPlayerEntry();
+    if (drainHandle != 0) {
+        std::atomic<bool> releaseCompleted{false};
+        std::string releaseResult;
+        std::thread releaseThread;
+        {
+            std::string acquireError;
+            PlayerOperationGuard heldGuard = acquirePlayer(drainHandle, acquireError);
+            if (heldGuard) {
+                releaseThread = std::thread([&] {
+                    releaseResult = releasePlayerEntry(drainHandle);
+                    releaseCompleted.store(true);
+                });
+                for (int attempt = 0; attempt < 100; ++attempt) {
+                    std::string probeError;
+                    PlayerOperationGuard probeGuard = acquirePlayer(drainHandle, probeError);
+                    if (!probeGuard) {
+                        closingRejectedNewOperations = true;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                releaseWaitedForActiveOperation = !releaseCompleted.load();
+            }
+        }
+        if (releaseThread.joinable()) {
+            releaseThread.join();
+        }
+        if (!succeeded(releaseResult)) {
+            createReleasePassed = false;
+        }
+    } else {
+        createReleasePassed = false;
+    }
+
+    bool concurrentReleasePassed = true;
+    int64_t minimumReleaseWaitMs = INT64_MAX;
+    for (int cycle = 0; cycle < kConcurrentReleaseCycles; ++cycle) {
+        const jlong handle = createPlayerEntry();
+        if (handle == 0) {
+            concurrentReleasePassed = false;
+            break;
+        }
+
+        std::mutex gateMutex;
+        std::condition_variable gateCv;
+        int readyOperations = 0;
+        bool startOperations = false;
+        std::atomic<bool> operationFailed{false};
+        std::vector<std::thread> operationThreads;
+        operationThreads.reserve(kConcurrentOperations);
+        for (int operation = 0; operation < kConcurrentOperations; ++operation) {
+            operationThreads.emplace_back([&, operation] {
+                std::string acquireError;
+                PlayerOperationGuard guard = acquirePlayer(handle, acquireError);
+                {
+                    std::unique_lock<std::mutex> gateLock(gateMutex);
+                    ++readyOperations;
+                    gateCv.notify_all();
+                    gateCv.wait(gateLock, [&] { return startOperations; });
+                }
+                if (!guard) {
+                    operationFailed.store(true);
+                    return;
+                }
+                const std::string result = operation % 2 == 0
+                                           ? guard.player()->getStats()
+                                           : guard.player()->setThermalEnabled(operation == 1);
+                if (!succeeded(result)) {
+                    operationFailed.store(true);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            });
+        }
+
+        {
+            std::unique_lock<std::mutex> gateLock(gateMutex);
+            gateCv.wait(gateLock, [&] { return readyOperations == kConcurrentOperations; });
+            startOperations = true;
+        }
+        gateCv.notify_all();
+
+        const auto releaseStart = std::chrono::steady_clock::now();
+        const std::string releaseResult = releasePlayerEntry(handle);
+        const int64_t releaseWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - releaseStart).count();
+        minimumReleaseWaitMs = std::min(minimumReleaseWaitMs, releaseWaitMs);
+
+        for (std::thread &operationThread : operationThreads) {
+            operationThread.join();
+        }
+        if (!succeeded(releaseResult) || operationFailed.load()) {
+            concurrentReleasePassed = false;
+        }
+    }
+
+    size_t activePlayerCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_player_registry_mutex);
+        activePlayerCount = g_player_registry.size();
+    }
+    const bool registryEmpty = activePlayerCount == 0;
+    const bool success = createReleasePassed
+                         && uniqueHandles
+                         && staleHandleSafe
+                         && duplicateReleaseSafe
+                         && oldHandleCannotTargetNewPlayer
+                         && releaseWaitedForActiveOperation
+                         && closingRejectedNewOperations
+                         && concurrentReleasePassed
+                         && registryEmpty;
+
+    std::ostringstream out;
+    out << "{\"success\":" << boolJson(success) << ","
+        << "\"createReleaseCycles\":" << kCreateReleaseCycles << ","
+        << "\"concurrentReleaseCycles\":" << kConcurrentReleaseCycles << ","
+        << "\"uniqueHandles\":" << boolJson(uniqueHandles) << ","
+        << "\"duplicateReleaseSafe\":" << boolJson(duplicateReleaseSafe) << ","
+        << "\"staleHandleSafe\":" << boolJson(staleHandleSafe) << ","
+        << "\"oldHandleCannotTargetNewPlayer\":" << boolJson(oldHandleCannotTargetNewPlayer) << ","
+        << "\"releaseWaitedForActiveOperation\":" << boolJson(releaseWaitedForActiveOperation) << ","
+        << "\"closingRejectedNewOperations\":" << boolJson(closingRejectedNewOperations) << ","
+        << "\"concurrentStatsThermalReleaseSafe\":" << boolJson(concurrentReleasePassed) << ","
+        << "\"minimumReleaseWaitMs\":"
+        << (minimumReleaseWaitMs == INT64_MAX ? -1 : minimumReleaseWaitMs) << ","
+        << "\"activePlayerCount\":" << activePlayerCount << "}";
+    LOGI("player lifetime stress result=%s", out.str().c_str());
+    return out.str();
 }
 
 bool registerNativeMethods(JNIEnv *env) {

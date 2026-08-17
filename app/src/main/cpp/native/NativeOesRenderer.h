@@ -38,7 +38,7 @@ public:
     NativeOesRenderer &operator=(const NativeOesRenderer &) = delete;
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
-    bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
+    bool prepareForOesDecode(JNIEnv *env, int64_t handle, std::string &errorMessage);
     // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
     // whitePoint apply to white_hot and ironbow only (window in luminance 0..1 domain).
     // agcEnabled selects the OES AGC effective window when valid; runAgc triggers a

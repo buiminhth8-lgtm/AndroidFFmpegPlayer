@@ -261,6 +261,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + "\nbuildConfig=" + FFmpegNative.getFFmpegBuildConfig()
                         + "\ndecoders=" + FFmpegNative.getAvailableDecoders()
                         + "\nmediaCodec=" + FFmpegNative.getMediaCodecInfo()));
+        findViewById(R.id.infoButton).setOnLongClickListener(v -> {
+            runNative("Player Lifetime Stress", () -> FFmpegNative.runDebugCommand(
+                    new String[]{"-player-lifetime-stress"}));
+            return true;
+        });
 
         findViewById(R.id.probeButton).setOnClickListener(v -> runNative("Probe", () ->
                 FFmpegNative.probe(requireUrl(), readTimeoutMs())));

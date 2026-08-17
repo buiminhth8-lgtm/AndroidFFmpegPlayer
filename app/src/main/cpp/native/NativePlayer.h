@@ -44,7 +44,7 @@ class NativePlayer {
 public:
     static void setJavaVm(JavaVM *javaVm);
 
-    NativePlayer();
+    explicit NativePlayer(int64_t logicalHandle);
     ~NativePlayer();
 
     NativePlayer(const NativePlayer &) = delete;
@@ -149,6 +149,7 @@ private:
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> pauseRequested_{false};
     std::atomic<bool> released_{false};
+    const int64_t logicalHandle_;
 
     PlayerState state_ = PlayerState::Idle;
     std::string url_;

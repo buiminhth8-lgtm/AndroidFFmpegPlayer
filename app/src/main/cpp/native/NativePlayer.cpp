@@ -439,8 +439,10 @@ void NativePlayer::setJavaVm(JavaVM *javaVm) {
     g_native_player_java_vm = javaVm;
 }
 
-NativePlayer::NativePlayer() {
-    LOGI("createPlayer NativePlayer=%p", this);
+NativePlayer::NativePlayer(int64_t logicalHandle)
+        : logicalHandle_(logicalHandle) {
+    LOGI("createPlayer NativePlayer=%p handle=%lld", this,
+         static_cast<long long>(logicalHandle_));
 }
 
 NativePlayer::~NativePlayer() {
@@ -789,7 +791,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                     std::string oesError;
                     const bool prepared = env != nullptr
                                           && oesRenderer_.prepareForOesDecode(env,
-                                                                               reinterpret_cast<intptr_t>(this),
+                                                                               logicalHandle_,
                                                                                oesError);
                     detachCurrentThreadIfNeeded(attached);
                     if (!prepared) {
@@ -2765,7 +2767,7 @@ void NativePlayer::notifyPlayerEvent(const std::string &eventName,
             << "\"event\":\"" << escapeJson(eventName) << "\","
             << "\"playerState\":\"" << playerStateName(state) << "\","
             << "\"state\":\"" << stateName(state) << "\","
-            << "\"handle\":" << static_cast<long long>(reinterpret_cast<intptr_t>(this)) << ","
+            << "\"handle\":" << static_cast<long long>(logicalHandle_) << ","
             << "\"url\":\"" << escapeJson(url) << "\","
             << "\"reconnecting\":" << (reconnecting_.load() ? "true" : "false") << ","
             << "\"waitingSource\":" << (waitingSource_.load() ? "true" : "false") << ","
@@ -2783,7 +2785,7 @@ void NativePlayer::notifyPlayerEvent(const std::string &eventName,
     if (eventString != nullptr && payloadString != nullptr) {
         env->CallVoidMethod(listenerLocalRef,
                             method,
-                            static_cast<jlong>(reinterpret_cast<intptr_t>(this)),
+                            static_cast<jlong>(logicalHandle_),
                             eventString,
                             payloadString);
     }

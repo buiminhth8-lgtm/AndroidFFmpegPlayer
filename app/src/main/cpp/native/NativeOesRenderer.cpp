@@ -241,7 +241,7 @@ std::string NativeOesRenderer::setSurface(JNIEnv *env, jobject surface, int widt
     return jsonSuccess("oes surface attach requested");
 }
 
-bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage) {
+bool NativeOesRenderer::prepareForOesDecode(JNIEnv *env, int64_t handle, std::string &errorMessage) {
     if (env == nullptr) {
         errorMessage = "JNIEnv is null";
         return false;

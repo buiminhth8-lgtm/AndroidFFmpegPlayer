@@ -1074,9 +1074,12 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                     } else {
                         audioDecodeError_.clear();
                         audioDecodeOpened_.store(true);
-                        const bool playable = audioEnabled_.load() && audioCallbackSet_.load();
-                        audioPlayable_.store(playable);
-                        audioPlayError_ = playable || !audioEnabled_.load() ? "" : "audio callback is not set";
+                        // A0 freeze: the audio decoder is open, but no PCM output
+                        // path (swr -> PCM queue -> JNI sink -> AudioTrack) exists
+                        // yet. audioPlayable stays false until Slice A4 installs a
+                        // real audio sink.
+                        audioPlayable_.store(false);
+                        audioPlayError_ = audioEnabled_.load() ? "audio playback pipeline not implemented" : "";
                         LOGI("audio stream index=%d codec=%s sampleRate=%d channels=%d sampleFormat=%s decoderOpened=1",
                              audioStreamIndex_, audioCodec_.c_str(), audioSampleRate_, audioChannels_, audioSampleFormatName_.c_str());
                     }
@@ -1084,7 +1087,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
             }
         }
     } else {
-        audioEnabled_.store(false);
+        // A0 freeze: audioEnabled_ is the user's live-monitoring request and is
+        // intentionally NOT reset here. Source presence is a separate fact
+        // (sourceHasAudio_), and playback capability is separate (audioPlayable_).
         audioPlayable_.store(false);
         audioDecodeOpened_.store(false);
         audioPlayError_.clear();
@@ -1100,16 +1105,15 @@ std::string NativePlayer::setAudioCallback(JNIEnv *, jobject callback) {
         return jsonError(-1, "player is released");
     }
 
+    // STUB (A0 freeze): only records whether a Java audio sink object was
+    // supplied. No NewGlobalRef / GetMethodID / PCM delivery exists yet; the
+    // real JNI AudioPcmSink arrives in Slice A4. audioPlayable stays false
+    // regardless of callback presence because no PCM playback path exists.
     const bool callbackSet = callback != nullptr;
     audioCallbackSet_.store(callbackSet);
-    if (!callbackSet) {
-        audioPlayable_.store(false);
-        if (audioEnabled_.load() && sourceHasAudio_.load()) {
-            audioPlayError_ = "audio callback is not set";
-        }
-    } else if (sourceHasAudio_.load() && audioDecodeOpened_.load() && audioEnabled_.load()) {
-        audioPlayable_.store(true);
-        audioPlayError_.clear();
+    audioPlayable_.store(false);
+    if (audioEnabled_.load() && sourceHasAudio_.load()) {
+        audioPlayError_ = "audio playback pipeline not implemented";
     }
 
     LOGI("setAudioCallback callbackSet=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d",
@@ -1159,25 +1163,23 @@ std::string NativePlayer::enableAudio(bool enabled) {
         return jsonError(-1, "player is released");
     }
 
+    // A0 freeze: audioEnabled_ records only the user's live-monitoring request.
+    // It does NOT mean source presence, decoder state, recorder state, or sink
+    // state. Those are sourceHasAudio_, audioDecodeOpened_, audioCallbackSet_,
+    // and audioPlayable_ respectively.
+    audioEnabled_.store(enabled);
+    // No PCM sink / AudioTrack exists at A0, so the full playback pipeline is
+    // never playable yet. audioPlayable becomes true only after Slice A4
+    // installs a real JNI audio sink.
+    audioPlayable_.store(false);
     if (!enabled) {
-        audioEnabled_.store(false);
-        audioPlayable_.store(false);
         audioPlayError_.clear();
     } else if (!sourceHasAudio_.load()) {
-        audioEnabled_.store(false);
-        audioPlayable_.store(false);
         audioPlayError_.clear();
+    } else if (!audioDecodeOpened_.load()) {
+        audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
     } else {
-        audioEnabled_.store(true);
-        const bool playable = audioDecodeOpened_.load() && audioCallbackSet_.load();
-        audioPlayable_.store(playable);
-        if (!audioDecodeOpened_.load()) {
-            audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
-        } else if (!audioCallbackSet_.load()) {
-            audioPlayError_ = "audio callback is not set";
-        } else {
-            audioPlayError_.clear();
-        }
+        audioPlayError_ = "audio playback pipeline not implemented";
     }
 
     LOGI("enableAudio requested=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d error=%s",
@@ -1628,6 +1630,8 @@ std::string NativePlayer::getStats() {
         << "\"audioSampleRate\":" << audioSampleRate << ","
         << "\"audioChannels\":" << audioChannels << ","
         << "\"audioSampleFormat\":\"" << escapeJson(audioSampleFormatName) << "\","
+        << "\"audioDecodeOpened\":" << (audioDecodeOpened_.load() ? "true" : "false") << ","
+        << "\"audioCallbackSet\":" << (audioCallbackSet_.load() ? "true" : "false") << ","
         << "\"readPacketCount\":" << readPacketCount_.load() << ","
         << "\"videoPacketCount\":" << videoPacketCount_.load() << ","
         << "\"audioPacketCount\":" << audioPacketCount_.load() << ","
@@ -1661,7 +1665,11 @@ std::string NativePlayer::getStats() {
         << "\"lastFrameHeight\":" << frameHeight << ","
         << "\"audioEnabled\":" << (audioEnabled_.load() ? "true" : "false") << ","
         << "\"audioPlayable\":" << (audioPlayable_.load() ? "true" : "false") << ","
+        // audioClockUs is LEGACY / PRE-PLAYBACK: it mirrors the last compressed
+        // audio packet PTS and is NOT a speaker playback clock. audioPlaybackClockValid
+        // stays false until Slice A5 derives the clock from the AudioTrack playback head.
         << "\"audioClockUs\":" << audioClockUs_.load() << ","
+        << "\"audioPlaybackClockValid\":false,"
         << "\"videoClockUs\":" << videoClockUs_.load() << ","
         << "\"wallClockUs\":" << wallClockUs_.load() << ","
         << "\"lastReadPacketTimeMs\":" << lastReadPacketTimeMs_.load() << ","

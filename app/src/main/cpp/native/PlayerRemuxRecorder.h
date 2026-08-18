@@ -9,6 +9,7 @@
 
 struct AVFormatContext;
 struct AVPacket;
+struct AVBSFContext;
 
 struct RemuxRecordConfig {
     std::string outputPathOrPattern;
@@ -65,6 +66,7 @@ private:
 
     mutable std::mutex mutex_;
     AVFormatContext *outputFmtCtx_ = nullptr;
+    AVBSFContext *audioBitstreamFilter_ = nullptr;
     std::vector<int> streamMapping_;
     std::vector<int64_t> firstPts_;
     std::vector<int64_t> firstDts_;

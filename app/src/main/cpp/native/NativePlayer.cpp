@@ -1324,6 +1324,10 @@ std::string NativePlayer::enableAudio(bool enabled) {
         }
     }
     recomputeAudioPlayable();
+    // Recorder mapping is fixed from the compressed input streams at record
+    // start, but its diagnostic snapshot should still reflect the current
+    // live-monitoring request after an ON/OFF toggle.
+    remuxRecorder_.setAudioPlaybackState(audioEnabled_.load());
 
     LOGI("enableAudio requested=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d error=%s",
          enabled ? 1 : 0, sourceHasAudio_.load() ? 1 : 0,

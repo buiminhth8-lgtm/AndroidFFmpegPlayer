@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 extern "C" {
+#include "libavcodec/bsf.h"
 #include "libavcodec/codec_par.h"
 #include "libavcodec/packet.h"
 #include "libavformat/avformat.h"
@@ -434,6 +435,34 @@ int PlayerRemuxRecorder::openOutputLocked(AVFormatContext *inputFmtCtx, const st
             setErrorLocked(error, copyResult);
             return copyResult;
         }
+
+        if (isAudio && codecpar->codec_id == AV_CODEC_ID_AAC && isMp4LikeFormat(formatName_)) {
+            const AVBitStreamFilter *filter = av_bsf_get_by_name("aac_adtstoasc");
+            if (filter == nullptr) {
+                closeOutputLocked(false);
+                setErrorLocked("aac_adtstoasc bitstream filter unavailable", AVERROR_BSF_NOT_FOUND);
+                return lastErrorCode_;
+            }
+            result = av_bsf_alloc(filter, &audioBitstreamFilter_);
+            if (result >= 0) {
+                result = avcodec_parameters_copy(audioBitstreamFilter_->par_in, codecpar);
+            }
+            if (result >= 0) {
+                audioBitstreamFilter_->time_base_in = inputStream->time_base;
+                result = av_bsf_init(audioBitstreamFilter_);
+            }
+            if (result >= 0) {
+                result = avcodec_parameters_copy(outputStream->codecpar, audioBitstreamFilter_->par_out);
+            }
+            if (result < 0) {
+                const std::string error = ffmpegErrorToString(result);
+                closeOutputLocked(false);
+                setErrorLocked(error, result);
+                return result;
+            }
+            LOGI("record AAC bitstream filter enabled name=aac_adtstoasc input=%u output=%d", i,
+                 outputStream->index);
+        }
         outputStream->codecpar->codec_tag = 0;
         outputStream->time_base = inputStream->time_base;
         streamMapping_[i] = outputStream->index;
@@ -522,6 +551,8 @@ int PlayerRemuxRecorder::closeOutputLocked(bool writeTrailer) {
             LOGI("write trailer success outputPath=%s", closedPath.c_str());
         }
     }
+
+    av_bsf_free(&audioBitstreamFilter_);
 
     if (outputFmtCtx_ != nullptr) {
         if (!(outputFmtCtx_->oformat->flags & AVFMT_NOFILE) && outputFmtCtx_->pb != nullptr) {
@@ -926,42 +957,82 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
         recordPacket->pts = recordPacket->dts;
     }
 
-    av_packet_rescale_ts(recordPacket, inputStream->time_base, outputStream->time_base);
-    recordPacket->stream_index = outputIndex;
-    recordPacket->pos = -1;
+    auto writeOutputPacket = [&](AVPacket *outputPacket, AVRational sourceTimeBase) -> bool {
+        av_packet_rescale_ts(outputPacket, sourceTimeBase, outputStream->time_base);
+        outputPacket->stream_index = outputIndex;
+        outputPacket->pos = -1;
 
-    if (recordPacket->dts != AV_NOPTS_VALUE && outputIndex >= 0 && static_cast<size_t>(outputIndex) < lastDts_.size()) {
-        if (lastDts_[outputIndex] != AV_NOPTS_VALUE && recordPacket->dts <= lastDts_[outputIndex]) {
-            LOGE("skip non-monotonic dts stream=%d dts=%lld lastDts=%lld",
-                 outputIndex, static_cast<long long>(recordPacket->dts), static_cast<long long>(lastDts_[outputIndex]));
-            av_packet_free(&recordPacket);
+        if (outputPacket->dts != AV_NOPTS_VALUE && outputIndex >= 0
+            && static_cast<size_t>(outputIndex) < lastDts_.size()) {
+            if (lastDts_[outputIndex] != AV_NOPTS_VALUE && outputPacket->dts <= lastDts_[outputIndex]) {
+                LOGE("skip non-monotonic dts stream=%d dts=%lld lastDts=%lld",
+                     outputIndex, static_cast<long long>(outputPacket->dts),
+                     static_cast<long long>(lastDts_[outputIndex]));
+                return false;
+            }
+            lastDts_[outputIndex] = outputPacket->dts;
+        }
+
+        result = av_interleaved_write_frame(outputFmtCtx_, outputPacket);
+        if (result < 0) {
+            const std::string error = ffmpegErrorToString(result);
+            LOGE("av_interleaved_write_frame failed stream=%d error=%s", outputIndex, error.c_str());
+            setErrorLocked(error, result);
             return false;
         }
-        lastDts_[outputIndex] = recordPacket->dts;
-    }
+        if (isMp4LikeFormat(formatName_) && fragmentedMp4_ && outputFmtCtx_ != nullptr
+            && outputFmtCtx_->pb != nullptr) {
+            avio_flush(outputFmtCtx_->pb);
+        }
 
-    result = av_interleaved_write_frame(outputFmtCtx_, recordPacket);
-    if (result < 0) {
-        const std::string error = ffmpegErrorToString(result);
-        LOGE("av_interleaved_write_frame failed stream=%d error=%s", outputIndex, error.c_str());
+        if (packet->stream_index == videoInputStreamIndex_) {
+            ++videoPacketCount_;
+            ++currentSegmentVideoPacketCount_;
+        } else if (packet->stream_index == audioInputStreamIndex_) {
+            ++audioPacketCount_;
+            ++currentSegmentAudioPacketCount_;
+        }
+        return true;
+    };
+
+    if (packet->stream_index == audioInputStreamIndex_ && audioBitstreamFilter_ != nullptr) {
+        result = av_bsf_send_packet(audioBitstreamFilter_, recordPacket);
         av_packet_free(&recordPacket);
-        setErrorLocked(error, result);
-        return false;
-    }
-    if (isMp4LikeFormat(formatName_) && fragmentedMp4_ && outputFmtCtx_ != nullptr && outputFmtCtx_->pb != nullptr) {
-        avio_flush(outputFmtCtx_->pb);
+        if (result < 0) {
+            const std::string error = ffmpegErrorToString(result);
+            setErrorLocked(error, result);
+            return false;
+        }
+
+        AVPacket *filteredPacket = av_packet_alloc();
+        if (filteredPacket == nullptr) {
+            setErrorLocked("av_packet_alloc failed", -1);
+            return false;
+        }
+        bool success = true;
+        while (true) {
+            result = av_bsf_receive_packet(audioBitstreamFilter_, filteredPacket);
+            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) {
+                break;
+            }
+            if (result < 0) {
+                setErrorLocked(ffmpegErrorToString(result), result);
+                success = false;
+                break;
+            }
+            if (!writeOutputPacket(filteredPacket, audioBitstreamFilter_->time_base_out)) {
+                success = false;
+                break;
+            }
+            av_packet_unref(filteredPacket);
+        }
+        av_packet_free(&filteredPacket);
+        return success;
     }
 
-    if (packet->stream_index == videoInputStreamIndex_) {
-        ++videoPacketCount_;
-        ++currentSegmentVideoPacketCount_;
-    } else if (packet->stream_index == audioInputStreamIndex_) {
-        ++audioPacketCount_;
-        ++currentSegmentAudioPacketCount_;
-    }
-
+    const bool success = writeOutputPacket(recordPacket, inputStream->time_base);
     av_packet_free(&recordPacket);
-    return true;
+    return success;
 }
 
 std::string PlayerRemuxRecorder::makeSegmentPathLocked(int segmentIndex) const {

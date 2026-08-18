@@ -883,6 +883,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                                 + " worker=" + stats.optBoolean("audioWorkerRunning", false)
                                 + " sink=" + stats.optBoolean("audioSinkReady", false)
                                 + " clock=" + stats.optBoolean("audioPlaybackClockValid", false)
+                                + " clockUs=" + stats.optLong("audioPlaybackClockUs", 0)
+                                + " avDiffUs=" + stats.optLong("audioVideoDiffUs", 0)
+                                + " ptsRebase=" + stats.optLong("audioClockPtsDiscontinuityCount", 0)
                                 + " generation=" + stats.optLong("audioGeneration", 0)
                                 + " flush=" + stats.optLong("audioQueueFlushCount", 0)
                                 + " start/join=" + stats.optLong("audioWorkerStartCount", 0)
@@ -893,7 +896,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                                 + " cancel=" + stats.optLong("audioSinkControlledCancelCount", 0)
                                 + " sinkError=" + stats.optLong("audioSinkWriteErrorCount", 0)
                                 + " queueUs=" + stats.optLong("audioQueueDurationUs", 0)
+                                + " queueHighUs=" + stats.optLong("audioQueueHighWatermarkUs", 0)
+                                + " queueDrop=" + stats.optLong("audioQueueDropCount", 0)
                                 + " master=" + stats.optString("effectiveSyncMaster", "unknown")
+                                + " decoderOpen=" + stats.optLong("videoDecoderOpenCount", 0)
+                                + "/" + stats.optLong("hardwareDecoderOpenCount", 0)
                                 + " recording=" + stats.optBoolean("recording", false)
                                 + " recordAudio=" + stats.optLong("recordAudioPacketCount", 0));
             }

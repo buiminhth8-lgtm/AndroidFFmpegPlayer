@@ -486,11 +486,14 @@ private:
     std::atomic<int64_t> audioPlaybackHeadFrames_{0};
     std::atomic<int64_t> audioClockGeneration_{0};
     std::atomic<int64_t> audioClockBaseMediaPtsUs_{0};
+    std::atomic<int64_t> audioClockExpectedNextPtsUs_{0};
     std::atomic<int32_t> audioPlaybackHeadRaw32_{0};
     std::atomic<int64_t> audioPlaybackHeadExtended64_{0};
     std::atomic<int64_t> audioClockLastUpdateMs_{0};
     std::atomic<int64_t> audioClockResetCount_{0};
     std::atomic<int64_t> audioClockStaleCount_{0};
+    std::atomic<int64_t> audioClockPtsDiscontinuityCount_{0};
+    std::atomic<int64_t> lastAudioClockPtsDiscontinuityLogMs_{0};
     std::atomic<int64_t> audioVideoDiffUs_{0};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};

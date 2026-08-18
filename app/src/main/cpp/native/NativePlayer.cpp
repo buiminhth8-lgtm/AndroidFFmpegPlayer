@@ -64,6 +64,7 @@ constexpr int kAudioSinkWriteCancelled = -10000;
 constexpr int64_t kAudioClockStaleMs = 500;         // clock considered stale if not refreshed within this window
 constexpr int64_t kAudioMasterMaxWaitUs = 150000;   // bounded max wait for video to catch up to audio (150 ms)
 constexpr int kAudioMasterWaitPollMs = 2;           // poll interval while waiting for the audio clock
+constexpr int64_t kAudioClockPtsJitterToleranceUs = 20000;
 
 // AGC tuning constants.
 constexpr int kAgcUpdateIntervalFrames = 5;
@@ -1944,6 +1945,7 @@ std::string NativePlayer::getStats() {
         << "\"audioClockGeneration\":" << audioClockGeneration_.load() << ","
         << "\"audioClockResetCount\":" << audioClockResetCount_.load() << ","
         << "\"audioClockStaleCount\":" << audioClockStaleCount_.load() << ","
+        << "\"audioClockPtsDiscontinuityCount\":" << audioClockPtsDiscontinuityCount_.load() << ","
         << "\"audioVideoDiffUs\":" << audioVideoDiffUs_.load() << ","
         << "\"videoClockUs\":" << videoClockUs_.load() << ","
         << "\"wallClockUs\":" << wallClockUs_.load() << ","
@@ -3487,6 +3489,7 @@ void NativePlayer::flushAudioPcmForDiscontinuity() {
     invalidateAudioClock();
     audioClockGeneration_.store(generation);
     audioClockBaseMediaPtsUs_.store(0);
+    audioClockExpectedNextPtsUs_.store(0);
     audioPlaybackHeadRaw32_.store(0);
     audioPlaybackHeadExtended64_.store(0);
     audioPlaybackHeadFrames_.store(0);
@@ -3585,9 +3588,25 @@ void NativePlayer::updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Bl
         }
         return;
     }
-    // Rebase on a new generation or when the clock is not yet valid.
+    // A realtime catch-up gate and the bounded PCM queue can both discard old
+    // audio without changing generation. Detect that media-PTS hole here so
+    // the AudioTrack playback-head mapping cannot accumulate permanent drift.
+    const int64_t expectedNextPtsUs = audioClockExpectedNextPtsUs_.load();
+    const int64_t blockDurationUs = block.sampleCount > 0
+                                    ? block.sampleCount * 1000000 / kAudioPcmOutputSampleRate
+                                    : 0;
+    const int64_t ptsGapUs = expectedNextPtsUs > 0 && block.startPtsUs > 0
+                             ? block.startPtsUs - expectedNextPtsUs
+                             : 0;
+    const bool ptsDiscontinuity = expectedNextPtsUs > 0
+                                  && block.startPtsUs > 0
+                                  && std::llabs(ptsGapUs) > kAudioClockPtsJitterToleranceUs;
+    // Rebase on a new generation, an invalid clock, or a same-generation PTS
+    // discontinuity. This changes only the clock mapping; the sink, worker,
+    // decoder, queue, recorder, and MediaCodec lifetime remain untouched.
     const bool rebase = !audioPlaybackClockValid_.load()
-                        || block.generation != audioClockGeneration_.load();
+                        || block.generation != audioClockGeneration_.load()
+                        || ptsDiscontinuity;
     if (rebase) {
         if (block.startPtsUs <= 0) {
             // No valid media PTS yet; cannot anchor the media timeline.
@@ -3598,6 +3617,23 @@ void NativePlayer::updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Bl
         audioPlaybackHeadRaw32_.store(rawHead);
         audioPlaybackHeadExtended64_.store(0);
         audioClockResetCount_.fetch_add(1);
+        if (ptsDiscontinuity) {
+            audioClockPtsDiscontinuityCount_.fetch_add(1);
+            const int64_t nowMsValue = nowMs();
+            const int64_t lastLogMs = lastAudioClockPtsDiscontinuityLogMs_.load();
+            if (lastLogMs == 0 || nowMsValue - lastLogMs >= 2000) {
+                lastAudioClockPtsDiscontinuityLogMs_.store(nowMsValue);
+                LOGI("audio playback clock PTS rebase gapUs=%lld blockPtsUs=%lld expectedPtsUs=%lld generation=%lld count=%lld",
+                     static_cast<long long>(ptsGapUs),
+                     static_cast<long long>(block.startPtsUs),
+                     static_cast<long long>(expectedNextPtsUs),
+                     static_cast<long long>(block.generation),
+                     static_cast<long long>(audioClockPtsDiscontinuityCount_.load()));
+            }
+        }
+    }
+    if (block.startPtsUs > 0 && blockDurationUs > 0) {
+        audioClockExpectedNextPtsUs_.store(block.startPtsUs + blockDurationUs);
     }
     // Convert the raw 32-bit playback head into a monotonic 64-bit played-frame
     // count. The uint32 subtraction handles the 32-bit wraparound.
@@ -5168,11 +5204,14 @@ void NativePlayer::resetStats() {
     audioPlaybackHeadFrames_.store(0);
     audioClockGeneration_.store(0);
     audioClockBaseMediaPtsUs_.store(0);
+    audioClockExpectedNextPtsUs_.store(0);
     audioPlaybackHeadRaw32_.store(0);
     audioPlaybackHeadExtended64_.store(0);
     audioClockLastUpdateMs_.store(0);
     audioClockResetCount_.store(0);
     audioClockStaleCount_.store(0);
+    audioClockPtsDiscontinuityCount_.store(0);
+    lastAudioClockPtsDiscontinuityLogMs_.store(0);
     audioVideoDiffUs_.store(0);
     audioFlushRequested_.store(false);
     audioResumeDiscontinuityRequested_.store(false);

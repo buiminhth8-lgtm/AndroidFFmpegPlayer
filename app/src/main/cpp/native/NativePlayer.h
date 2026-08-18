@@ -23,6 +23,7 @@ struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+struct SwrContext;
 
 enum class PlayerState {
     Idle,
@@ -125,6 +126,10 @@ private:
     void decodeAudioPacket(const AVPacket *packet);
     void drainAudioDecodedFrames();
     void logRateLimitedAudioDecodeError(int errorCode);
+    bool convertAudioFrameToPcm(AVFrame *frame);
+    bool configureAudioSwrContext(int inputFormat, int inputSampleRate,
+                                  uint64_t inputLayoutMask, int inputChannels);
+    void logRateLimitedAudioResampleError(const char *message);
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
@@ -195,6 +200,13 @@ private:
     AVCodecContext *videoCodecContext_ = nullptr;
     AVCodecContext *audioCodecContext_ = nullptr;
     AVFrame *audioDecodedFrame_ = nullptr;
+    struct SwrContext *audioSwrContext_ = nullptr;
+    std::vector<uint8_t> audioPcmBuffer_;
+    int audioSwrInputSampleFormat_ = -1;
+    int audioSwrInputSampleRate_ = 0;
+    int audioSwrInputChannels_ = 0;
+    uint64_t audioSwrInputLayoutMask_ = 0;
+    bool audioPcmFirstConvertLogged_ = false;
     SwsContext *swsContext_ = nullptr;
     AVPacket *packet_ = nullptr;
     AVFrame *decodedFrame_ = nullptr;
@@ -357,6 +369,18 @@ private:
     std::atomic<int64_t> maxAudioDecodeCostUs_{0};
     std::atomic<int64_t> lastAudioDecodeErrorLogMs_{0};
     bool audioDecodeFirstFrameLogged_ = false;
+    // A2: decoded AVFrame -> PCM S16/48k/stereo interleaved via libswresample.
+    std::atomic<int64_t> audioSwrReconfigureCount_{0};
+    std::atomic<int64_t> audioPcmBlockCount_{0};
+    std::atomic<int64_t> audioPcmSampleCount_{0};
+    std::atomic<int64_t> audioPcmByteCount_{0};
+    std::atomic<int64_t> audioResampleErrorCount_{0};
+    std::atomic<int64_t> lastPcmPtsUs_{0};
+    std::atomic<int64_t> lastAudioResampleCostUs_{-1};
+    std::atomic<int64_t> totalAudioResampleCostUs_{0};
+    std::atomic<int64_t> audioResampleCostSampleCount_{0};
+    std::atomic<int64_t> maxAudioResampleCostUs_{0};
+    std::atomic<int64_t> lastAudioResampleErrorLogMs_{0};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
     std::atomic<bool> infiniteReconnect_{true};

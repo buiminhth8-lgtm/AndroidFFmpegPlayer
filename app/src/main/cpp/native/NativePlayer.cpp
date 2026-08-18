@@ -29,6 +29,9 @@ extern "C" {
 #include "libavutil/rational.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/time.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/mathematics.h"
+#include "libswresample/swresample.h"
 #include "libswscale/swscale.h"
 }
 
@@ -40,6 +43,11 @@ namespace {
 
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
+
+// A2 frozen PCM output contract: S16 / 48000 Hz / stereo / interleaved.
+constexpr int kAudioPcmOutputSampleRate = 48000;
+constexpr int kAudioPcmOutputChannels = 2;
+constexpr AVSampleFormat kAudioPcmOutputFormat = AV_SAMPLE_FMT_S16;
 
 // AGC tuning constants.
 constexpr int kAgcUpdateIntervalFrames = 5;
@@ -599,6 +607,7 @@ sourceHasVideo_.store(false);
         audioDecodeOpened_.store(false);
         audioPlayable_.store(false);
         lastDecodedAudioPtsUs_.store(0);
+        lastPcmPtsUs_.store(0);
         lastDecodedAudioNbSamples_.store(0);
         lastDecodedAudioSampleRate_.store(0);
         lastDecodedAudioChannels_.store(0);
@@ -1689,6 +1698,19 @@ std::string NativePlayer::getStats() {
         << "\"lastAudioDecodeCostUs\":" << lastAudioDecodeCostUs_.load() << ","
         << "\"avgAudioDecodeCostUs\":" << averageUs(totalAudioDecodeCostUs_.load(), audioDecodeCostSampleCount_.load()) << ","
         << "\"maxAudioDecodeCostUs\":" << maxAudioDecodeCostUs_.load() << ","
+        << "\"audioOutputSampleRate\":" << kAudioPcmOutputSampleRate << ","
+        << "\"audioOutputChannels\":" << kAudioPcmOutputChannels << ","
+        << "\"audioOutputSampleFormat\":\"s16\","
+        << "\"audioOutputInterleaved\":true,"
+        << "\"audioSwrReconfigureCount\":" << audioSwrReconfigureCount_.load() << ","
+        << "\"audioPcmBlockCount\":" << audioPcmBlockCount_.load() << ","
+        << "\"audioPcmSampleCount\":" << audioPcmSampleCount_.load() << ","
+        << "\"audioPcmByteCount\":" << audioPcmByteCount_.load() << ","
+        << "\"audioResampleErrorCount\":" << audioResampleErrorCount_.load() << ","
+        << "\"lastPcmPtsUs\":" << lastPcmPtsUs_.load() << ","
+        << "\"lastAudioResampleCostUs\":" << lastAudioResampleCostUs_.load() << ","
+        << "\"avgAudioResampleCostUs\":" << averageUs(totalAudioResampleCostUs_.load(), audioResampleCostSampleCount_.load()) << ","
+        << "\"maxAudioResampleCostUs\":" << maxAudioResampleCostUs_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
         << "\"droppedVideoFrameCount\":" << droppedVideoFrameCount_.load() << ","
         << "\"recording\":" << (remuxRecorder_.isRecording() ? "true" : "false") << ","
@@ -2807,6 +2829,8 @@ void NativePlayer::drainAudioDecodedFrames() {
                      fmtName == nullptr ? "unknown" : fmtName, nbSamples,
                      static_cast<long long>(lastDecodedAudioPtsUs_.load()));
             }
+            // A2: decode -> PCM (S16/48k/stereo interleaved) -> stats -> discard.
+            convertAudioFrameToPcm(audioDecodedFrame_);
             av_frame_unref(audioDecodedFrame_);
         } else if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             break;
@@ -2825,6 +2849,176 @@ void NativePlayer::logRateLimitedAudioDecodeError(int errorCode) {
         lastAudioDecodeErrorLogMs_.store(now);
         const std::string error = ffmpegErrorToString(errorCode);
         LOGE("audio decode error code=%d message=%s", errorCode, error.c_str());
+    }
+}
+
+bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
+    if (frame == nullptr) {
+        return false;
+    }
+
+    // Input format identity comes from the real decoded frame; fall back to the
+    // codec context only when the frame lacks the fields.
+    int inputSampleRate = frame->sample_rate > 0 ? frame->sample_rate
+                         : (audioCodecContext_ != nullptr ? audioCodecContext_->sample_rate : 0);
+    int inputChannels = frame->ch_layout.nb_channels > 0 ? frame->ch_layout.nb_channels
+                        : (audioCodecContext_ != nullptr ? audioCodecContext_->ch_layout.nb_channels : 0);
+    const AVSampleFormat inputFormat = frame->format >= 0
+            ? static_cast<AVSampleFormat>(frame->format)
+            : (audioCodecContext_ != nullptr ? audioCodecContext_->sample_fmt : AV_SAMPLE_FMT_NONE);
+
+    if (inputSampleRate <= 0 || inputChannels <= 0 || inputFormat == AV_SAMPLE_FMT_NONE) {
+        ++audioResampleErrorCount_;
+        logRateLimitedAudioResampleError("invalid input audio format");
+        return false;
+    }
+
+    // Derive a usable input channel layout. Decoder frames may carry an
+    // unspecified layout; fall back to the FFmpeg default layout for the
+    // channel count (1 -> mono, 2 -> stereo, ...) when the mask is unknown.
+    uint64_t inputLayoutMask = 0;
+    if (frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE && frame->ch_layout.nb_channels > 0) {
+        inputLayoutMask = frame->ch_layout.u.mask;
+    }
+
+    const bool identityChanged = audioSwrContext_ == nullptr
+            || audioSwrInputSampleFormat_ != static_cast<int>(inputFormat)
+            || audioSwrInputSampleRate_ != inputSampleRate
+            || audioSwrInputChannels_ != inputChannels
+            || audioSwrInputLayoutMask_ != inputLayoutMask;
+    if (identityChanged) {
+        if (!configureAudioSwrContext(static_cast<int>(inputFormat), inputSampleRate,
+                                      inputLayoutMask, inputChannels)) {
+            ++audioResampleErrorCount_;
+            logRateLimitedAudioResampleError("swr_alloc_set_opts2/swr_init failed");
+            return false;
+        }
+        audioSwrReconfigureCount_.fetch_add(1);
+        const char *fmtName = av_get_sample_fmt_name(inputFormat);
+        LOGI("audio swr reconfigured input=%dHz/%dch/%s output=%dkHz/2/s16 reconfigureCount=%lld",
+             inputSampleRate, inputChannels, fmtName == nullptr ? "unknown" : fmtName,
+             kAudioPcmOutputSampleRate, static_cast<long long>(audioSwrReconfigureCount_.load()));
+    }
+
+    // Output sample capacity must account for the swr internal resampling delay
+    // plus this frame's input samples, rounded up, per the FFmpeg convention.
+    const int64_t delaySamples = swr_get_delay(audioSwrContext_, inputSampleRate);
+    const int64_t requestedOutSamples = av_rescale_rnd(delaySamples + std::max(0, frame->nb_samples),
+                                                       kAudioPcmOutputSampleRate, inputSampleRate, AV_ROUND_UP);
+    if (requestedOutSamples <= 0
+        || requestedOutSamples > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        ++audioResampleErrorCount_;
+        logRateLimitedAudioResampleError("invalid output sample count");
+        return false;
+    }
+    const int64_t requiredBytes = requestedOutSamples
+            * static_cast<int64_t>(kAudioPcmOutputChannels)
+            * static_cast<int64_t>(sizeof(int16_t));
+    if (requiredBytes <= 0
+        || requiredBytes > static_cast<int64_t>(std::numeric_limits<size_t>::max())) {
+        ++audioResampleErrorCount_;
+        logRateLimitedAudioResampleError("PCM buffer size overflow");
+        return false;
+    }
+    if (audioPcmBuffer_.size() < static_cast<size_t>(requiredBytes)) {
+        audioPcmBuffer_.resize(static_cast<size_t>(requiredBytes));
+    }
+
+    const int64_t resampleStartUs = steadyNowUs();
+    uint8_t *outData[] = { audioPcmBuffer_.data() };
+    const uint8_t *const *inData = frame->extended_data != nullptr
+            ? frame->extended_data
+            : const_cast<const uint8_t **>(frame->data);
+    const int convertedSamples = swr_convert(audioSwrContext_, outData, static_cast<int>(requestedOutSamples),
+                                             inData, std::max(0, frame->nb_samples));
+    recordCost(lastAudioResampleCostUs_, totalAudioResampleCostUs_, audioResampleCostSampleCount_,
+               maxAudioResampleCostUs_, steadyNowUs() - resampleStartUs);
+
+    if (convertedSamples < 0) {
+        ++audioResampleErrorCount_;
+        logRateLimitedAudioResampleError("swr_convert failed");
+        return false;
+    }
+    if (convertedSamples == 0) {
+        return true;
+    }
+
+    audioPcmBlockCount_.fetch_add(1);
+    const int64_t pcmBytes = static_cast<int64_t>(convertedSamples)
+            * kAudioPcmOutputChannels * static_cast<int64_t>(sizeof(int16_t));
+    audioPcmSampleCount_.fetch_add(convertedSamples);
+    audioPcmByteCount_.fetch_add(pcmBytes);
+    if (!audioPcmFirstConvertLogged_) {
+        audioPcmFirstConvertLogged_ = true;
+        const char *fmtName = av_get_sample_fmt_name(inputFormat);
+        LOGI("audio pcm ready input=%dHz/%dch/%s output=%dkHz/2/s16 convertedSamples=%d bytes=%lld",
+             inputSampleRate, inputChannels, fmtName == nullptr ? "unknown" : fmtName,
+             kAudioPcmOutputSampleRate, convertedSamples, static_cast<long long>(pcmBytes));
+    }
+
+    // PCM media PTS association: use the decoded frame's media start time
+    // (best-effort timestamp, fallback pts), rescaled to microseconds. This is
+    // the block start PTS for the future A3 queue; resampling does not move the
+    // media timeline.
+    int64_t framePts = frame->best_effort_timestamp;
+    if (framePts == AV_NOPTS_VALUE) {
+        framePts = frame->pts;
+    }
+    if (framePts != AV_NOPTS_VALUE && formatContext_ != nullptr
+        && audioStreamIndex_ >= 0 && audioStreamIndex_ < static_cast<int>(formatContext_->nb_streams)) {
+        lastPcmPtsUs_.store(av_rescale_q(framePts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
+    }
+    return true;
+}
+
+bool NativePlayer::configureAudioSwrContext(int inputFormat, int inputSampleRate,
+                                            uint64_t inputLayoutMask, int inputChannels) {
+    if (audioSwrContext_ != nullptr) {
+        swr_free(&audioSwrContext_);
+    }
+    audioSwrInputSampleFormat_ = -1;
+    audioSwrInputSampleRate_ = 0;
+    audioSwrInputChannels_ = 0;
+    audioSwrInputLayoutMask_ = 0;
+
+    AVChannelLayout inLayout{};
+    if (inputLayoutMask != 0 && av_channel_layout_from_mask(&inLayout, inputLayoutMask) < 0) {
+        av_channel_layout_uninit(&inLayout);
+        inLayout = AVChannelLayout{};
+    }
+    if (inLayout.nb_channels <= 0) {
+        av_channel_layout_default(&inLayout, inputChannels);
+    }
+    AVChannelLayout outLayout{};
+    av_channel_layout_default(&outLayout, kAudioPcmOutputChannels);
+    const int result = swr_alloc_set_opts2(&audioSwrContext_, &outLayout, kAudioPcmOutputFormat,
+                                           kAudioPcmOutputSampleRate, &inLayout,
+                                           static_cast<AVSampleFormat>(inputFormat),
+                                           inputSampleRate, 0, nullptr);
+    av_channel_layout_uninit(&inLayout);
+    av_channel_layout_uninit(&outLayout);
+    if (result < 0 || audioSwrContext_ == nullptr) {
+        audioSwrContext_ = nullptr;
+        return false;
+    }
+    if (swr_init(audioSwrContext_) < 0) {
+        swr_free(&audioSwrContext_);
+        return false;
+    }
+
+    audioSwrInputSampleFormat_ = inputFormat;
+    audioSwrInputSampleRate_ = inputSampleRate;
+    audioSwrInputChannels_ = inputChannels;
+    audioSwrInputLayoutMask_ = inputLayoutMask;
+    return true;
+}
+
+void NativePlayer::logRateLimitedAudioResampleError(const char *message) {
+    const int64_t now = nowMs();
+    const int64_t last = lastAudioResampleErrorLogMs_.load();
+    if (last == 0 || now - last >= 2000) {
+        lastAudioResampleErrorLogMs_.store(now);
+        LOGE("audio resample error: %s", message);
     }
 }
 
@@ -3318,10 +3512,21 @@ void NativePlayer::playbackLoop() {
             continue;
         }
 
-        // Audio OFF -> ON transition boundary: flush the audio decoder on the
-        // playback thread so the next ON never emits stale pre-toggle frames.
-        if (audioFlushRequested_.exchange(false) && audioCodecContext_ != nullptr) {
-            avcodec_flush_buffers(audioCodecContext_);
+        // Audio OFF -> ON transition boundary: flush the audio decoder and reset the
+        // swr context on the playback thread so the next ON never emits stale
+        // pre-toggle frames or stale resampler-delayed samples.
+        if (audioFlushRequested_.exchange(false)) {
+            if (audioCodecContext_ != nullptr) {
+                avcodec_flush_buffers(audioCodecContext_);
+            }
+            if (audioSwrContext_ != nullptr) {
+                swr_free(&audioSwrContext_);
+            }
+            audioSwrInputLayoutMask_ = 0;
+            audioSwrInputSampleFormat_ = -1;
+            audioSwrInputSampleRate_ = 0;
+            audioSwrInputChannels_ = 0;
+            audioPcmBuffer_.clear();
             LOGI("audio decoder flushed for playback toggle");
         }
 
@@ -4130,6 +4335,17 @@ void NativePlayer::resetStats() {
     audioDecodeCostSampleCount_.store(0);
     maxAudioDecodeCostUs_.store(0);
     lastAudioDecodeErrorLogMs_.store(0);
+    audioSwrReconfigureCount_.store(0);
+    audioPcmBlockCount_.store(0);
+    audioPcmSampleCount_.store(0);
+    audioPcmByteCount_.store(0);
+    audioResampleErrorCount_.store(0);
+    lastPcmPtsUs_.store(0);
+    lastAudioResampleCostUs_.store(-1);
+    totalAudioResampleCostUs_.store(0);
+    audioResampleCostSampleCount_.store(0);
+    maxAudioResampleCostUs_.store(0);
+    lastAudioResampleErrorLogMs_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);
@@ -4272,6 +4488,14 @@ void NativePlayer::releaseFfmpegResources() {
     if (audioDecodedFrame_ != nullptr) {
         av_frame_free(&audioDecodedFrame_);
     }
+    if (audioSwrContext_ != nullptr) {
+        swr_free(&audioSwrContext_);
+    }
+    audioSwrInputLayoutMask_ = 0;
+    audioSwrInputSampleFormat_ = -1;
+    audioSwrInputSampleRate_ = 0;
+    audioSwrInputChannels_ = 0;
+    audioPcmBuffer_.clear();
     if (audioCodecContext_ != nullptr) {
         avcodec_free_context(&audioCodecContext_);
     }

@@ -122,6 +122,9 @@ private:
     SyncMaster effectiveSyncMaster(const PlayerOptions &options) const;
     std::string effectiveSyncMasterName(const PlayerOptions &options) const;
     void updateVideoDelayStats(int64_t delayUs);
+    void decodeAudioPacket(const AVPacket *packet);
+    void drainAudioDecodedFrames();
+    void logRateLimitedAudioDecodeError(int errorCode);
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
@@ -191,6 +194,7 @@ private:
     AVFormatContext *formatContext_ = nullptr;
     AVCodecContext *videoCodecContext_ = nullptr;
     AVCodecContext *audioCodecContext_ = nullptr;
+    AVFrame *audioDecodedFrame_ = nullptr;
     SwsContext *swsContext_ = nullptr;
     AVPacket *packet_ = nullptr;
     AVFrame *decodedFrame_ = nullptr;
@@ -338,6 +342,21 @@ private:
     std::atomic<bool> audioPlayable_{false};
     std::atomic<bool> audioDecodeOpened_{false};
     std::atomic<bool> audioCallbackSet_{false};
+    // A1: decoded audio frame pipeline (no PCM yet; decode -> count -> discard).
+    std::atomic<bool> audioFlushRequested_{false};
+    std::atomic<int64_t> audioDecodedSampleCount_{0};
+    std::atomic<int64_t> audioDecodeErrorCount_{0};
+    std::atomic<int64_t> lastDecodedAudioPtsUs_{0};
+    std::atomic<int> lastDecodedAudioNbSamples_{0};
+    std::atomic<int> lastDecodedAudioSampleRate_{0};
+    std::atomic<int> lastDecodedAudioChannels_{0};
+    std::atomic<int> lastDecodedAudioSampleFormat_{-1};
+    std::atomic<int64_t> lastAudioDecodeCostUs_{-1};
+    std::atomic<int64_t> totalAudioDecodeCostUs_{0};
+    std::atomic<int64_t> audioDecodeCostSampleCount_{0};
+    std::atomic<int64_t> maxAudioDecodeCostUs_{0};
+    std::atomic<int64_t> lastAudioDecodeErrorLogMs_{0};
+    bool audioDecodeFirstFrameLogged_ = false;
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
     std::atomic<bool> infiniteReconnect_{true};

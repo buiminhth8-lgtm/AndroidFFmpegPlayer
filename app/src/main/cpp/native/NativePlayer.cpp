@@ -594,10 +594,15 @@ std::string NativePlayer::clearSurface() {
 
 int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage) {
     if (resetStreamMetadata) {
-        sourceHasVideo_.store(false);
+sourceHasVideo_.store(false);
         sourceHasAudio_.store(false);
         audioDecodeOpened_.store(false);
         audioPlayable_.store(false);
+        lastDecodedAudioPtsUs_.store(0);
+        lastDecodedAudioNbSamples_.store(0);
+        lastDecodedAudioSampleRate_.store(0);
+        lastDecodedAudioChannels_.store(0);
+        lastDecodedAudioSampleFormat_.store(-1);
         streamBitRate_.store(0);
         videoBitRate_.store(0);
         audioBitRate_.store(0);
@@ -1073,15 +1078,26 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
                         LOGE("audio decoder open failed: %s", audioDecodeError_.c_str());
                     } else {
                         audioDecodeError_.clear();
-                        audioDecodeOpened_.store(true);
-                        // A0 freeze: the audio decoder is open, but no PCM output
-                        // path (swr -> PCM queue -> JNI sink -> AudioTrack) exists
-                        // yet. audioPlayable stays false until Slice A4 installs a
-                        // real audio sink.
-                        audioPlayable_.store(false);
-                        audioPlayError_ = audioEnabled_.load() ? "audio playback pipeline not implemented" : "";
-                        LOGI("audio stream index=%d codec=%s sampleRate=%d channels=%d sampleFormat=%s decoderOpened=1",
-                             audioStreamIndex_, audioCodec_.c_str(), audioSampleRate_, audioChannels_, audioSampleFormatName_.c_str());
+                        audioDecodedFrame_ = av_frame_alloc();
+                        if (audioDecodedFrame_ == nullptr) {
+                            audioDecodeError_ = "av_frame_alloc failed for audio";
+                            audioPlayError_ = audioDecodeError_;
+                            avcodec_free_context(&audioCodecContext_);
+                            audioDecodeOpened_.store(false);
+                            audioPlayable_.store(false);
+                            LOGI("audio decoder open skipped: %s", audioDecodeError_.c_str());
+                        } else {
+                            audioDecodeOpened_.store(true);
+                            audioDecodeFirstFrameLogged_ = false;
+                            // A0 freeze: the audio decoder is open, but no PCM output
+                            // path (swr -> PCM queue -> JNI sink -> AudioTrack) exists
+                            // yet. audioPlayable stays false until Slice A4 installs a
+                            // real audio sink.
+                            audioPlayable_.store(false);
+                            audioPlayError_ = audioEnabled_.load() ? "audio playback pipeline not implemented" : "";
+                            LOGI("audio stream index=%d codec=%s sampleRate=%d channels=%d sampleFormat=%s decoderOpened=1",
+                                 audioStreamIndex_, audioCodec_.c_str(), audioSampleRate_, audioChannels_, audioSampleFormatName_.c_str());
+                        }
                     }
                 }
             }
@@ -1173,6 +1189,9 @@ std::string NativePlayer::enableAudio(bool enabled) {
     // installs a real JNI audio sink.
     audioPlayable_.store(false);
     if (!enabled) {
+        // Request the playback thread to flush the audio decoder so a later
+        // ON never outputs stale pre-toggle frames (AVFrame A1 lifecycle).
+        audioFlushRequested_.store(true);
         audioPlayError_.clear();
     } else if (!sourceHasAudio_.load()) {
         audioPlayError_.clear();
@@ -1483,6 +1502,12 @@ std::string NativePlayer::getStats() {
 
     wallClockUs_.store(steadyNowUs());
     const std::string effectiveSyncMasterValue = effectiveSyncMasterName(optionsSnapshot);
+    const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
+    const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
+            ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
+            : nullptr;
+    const std::string decodedAudioSampleFormatNameStr = decodedAudioSampleFormatName == nullptr
+            ? "unknown" : decodedAudioSampleFormatName;
     const int64_t avgReadFrameCostUs = averageUs(totalReadFrameCostUs_.load(), readFrameCostSampleCount_.load());
     const int64_t avgDecodeCostUs = averageUs(totalDecodeCostUs_.load(), decodeCostSampleCount_.load());
     const int64_t avgSwsScaleCostUs = averageUs(totalSwsScaleCostUs_.load(), swsScaleCostSampleCount_.load());
@@ -1653,6 +1678,17 @@ std::string NativePlayer::getStats() {
         << "\"frameYStride\":" << decodedFrameYStride << ","
         << "\"videoFrameCount\":" << videoFrameCount_.load() << ","
         << "\"audioFrameCount\":" << audioFrameCount_.load() << ","
+        << "\"audioDecodedFrameCount\":" << audioFrameCount_.load() << ","
+        << "\"audioDecodedSampleCount\":" << audioDecodedSampleCount_.load() << ","
+        << "\"audioDecodeErrorCount\":" << audioDecodeErrorCount_.load() << ","
+        << "\"lastDecodedAudioPtsUs\":" << lastDecodedAudioPtsUs_.load() << ","
+        << "\"lastDecodedAudioNbSamples\":" << lastDecodedAudioNbSamples_.load() << ","
+        << "\"lastDecodedAudioSampleRate\":" << lastDecodedAudioSampleRate_.load() << ","
+        << "\"lastDecodedAudioChannels\":" << lastDecodedAudioChannels_.load() << ","
+        << "\"lastDecodedAudioSampleFormat\":\"" << escapeJson(decodedAudioSampleFormatNameStr) << "\","
+        << "\"lastAudioDecodeCostUs\":" << lastAudioDecodeCostUs_.load() << ","
+        << "\"avgAudioDecodeCostUs\":" << averageUs(totalAudioDecodeCostUs_.load(), audioDecodeCostSampleCount_.load()) << ","
+        << "\"maxAudioDecodeCostUs\":" << maxAudioDecodeCostUs_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
         << "\"droppedVideoFrameCount\":" << droppedVideoFrameCount_.load() << ","
         << "\"recording\":" << (remuxRecorder_.isRecording() ? "true" : "false") << ","
@@ -2711,6 +2747,87 @@ void NativePlayer::updateVideoDelayStats(int64_t delayUs) {
     updateMax(maxVideoDelayUs_, safeDelayUs);
 }
 
+void NativePlayer::decodeAudioPacket(const AVPacket *packet) {
+    if (packet == nullptr || audioCodecContext_ == nullptr || !audioDecodeOpened_.load()) {
+        return;
+    }
+    if (!audioEnabled_.load()) {
+        // A1 policy: audioEnabled=false skips playback AAC decode. The recorder
+        // still received the original compressed packet earlier in the loop.
+        return;
+    }
+
+    const int64_t decodeStartUs = steadyNowUs();
+    int sendResult = avcodec_send_packet(audioCodecContext_, packet);
+    if (sendResult == AVERROR(EAGAIN)) {
+        // Decoder output has not been drained yet. Drain pending frames, then
+        // retry the send once per the FFmpeg send/receive contract.
+        drainAudioDecodedFrames();
+        sendResult = avcodec_send_packet(audioCodecContext_, packet);
+    }
+    if (sendResult == AVERROR(EAGAIN)) {
+        // Still not accepted after drain+retry: drop this packet this cycle.
+        // No packet queue exists in A1 (per scope), and a subsequent packet's
+        // drain keeps the decoder moving, so this is not a permanent loss.
+        drainAudioDecodedFrames();
+    } else if (sendResult < 0 && sendResult != AVERROR_EOF) {
+        ++audioDecodeErrorCount_;
+        logRateLimitedAudioDecodeError(sendResult);
+    } else {
+        drainAudioDecodedFrames();
+    }
+    recordCost(lastAudioDecodeCostUs_, totalAudioDecodeCostUs_, audioDecodeCostSampleCount_, maxAudioDecodeCostUs_,
+               steadyNowUs() - decodeStartUs);
+}
+
+void NativePlayer::drainAudioDecodedFrames() {
+    while (!stopRequested_.load()) {
+        const int ret = avcodec_receive_frame(audioCodecContext_, audioDecodedFrame_);
+        if (ret == 0) {
+            audioFrameCount_.fetch_add(1);
+            const int nbSamples = std::max(0, audioDecodedFrame_->nb_samples);
+            audioDecodedSampleCount_.fetch_add(nbSamples);
+            lastDecodedAudioNbSamples_.store(nbSamples);
+            lastDecodedAudioSampleRate_.store(audioDecodedFrame_->sample_rate);
+            lastDecodedAudioChannels_.store(audioDecodedFrame_->ch_layout.nb_channels);
+            lastDecodedAudioSampleFormat_.store(audioDecodedFrame_->format);
+            int64_t framePts = audioDecodedFrame_->best_effort_timestamp;
+            if (framePts == AV_NOPTS_VALUE) {
+                framePts = audioDecodedFrame_->pts;
+            }
+            if (framePts != AV_NOPTS_VALUE && formatContext_ != nullptr
+                && audioStreamIndex_ >= 0 && audioStreamIndex_ < static_cast<int>(formatContext_->nb_streams)) {
+                lastDecodedAudioPtsUs_.store(av_rescale_q(framePts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
+            }
+            if (!audioDecodeFirstFrameLogged_) {
+                audioDecodeFirstFrameLogged_ = true;
+                const char *fmtName = av_get_sample_fmt_name(static_cast<AVSampleFormat>(audioDecodedFrame_->format));
+                LOGI("audio decoded frame: codec=%s sampleRate=%d channels=%d sampleFormat=%s nbSamples=%d ptsUs=%lld",
+                     audioCodec_.c_str(), audioDecodedFrame_->sample_rate, audioDecodedFrame_->ch_layout.nb_channels,
+                     fmtName == nullptr ? "unknown" : fmtName, nbSamples,
+                     static_cast<long long>(lastDecodedAudioPtsUs_.load()));
+            }
+            av_frame_unref(audioDecodedFrame_);
+        } else if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        } else {
+            ++audioDecodeErrorCount_;
+            logRateLimitedAudioDecodeError(ret);
+            break;
+        }
+    }
+}
+
+void NativePlayer::logRateLimitedAudioDecodeError(int errorCode) {
+    const int64_t now = nowMs();
+    const int64_t last = lastAudioDecodeErrorLogMs_.load();
+    if (last == 0 || now - last >= 2000) {
+        lastAudioDecodeErrorLogMs_.store(now);
+        const std::string error = ffmpegErrorToString(errorCode);
+        LOGE("audio decode error code=%d message=%s", errorCode, error.c_str());
+    }
+}
+
 bool NativePlayer::shouldDropRealtimePacket(const AVPacket *packet) {
     if (packet == nullptr || packet->stream_index != videoStreamIndex_) {
         return false;
@@ -3201,6 +3318,13 @@ void NativePlayer::playbackLoop() {
             continue;
         }
 
+        // Audio OFF -> ON transition boundary: flush the audio decoder on the
+        // playback thread so the next ON never emits stale pre-toggle frames.
+        if (audioFlushRequested_.exchange(false) && audioCodecContext_ != nullptr) {
+            avcodec_flush_buffers(audioCodecContext_);
+            LOGI("audio decoder flushed for playback toggle");
+        }
+
         const int64_t readStartUs = steadyNowUs();
         const int readResult = av_read_frame(formatContext_, packet_);
         const int64_t readCostUs = steadyNowUs() - readStartUs;
@@ -3374,6 +3498,11 @@ void NativePlayer::playbackLoop() {
                 }
                 av_frame_unref(latestFrame_);
             }
+        } else if (packet_->stream_index == audioStreamIndex_) {
+            // A1: decode compressed audio packets into decoded Audio AVFrames
+            // on the playback thread, then discard them (no PCM yet). The
+            // recorder already received the original packet earlier in the loop.
+            decodeAudioPacket(packet_);
         }
 
         renderOesPendingFrameIfReady();
@@ -3989,6 +4118,18 @@ void NativePlayer::resetStats() {
     audioPacketBytes_.store(0);
     videoFrameCount_.store(0);
     audioFrameCount_.store(0);
+    audioDecodedSampleCount_.store(0);
+    audioDecodeErrorCount_.store(0);
+    lastDecodedAudioPtsUs_.store(0);
+    lastDecodedAudioNbSamples_.store(0);
+    lastDecodedAudioSampleRate_.store(0);
+    lastDecodedAudioChannels_.store(0);
+    lastDecodedAudioSampleFormat_.store(-1);
+    lastAudioDecodeCostUs_.store(-1);
+    totalAudioDecodeCostUs_.store(0);
+    audioDecodeCostSampleCount_.store(0);
+    maxAudioDecodeCostUs_.store(0);
+    lastAudioDecodeErrorLogMs_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);
@@ -4128,6 +4269,9 @@ void NativePlayer::releaseFfmpegResources() {
         avcodec_free_context(&videoCodecContext_);
     }
     mediaCodecContextInitialized_ = false;
+    if (audioDecodedFrame_ != nullptr) {
+        av_frame_free(&audioDecodedFrame_);
+    }
     if (audioCodecContext_ != nullptr) {
         avcodec_free_context(&audioCodecContext_);
     }

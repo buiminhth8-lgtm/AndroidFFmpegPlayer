@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -421,6 +422,14 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     }
     if (first == "-player-lifetime-stress") {
         return toJString(env, runPlayerLifetimeStressTest());
+    }
+    if (first == "-audio-backpressure-test") {
+        // Test-only: make the audio output worker's null sink sleep per block to
+        // validate that a slow consumer never blocks the playback thread.
+        const int delayMs = command.size() >= 2 ? std::atoi(command[1].c_str()) : 0;
+        setAudioWorkerBackpressureTestDelayMs(delayMs);
+        return toJString(env, std::string("{\"success\":true,\"audioWorkerTestDelayMs\":")
+                              + std::to_string(delayMs) + "}");
     }
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {

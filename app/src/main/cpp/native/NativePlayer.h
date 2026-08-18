@@ -12,7 +12,9 @@
 #include <jni.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,6 +26,56 @@ struct AVFrame;
 struct AVPacket;
 struct SwsContext;
 struct SwrContext;
+
+// A3: bounded low-latency PCM queue decoupling the playback thread (producer)
+// from the audio output worker (consumer). PCM contract is fixed:
+// S16 / 48000 Hz / stereo / interleaved. The producer never blocks; overflow
+// drops the oldest blocks to keep the live edge.
+class AudioPcmQueue {
+public:
+    struct Block {
+        std::vector<uint8_t> data;   // owned PCM bytes (S16/48k/stereo interleaved)
+        int64_t startPtsUs = 0;      // media start PTS of the block
+        int64_t sampleCount = 0;     // samples per channel in this block
+        int64_t generation = 0;      // discontinuity identity (reconnect/source change)
+    };
+
+    void configure(int64_t targetDurationUs, int64_t maxDurationUs);
+    void enqueue(Block block);
+    bool waitAndDequeue(Block &out);
+    void flush();
+    void requestStop();
+    void resetForRestart();
+    void clearStats();
+
+    int64_t durationUs() const;
+    int64_t blockCount() const;
+    int64_t byteCount() const;
+    int64_t dropCount() const;
+    int64_t droppedSampleCount() const;
+    int64_t flushCount() const;
+    int64_t highWatermarkUs() const;
+
+private:
+    static int64_t blockDurationUs(const Block &block);
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Block> blocks_;
+    int64_t bufferedDurationUs_ = 0;
+    int64_t targetDurationUs_ = 150000;
+    int64_t maxDurationUs_ = 250000;
+    bool stopRequested_ = false;
+    int64_t dropCount_ = 0;
+    int64_t droppedSampleCount_ = 0;
+    int64_t flushCount_ = 0;
+    int64_t highWatermarkUs_ = 0;
+};
+
+// Test-only hook: makes the audio output worker's null sink sleep before each
+// consumed block, to validate that a slow consumer never blocks the playback
+// thread. Default 0 = no delay (production behavior unchanged).
+void setAudioWorkerBackpressureTestDelayMs(int delayMs);
 
 enum class PlayerState {
     Idle,
@@ -130,6 +182,10 @@ private:
     bool configureAudioSwrContext(int inputFormat, int inputSampleRate,
                                   uint64_t inputLayoutMask, int inputChannels);
     void logRateLimitedAudioResampleError(const char *message);
+    void audioOutputWorkerLoop();
+    void startAudioOutputWorker();
+    void stopAudioOutputWorker();
+    void flushAudioPcmForDiscontinuity();
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
@@ -381,6 +437,16 @@ private:
     std::atomic<int64_t> audioResampleCostSampleCount_{0};
     std::atomic<int64_t> maxAudioResampleCostUs_{0};
     std::atomic<int64_t> lastAudioResampleErrorLogMs_{0};
+    // A3: bounded PCM queue + audio output worker (null/discard sink).
+    AudioPcmQueue audioPcmQueue_;
+    std::thread audioOutputWorkerThread_;
+    mutable std::mutex audioWorkerMutex_;
+    std::atomic<bool> audioWorkerRunning_{false};
+    std::atomic<int64_t> audioQueueGeneration_{0};
+    std::atomic<int64_t> audioWorkerConsumedBlockCount_{0};
+    std::atomic<int64_t> audioWorkerConsumedSampleCount_{0};
+    std::atomic<int64_t> audioWorkerConsumedByteCount_{0};
+    std::atomic<int64_t> lastConsumedPcmPtsUs_{0};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
     std::atomic<bool> infiniteReconnect_{true};

@@ -44,6 +44,9 @@ namespace {
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
+// A3 test-only hook (default 0 = production behavior unchanged).
+std::atomic<int> g_audio_worker_test_delay_ms{0};
+
 // A2 frozen PCM output contract: S16 / 48000 Hz / stereo / interleaved.
 constexpr int kAudioPcmOutputSampleRate = 48000;
 constexpr int kAudioPcmOutputChannels = 2;
@@ -518,6 +521,8 @@ void NativePlayer::setJavaVm(JavaVM *javaVm) {
 
 NativePlayer::NativePlayer(int64_t logicalHandle)
         : logicalHandle_(logicalHandle) {
+    // A3: bounded low-latency PCM queue — target ~150 ms, hard max ~250 ms.
+    audioPcmQueue_.configure(150000, 250000);
     LOGI("createPlayer NativePlayer=%p handle=%lld", this,
          static_cast<long long>(logicalHandle_));
 }
@@ -1192,22 +1197,34 @@ std::string NativePlayer::enableAudio(bool enabled) {
     // It does NOT mean source presence, decoder state, recorder state, or sink
     // state. Those are sourceHasAudio_, audioDecodeOpened_, audioCallbackSet_,
     // and audioPlayable_ respectively.
-    audioEnabled_.store(enabled);
     // No PCM sink / AudioTrack exists at A0, so the full playback pipeline is
     // never playable yet. audioPlayable becomes true only after Slice A4
     // installs a real JNI audio sink.
     audioPlayable_.store(false);
     if (!enabled) {
-        // Request the playback thread to flush the audio decoder so a later
-        // ON never outputs stale pre-toggle frames (AVFrame A1 lifecycle).
+        // 1) Stop the output worker and flush the queue; 2) request the playback
+        // thread to flush the audio decoder + swr. A later ON starts from the
+        // live edge with no stale frames/resampler delay/PCM.
+        audioEnabled_.store(false);
+        audioPcmQueue_.flush();
+        stopAudioOutputWorker();
         audioFlushRequested_.store(true);
         audioPlayError_.clear();
-    } else if (!sourceHasAudio_.load()) {
-        audioPlayError_.clear();
-    } else if (!audioDecodeOpened_.load()) {
-        audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
     } else {
-        audioPlayError_ = "audio playback pipeline not implemented";
+        // Request the playback thread to flush the audio decoder + swr, then
+        // start the output worker (which resets the queue and clears the stop
+        // flag), then enable production. The worker is ready before any PCM can
+        // be enqueued.
+        audioFlushRequested_.store(true);
+        startAudioOutputWorker();
+        audioEnabled_.store(true);
+        if (!sourceHasAudio_.load()) {
+            audioPlayError_.clear();
+        } else if (!audioDecodeOpened_.load()) {
+            audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
+        } else {
+            audioPlayError_ = "audio playback pipeline not implemented";
+        }
     }
 
     LOGI("enableAudio requested=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d error=%s",
@@ -1360,6 +1377,11 @@ std::string NativePlayer::start() {
         startPlayTimeMs_.store(nowMs());
         startToFirstFrameMs_.store(-1);
         state_ = PlayerState::Playing;
+        // Restart the audio output worker when live audio monitoring is still
+        // requested (prepare() stops it). It is idempotent and resets the queue.
+        if (audioEnabled_.load()) {
+            startAudioOutputWorker();
+        }
         playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
     }
     LOGI("startPlayer player=%p inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld reused=%d",
@@ -1412,6 +1434,10 @@ std::string NativePlayer::stop() {
     reconnecting_.store(false);
     waitingSource_.store(false);
     setRendererFallbackReason(rendererState_, 0);
+
+    // Stop and join the audio output worker (no-op when audio was disabled).
+    audioPcmQueue_.flush();
+    stopAudioOutputWorker();
 
     if (remuxRecorder_.isRecording()) {
         LOGI("stopPlayer auto stop active recorder");
@@ -1711,6 +1737,19 @@ std::string NativePlayer::getStats() {
         << "\"lastAudioResampleCostUs\":" << lastAudioResampleCostUs_.load() << ","
         << "\"avgAudioResampleCostUs\":" << averageUs(totalAudioResampleCostUs_.load(), audioResampleCostSampleCount_.load()) << ","
         << "\"maxAudioResampleCostUs\":" << maxAudioResampleCostUs_.load() << ","
+        << "\"audioQueueDurationUs\":" << audioPcmQueue_.durationUs() << ","
+        << "\"audioQueueBlockCount\":" << audioPcmQueue_.blockCount() << ","
+        << "\"audioQueueBytes\":" << audioPcmQueue_.byteCount() << ","
+        << "\"audioQueueHighWatermarkUs\":" << audioPcmQueue_.highWatermarkUs() << ","
+        << "\"audioQueueDropCount\":" << audioPcmQueue_.dropCount() << ","
+        << "\"audioQueueDroppedSampleCount\":" << audioPcmQueue_.droppedSampleCount() << ","
+        << "\"audioQueueFlushCount\":" << audioPcmQueue_.flushCount() << ","
+        << "\"audioQueueGeneration\":" << audioQueueGeneration_.load() << ","
+        << "\"audioWorkerRunning\":" << (audioWorkerRunning_.load() ? "true" : "false") << ","
+        << "\"audioWorkerConsumedBlockCount\":" << audioWorkerConsumedBlockCount_.load() << ","
+        << "\"audioWorkerConsumedSampleCount\":" << audioWorkerConsumedSampleCount_.load() << ","
+        << "\"audioWorkerConsumedByteCount\":" << audioWorkerConsumedByteCount_.load() << ","
+        << "\"lastConsumedPcmPtsUs\":" << lastConsumedPcmPtsUs_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
         << "\"droppedVideoFrameCount\":" << droppedVideoFrameCount_.load() << ","
         << "\"recording\":" << (remuxRecorder_.isRecording() ? "true" : "false") << ","
@@ -2958,15 +2997,29 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
 
     // PCM media PTS association: use the decoded frame's media start time
     // (best-effort timestamp, fallback pts), rescaled to microseconds. This is
-    // the block start PTS for the future A3 queue; resampling does not move the
+    // the block start PTS for the A3 queue; resampling does not move the
     // media timeline.
     int64_t framePts = frame->best_effort_timestamp;
     if (framePts == AV_NOPTS_VALUE) {
         framePts = frame->pts;
     }
+    int64_t pcmStartPtsUs = 0;
     if (framePts != AV_NOPTS_VALUE && formatContext_ != nullptr
         && audioStreamIndex_ >= 0 && audioStreamIndex_ < static_cast<int>(formatContext_->nb_streams)) {
-        lastPcmPtsUs_.store(av_rescale_q(framePts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q));
+        pcmStartPtsUs = av_rescale_q(framePts, formatContext_->streams[audioStreamIndex_]->time_base, AV_TIME_BASE_Q);
+        lastPcmPtsUs_.store(pcmStartPtsUs);
+    }
+
+    // A3: hand the PCM block to the bounded output queue. The block owns a copy
+    // of the PCM bytes (the scratch buffer is reused on the next frame). The
+    // producer never waits for queue space; overflow drops the oldest blocks.
+    if (audioEnabled_.load()) {
+        AudioPcmQueue::Block block;
+        block.data.assign(audioPcmBuffer_.data(), audioPcmBuffer_.data() + static_cast<size_t>(pcmBytes));
+        block.startPtsUs = pcmStartPtsUs;
+        block.sampleCount = convertedSamples;
+        block.generation = audioQueueGeneration_.load();
+        audioPcmQueue_.enqueue(std::move(block));
     }
     return true;
 }
@@ -3020,6 +3073,174 @@ void NativePlayer::logRateLimitedAudioResampleError(const char *message) {
         lastAudioResampleErrorLogMs_.store(now);
         LOGE("audio resample error: %s", message);
     }
+}
+
+void setAudioWorkerBackpressureTestDelayMs(int delayMs) {
+    g_audio_worker_test_delay_ms.store(delayMs < 0 ? 0 : delayMs);
+}
+
+int64_t AudioPcmQueue::blockDurationUs(const Block &block) {
+    if (block.sampleCount <= 0) {
+        return 0;
+    }
+    return block.sampleCount * 1000000 / kAudioPcmOutputSampleRate;
+}
+
+void AudioPcmQueue::configure(int64_t targetDurationUs, int64_t maxDurationUs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    targetDurationUs_ = std::max<int64_t>(1, targetDurationUs);
+    maxDurationUs_ = std::max<int64_t>(targetDurationUs_, maxDurationUs);
+}
+
+void AudioPcmQueue::enqueue(Block block) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int64_t blockUs = blockDurationUs(block);
+    // Bounded: drop oldest blocks until the new block fits within the hard max.
+    // Producer never blocks; this keeps the live edge.
+    while (!blocks_.empty() && bufferedDurationUs_ + blockUs > maxDurationUs_) {
+        droppedSampleCount_ += blocks_.front().sampleCount;
+        bufferedDurationUs_ -= blockDurationUs(blocks_.front());
+        ++dropCount_;
+        blocks_.pop_front();
+    }
+    blocks_.push_back(std::move(block));
+    bufferedDurationUs_ += blockUs;
+    highWatermarkUs_ = std::max(highWatermarkUs_, bufferedDurationUs_);
+    cv_.notify_one();
+}
+
+bool AudioPcmQueue::waitAndDequeue(Block &out) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return stopRequested_ || !blocks_.empty(); });
+    if (blocks_.empty()) {
+        return false;  // stopped and drained
+    }
+    out = std::move(blocks_.front());
+    blocks_.pop_front();
+    bufferedDurationUs_ -= blockDurationUs(out);
+    return true;
+}
+
+void AudioPcmQueue::flush() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!blocks_.empty()) {
+        ++flushCount_;
+    }
+    blocks_.clear();
+    bufferedDurationUs_ = 0;
+    cv_.notify_all();
+}
+
+void AudioPcmQueue::requestStop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopRequested_ = true;
+    cv_.notify_all();
+}
+
+void AudioPcmQueue::resetForRestart() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    blocks_.clear();
+    bufferedDurationUs_ = 0;
+    stopRequested_ = false;
+}
+
+void AudioPcmQueue::clearStats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    dropCount_ = 0;
+    droppedSampleCount_ = 0;
+    flushCount_ = 0;
+    highWatermarkUs_ = 0;
+}
+
+int64_t AudioPcmQueue::durationUs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return bufferedDurationUs_;
+}
+
+int64_t AudioPcmQueue::blockCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<int64_t>(blocks_.size());
+}
+
+int64_t AudioPcmQueue::byteCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int64_t bytes = 0;
+    for (const auto &block : blocks_) {
+        bytes += static_cast<int64_t>(block.data.size());
+    }
+    return bytes;
+}
+
+int64_t AudioPcmQueue::dropCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return dropCount_;
+}
+
+int64_t AudioPcmQueue::droppedSampleCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return droppedSampleCount_;
+}
+
+int64_t AudioPcmQueue::flushCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return flushCount_;
+}
+
+int64_t AudioPcmQueue::highWatermarkUs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return highWatermarkUs_;
+}
+
+void NativePlayer::audioOutputWorkerLoop() {
+    LOGI("audio output worker started");
+    AudioPcmQueue::Block block;
+    while (true) {
+        const bool got = audioPcmQueue_.waitAndDequeue(block);
+        if (!got) {
+            break;
+        }
+        const int testDelayMs = g_audio_worker_test_delay_ms.load();
+        if (testDelayMs > 0) {
+            // Test-only backpressure hook: simulate a slow consumer to prove the
+            // playback thread never blocks. Never enabled in production.
+            std::this_thread::sleep_for(std::chrono::milliseconds(testDelayMs));
+        }
+        // Null / discard sink: consume, record stats, then discard.
+        audioWorkerConsumedBlockCount_.fetch_add(1);
+        audioWorkerConsumedSampleCount_.fetch_add(block.sampleCount);
+        audioWorkerConsumedByteCount_.fetch_add(static_cast<int64_t>(block.data.size()));
+        lastConsumedPcmPtsUs_.store(block.startPtsUs);
+        block.data.clear();
+    }
+    LOGI("audio output worker ended");
+}
+
+void NativePlayer::startAudioOutputWorker() {
+    std::lock_guard<std::mutex> lock(audioWorkerMutex_);
+    if (audioOutputWorkerThread_.joinable()) {
+        return;
+    }
+    audioPcmQueue_.resetForRestart();
+    audioWorkerRunning_.store(true);
+    audioOutputWorkerThread_ = std::thread(&NativePlayer::audioOutputWorkerLoop, this);
+}
+
+void NativePlayer::stopAudioOutputWorker() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(audioWorkerMutex_);
+        worker = std::move(audioOutputWorkerThread_);
+    }
+    if (worker.joinable()) {
+        audioPcmQueue_.requestStop();
+        worker.join();
+        audioWorkerRunning_.store(false);
+    }
+}
+
+void NativePlayer::flushAudioPcmForDiscontinuity() {
+    audioPcmQueue_.flush();
+    audioQueueGeneration_.fetch_add(1);
 }
 
 bool NativePlayer::shouldDropRealtimePacket(const AVPacket *packet) {
@@ -3371,6 +3592,9 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
                 }
             }
             resetRealtimeClock();
+            // New source generation: flush stale queued PCM so the new stream
+            // enqueues from its live edge (generation also advances).
+            flushAudioPcmForDiscontinuity();
             beginStartupKeyFrameWait("reconnect");
             if (!startupKeyFrameWaitActive_.load()) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -3479,6 +3703,8 @@ bool NativePlayer::switchTransportInput() {
     }
 
     resetRealtimeClock();
+    // New source generation: flush stale queued PCM and advance the generation.
+    flushAudioPcmForDiscontinuity();
     beginStartupKeyFrameWait("transport_switch");
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -4346,6 +4572,12 @@ void NativePlayer::resetStats() {
     audioResampleCostSampleCount_.store(0);
     maxAudioResampleCostUs_.store(0);
     lastAudioResampleErrorLogMs_.store(0);
+    audioPcmQueue_.clearStats();
+    audioQueueGeneration_.store(0);
+    audioWorkerConsumedBlockCount_.store(0);
+    audioWorkerConsumedSampleCount_.store(0);
+    audioWorkerConsumedByteCount_.store(0);
+    lastConsumedPcmPtsUs_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);

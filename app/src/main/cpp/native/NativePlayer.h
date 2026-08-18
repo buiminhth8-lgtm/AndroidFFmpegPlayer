@@ -186,6 +186,10 @@ private:
     void startAudioOutputWorker();
     void stopAudioOutputWorker();
     void flushAudioPcmForDiscontinuity();
+    bool writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &block);
+    void sendAudioSinkControl(int command, const char *commandName);
+    void deleteAudioSinkGlobalRef(JNIEnv *env);
+    void recomputeAudioPlayable();
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
@@ -447,6 +451,20 @@ private:
     std::atomic<int64_t> audioWorkerConsumedSampleCount_{0};
     std::atomic<int64_t> audioWorkerConsumedByteCount_{0};
     std::atomic<int64_t> lastConsumedPcmPtsUs_{0};
+    // A4: JNI PCM sink (Android AudioTrack) owned by the Java LiveAudioPcmSink.
+    mutable std::mutex audioSinkMutex_;
+    jobject audioSinkGlobalRef_ = nullptr;
+    jmethodID audioSinkWriteMethodId_ = nullptr;
+    jmethodID audioSinkControlMethodId_ = nullptr;
+    std::atomic<bool> audioSinkReady_{false};
+    std::atomic<int64_t> audioSinkWriteCount_{0};
+    std::atomic<int64_t> audioSinkWrittenByteCount_{0};
+    std::atomic<int64_t> audioSinkWriteErrorCount_{0};
+    std::atomic<int> audioSinkLastErrorCode_{0};
+    std::atomic<int64_t> lastAudioSinkWriteCostUs_{-1};
+    std::atomic<int64_t> totalAudioSinkWriteCostUs_{0};
+    std::atomic<int64_t> audioSinkWriteCostSampleCount_{0};
+    std::atomic<int64_t> maxAudioSinkWriteCostUs_{0};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
     std::atomic<bool> infiniteReconnect_{true};

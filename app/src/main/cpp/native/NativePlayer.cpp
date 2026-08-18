@@ -52,6 +52,12 @@ constexpr int kAudioPcmOutputSampleRate = 48000;
 constexpr int kAudioPcmOutputChannels = 2;
 constexpr AVSampleFormat kAudioPcmOutputFormat = AV_SAMPLE_FMT_S16;
 
+// A4 Java AudioTrack sink control commands (mirror LiveAudioPcmSink). START is
+// intentionally not sent: onAudioPcm lazily creates/plays the AudioTrack on the
+// worker thread, avoiding a cross-thread create race.
+constexpr int kAudioSinkCmdPauseFlush = 1;
+constexpr int kAudioSinkCmdRelease = 2;
+
 // AGC tuning constants.
 constexpr int kAgcUpdateIntervalFrames = 5;
 constexpr int kAgcPixelStep = 4;
@@ -1103,12 +1109,15 @@ sourceHasVideo_.store(false);
                         } else {
                             audioDecodeOpened_.store(true);
                             audioDecodeFirstFrameLogged_ = false;
-                            // A0 freeze: the audio decoder is open, but no PCM output
-                            // path (swr -> PCM queue -> JNI sink -> AudioTrack) exists
-                            // yet. audioPlayable stays false until Slice A4 installs a
-                            // real audio sink.
-                            audioPlayable_.store(false);
-                            audioPlayError_ = audioEnabled_.load() ? "audio playback pipeline not implemented" : "";
+                            // A4: the full pipeline (decode -> PCM -> queue ->
+                            // worker -> JNI sink -> AudioTrack) is wired.
+                            // audioPlayable now reflects real capability.
+                            recomputeAudioPlayable();
+                            if (audioEnabled_.load() && !audioSinkReady_.load()) {
+                                audioPlayError_ = "audio sink is not set";
+                            } else {
+                                audioPlayError_.clear();
+                            }
                             LOGI("audio stream index=%d codec=%s sampleRate=%d channels=%d sampleFormat=%s decoderOpened=1",
                                  audioStreamIndex_, audioCodec_.c_str(), audioSampleRate_, audioChannels_, audioSampleFormatName_.c_str());
                         }
@@ -1130,28 +1139,69 @@ sourceHasVideo_.store(false);
 }
 
 
-std::string NativePlayer::setAudioCallback(JNIEnv *, jobject callback) {
+std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
     if (isReleased()) {
         return jsonError(-1, "player is released");
     }
-
-    // STUB (A0 freeze): only records whether a Java audio sink object was
-    // supplied. No NewGlobalRef / GetMethodID / PCM delivery exists yet; the
-    // real JNI AudioPcmSink arrives in Slice A4. audioPlayable stays false
-    // regardless of callback presence because no PCM playback path exists.
-    const bool callbackSet = callback != nullptr;
-    audioCallbackSet_.store(callbackSet);
-    audioPlayable_.store(false);
-    if (audioEnabled_.load() && sourceHasAudio_.load()) {
-        audioPlayError_ = "audio playback pipeline not implemented";
+    if (env == nullptr) {
+        return jsonError(-1, "JNIEnv is null");
     }
 
-    LOGI("setAudioCallback callbackSet=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d",
+    // A4: register the Java audio PCM sink (LiveAudioPcmSink) and cache the
+    // method IDs for the worker's write path and the lifecycle control path.
+    jobject newRef = nullptr;
+    jmethodID writeMethod = nullptr;
+    jmethodID controlMethod = nullptr;
+    if (callback != nullptr) {
+        newRef = env->NewGlobalRef(callback);
+        if (newRef == nullptr) {
+            return jsonError(-1, "NewGlobalRef audio sink failed");
+        }
+        jclass sinkClass = env->GetObjectClass(newRef);
+        if (sinkClass != nullptr) {
+            writeMethod = env->GetMethodID(sinkClass, "onAudioPcm", "(Ljava/nio/ByteBuffer;IJ)I");
+            controlMethod = env->GetMethodID(sinkClass, "onAudioControl", "(I)I");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(sinkClass);
+        }
+        if (writeMethod == nullptr || controlMethod == nullptr) {
+            env->DeleteGlobalRef(newRef);
+            return jsonError(-1, "audio sink methods not found");
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(audioSinkMutex_);
+        if (audioSinkGlobalRef_ != nullptr) {
+            env->DeleteGlobalRef(audioSinkGlobalRef_);
+        }
+        audioSinkGlobalRef_ = newRef;
+        audioSinkWriteMethodId_ = writeMethod;
+        audioSinkControlMethodId_ = controlMethod;
+    }
+
+    const bool callbackSet = newRef != nullptr;
+    audioCallbackSet_.store(callbackSet);
+    audioSinkReady_.store(callbackSet);
+    if (!callbackSet) {
+        audioSinkLastErrorCode_.store(0);
+    }
+    if (audioEnabled_.load() && sourceHasAudio_.load() && !callbackSet) {
+        audioPlayError_ = "audio sink is not set";
+    } else if (callbackSet) {
+        audioPlayError_.clear();
+    }
+    recomputeAudioPlayable();
+
+    LOGI("setAudioCallback callbackSet=%d sourceHasAudio=%d audioEnabled=%d audioSinkReady=%d audioPlayable=%d",
          callbackSet ? 1 : 0, sourceHasAudio_.load() ? 1 : 0,
-         audioEnabled_.load() ? 1 : 0, audioPlayable_.load() ? 1 : 0);
+         audioEnabled_.load() ? 1 : 0, audioSinkReady_.load() ? 1 : 0, audioPlayable_.load() ? 1 : 0);
     std::ostringstream out;
     out << "{\"success\":true,\"message\":\"audio callback updated\","
         << "\"audioCallbackSet\":" << (audioCallbackSet_.load() ? "true" : "false") << ","
+        << "\"audioSinkReady\":" << (audioSinkReady_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
         << "\"audioPlayable\":" << (audioPlayable_.load() ? "true" : "false") << "}";
     return out.str();
@@ -1197,16 +1247,14 @@ std::string NativePlayer::enableAudio(bool enabled) {
     // It does NOT mean source presence, decoder state, recorder state, or sink
     // state. Those are sourceHasAudio_, audioDecodeOpened_, audioCallbackSet_,
     // and audioPlayable_ respectively.
-    // No PCM sink / AudioTrack exists at A0, so the full playback pipeline is
-    // never playable yet. audioPlayable becomes true only after Slice A4
-    // installs a real JNI audio sink.
-    audioPlayable_.store(false);
     if (!enabled) {
-        // 1) Stop the output worker and flush the queue; 2) request the playback
-        // thread to flush the audio decoder + swr. A later ON starts from the
-        // live edge with no stale frames/resampler delay/PCM.
+        // Stop the output worker, flush the queue, and pause/flush the AudioTrack
+        // so no stale audio keeps playing. Then request the playback thread to
+        // flush the audio decoder + swr. A later ON starts from the live edge.
         audioEnabled_.store(false);
         audioPcmQueue_.flush();
+        audioPcmQueue_.requestStop();
+        sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
         stopAudioOutputWorker();
         audioFlushRequested_.store(true);
         audioPlayError_.clear();
@@ -1214,7 +1262,7 @@ std::string NativePlayer::enableAudio(bool enabled) {
         // Request the playback thread to flush the audio decoder + swr, then
         // start the output worker (which resets the queue and clears the stop
         // flag), then enable production. The worker is ready before any PCM can
-        // be enqueued.
+        // be enqueued; onAudioPcm lazily creates/plays the AudioTrack.
         audioFlushRequested_.store(true);
         startAudioOutputWorker();
         audioEnabled_.store(true);
@@ -1222,10 +1270,13 @@ std::string NativePlayer::enableAudio(bool enabled) {
             audioPlayError_.clear();
         } else if (!audioDecodeOpened_.load()) {
             audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
+        } else if (!audioSinkReady_.load()) {
+            audioPlayError_ = "audio sink is not set";
         } else {
-            audioPlayError_ = "audio playback pipeline not implemented";
+            audioPlayError_.clear();
         }
     }
+    recomputeAudioPlayable();
 
     LOGI("enableAudio requested=%d sourceHasAudio=%d audioEnabled=%d audioPlayable=%d error=%s",
          enabled ? 1 : 0, sourceHasAudio_.load() ? 1 : 0,
@@ -1435,8 +1486,12 @@ std::string NativePlayer::stop() {
     waitingSource_.store(false);
     setRendererFallbackReason(rendererState_, 0);
 
-    // Stop and join the audio output worker (no-op when audio was disabled).
+    // Stop consumption, pause/flush the AudioTrack (unblocks any pending
+    // blocking write), then stop and join the audio output worker (no-op when
+    // audio was disabled).
     audioPcmQueue_.flush();
+    audioPcmQueue_.requestStop();
+    sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
     stopAudioOutputWorker();
 
     if (remuxRecorder_.isRecording()) {
@@ -1750,6 +1805,14 @@ std::string NativePlayer::getStats() {
         << "\"audioWorkerConsumedSampleCount\":" << audioWorkerConsumedSampleCount_.load() << ","
         << "\"audioWorkerConsumedByteCount\":" << audioWorkerConsumedByteCount_.load() << ","
         << "\"lastConsumedPcmPtsUs\":" << lastConsumedPcmPtsUs_.load() << ","
+        << "\"audioSinkReady\":" << (audioSinkReady_.load() ? "true" : "false") << ","
+        << "\"audioSinkWriteCount\":" << audioSinkWriteCount_.load() << ","
+        << "\"audioSinkWrittenByteCount\":" << audioSinkWrittenByteCount_.load() << ","
+        << "\"audioSinkWriteErrorCount\":" << audioSinkWriteErrorCount_.load() << ","
+        << "\"audioSinkLastErrorCode\":" << audioSinkLastErrorCode_.load() << ","
+        << "\"lastAudioSinkWriteCostUs\":" << lastAudioSinkWriteCostUs_.load() << ","
+        << "\"avgAudioSinkWriteCostUs\":" << averageUs(totalAudioSinkWriteCostUs_.load(), audioSinkWriteCostSampleCount_.load()) << ","
+        << "\"maxAudioSinkWriteCostUs\":" << maxAudioSinkWriteCostUs_.load() << ","
         << "\"renderedFrameCount\":" << renderedFrameCount_.load() << ","
         << "\"droppedVideoFrameCount\":" << droppedVideoFrameCount_.load() << ","
         << "\"recording\":" << (remuxRecorder_.isRecording() ? "true" : "false") << ","
@@ -2509,6 +2572,11 @@ std::string NativePlayer::release() {
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env != nullptr) {
+        // Release the Java AudioTrack sink, then delete its global reference.
+        // The worker has already been joined by stop(), so no concurrent write.
+        sendAudioSinkControl(kAudioSinkCmdRelease, "release");
+        deleteAudioSinkGlobalRef(env);
+        recomputeAudioPlayable();
         {
             std::lock_guard<std::mutex> surfaceLock(surfaceMutex_);
             deleteSurfaceGlobalRefLocked(env);
@@ -3112,8 +3180,11 @@ void AudioPcmQueue::enqueue(Block block) {
 bool AudioPcmQueue::waitAndDequeue(Block &out) {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return stopRequested_ || !blocks_.empty(); });
+    if (stopRequested_) {
+        return false;  // stopped: never consume residual/stale blocks
+    }
     if (blocks_.empty()) {
-        return false;  // stopped and drained
+        return false;
     }
     out = std::move(blocks_.front());
     blocks_.pop_front();
@@ -3193,6 +3264,13 @@ int64_t AudioPcmQueue::highWatermarkUs() const {
 
 void NativePlayer::audioOutputWorkerLoop() {
     LOGI("audio output worker started");
+    // Attach this native worker thread to the JVM once for its whole lifetime;
+    // detach once on exit (no cross-thread JNIEnv reuse, no per-block attach).
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        LOGE("audio output worker: JNIEnv unavailable; PCM will be discarded");
+    }
     AudioPcmQueue::Block block;
     while (true) {
         const bool got = audioPcmQueue_.waitAndDequeue(block);
@@ -3205,13 +3283,17 @@ void NativePlayer::audioOutputWorkerLoop() {
             // playback thread never blocks. Never enabled in production.
             std::this_thread::sleep_for(std::chrono::milliseconds(testDelayMs));
         }
-        // Null / discard sink: consume, record stats, then discard.
         audioWorkerConsumedBlockCount_.fetch_add(1);
         audioWorkerConsumedSampleCount_.fetch_add(block.sampleCount);
         audioWorkerConsumedByteCount_.fetch_add(static_cast<int64_t>(block.data.size()));
         lastConsumedPcmPtsUs_.store(block.startPtsUs);
+        // A4: hand the owned PCM block to the JNI sink (AudioTrack.write).
+        if (env != nullptr && !block.data.empty()) {
+            writeAudioPcmToSink(env, block);
+        }
         block.data.clear();
     }
+    detachCurrentThreadIfNeeded(attached);
     LOGI("audio output worker ended");
 }
 
@@ -3241,6 +3323,119 @@ void NativePlayer::stopAudioOutputWorker() {
 void NativePlayer::flushAudioPcmForDiscontinuity() {
     audioPcmQueue_.flush();
     audioQueueGeneration_.fetch_add(1);
+    // Clear stale AudioTrack-buffered data too, so the new source generation
+    // never plays old audio. onAudioPcm lazily resumes playback on next write.
+    sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
+}
+
+void NativePlayer::recomputeAudioPlayable() {
+    // A0 frozen semantics: audioPlayable means the full playback pipeline
+    // (decode -> PCM -> queue -> worker -> sink -> AudioTrack) is wired and
+    // capable. A4 completes that pipeline, so it now reflects real capability.
+    const bool playable = audioEnabled_.load()
+                          && sourceHasAudio_.load()
+                          && audioDecodeOpened_.load()
+                          && audioSinkReady_.load();
+    audioPlayable_.store(playable);
+}
+
+bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &block) {
+    if (env == nullptr) {
+        ++audioSinkWriteErrorCount_;
+        audioSinkLastErrorCode_.store(-1);
+        return false;
+    }
+    jobject sinkLocal = nullptr;
+    jmethodID writeMethod = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioSinkMutex_);
+        if (audioSinkGlobalRef_ == nullptr || audioSinkWriteMethodId_ == nullptr) {
+            return false;
+        }
+        sinkLocal = env->NewLocalRef(audioSinkGlobalRef_);
+        writeMethod = audioSinkWriteMethodId_;
+    }
+    if (sinkLocal == nullptr) {
+        ++audioSinkWriteErrorCount_;
+        audioSinkLastErrorCode_.store(-1);
+        return false;
+    }
+
+    jobject buffer = env->NewDirectByteBuffer(const_cast<void *>(static_cast<const void *>(block.data.data())),
+                                              static_cast<jlong>(block.data.size()));
+    if (buffer == nullptr) {
+        ++audioSinkWriteErrorCount_;
+        audioSinkLastErrorCode_.store(-1);
+        env->DeleteLocalRef(sinkLocal);
+        return false;
+    }
+
+    const int64_t writeStartUs = steadyNowUs();
+    const jint written = env->CallIntMethod(sinkLocal, writeMethod, buffer,
+                                            static_cast<jint>(block.data.size()),
+                                            static_cast<jlong>(block.startPtsUs));
+    const bool exception = env->ExceptionCheck();
+    if (exception) {
+        env->ExceptionClear();
+    }
+    recordCost(lastAudioSinkWriteCostUs_, totalAudioSinkWriteCostUs_, audioSinkWriteCostSampleCount_,
+               maxAudioSinkWriteCostUs_, steadyNowUs() - writeStartUs);
+
+    env->DeleteLocalRef(buffer);
+    env->DeleteLocalRef(sinkLocal);
+
+    if (exception || written < 0) {
+        ++audioSinkWriteErrorCount_;
+        audioSinkLastErrorCode_.store(exception ? -1 : written);
+        return false;
+    }
+    audioSinkWriteCount_.fetch_add(1);
+    audioSinkWrittenByteCount_.fetch_add(written);
+    audioSinkLastErrorCode_.store(0);
+    return true;
+}
+
+void NativePlayer::sendAudioSinkControl(int command, const char *commandName) {
+    bool attached = false;
+    JNIEnv *env = getJniEnvForCurrentThread(attached);
+    if (env == nullptr) {
+        LOGE("audio sink control %s: JNIEnv unavailable", commandName);
+        return;
+    }
+    jobject sinkLocal = nullptr;
+    jmethodID controlMethod = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioSinkMutex_);
+        if (audioSinkGlobalRef_ == nullptr || audioSinkControlMethodId_ == nullptr) {
+            detachCurrentThreadIfNeeded(attached);
+            return;
+        }
+        sinkLocal = env->NewLocalRef(audioSinkGlobalRef_);
+        controlMethod = audioSinkControlMethodId_;
+    }
+    if (sinkLocal != nullptr) {
+        env->CallIntMethod(sinkLocal, controlMethod, static_cast<jint>(command));
+        if (env->ExceptionCheck()) {
+            LOGE("audio sink control %s threw", commandName);
+            env->ExceptionClear();
+        }
+        env->DeleteLocalRef(sinkLocal);
+    }
+    detachCurrentThreadIfNeeded(attached);
+}
+
+void NativePlayer::deleteAudioSinkGlobalRef(JNIEnv *env) {
+    if (env == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(audioSinkMutex_);
+    if (audioSinkGlobalRef_ != nullptr) {
+        env->DeleteGlobalRef(audioSinkGlobalRef_);
+    }
+    audioSinkGlobalRef_ = nullptr;
+    audioSinkWriteMethodId_ = nullptr;
+    audioSinkControlMethodId_ = nullptr;
+    audioSinkReady_.store(false);
 }
 
 bool NativePlayer::shouldDropRealtimePacket(const AVPacket *packet) {
@@ -4578,6 +4773,14 @@ void NativePlayer::resetStats() {
     audioWorkerConsumedSampleCount_.store(0);
     audioWorkerConsumedByteCount_.store(0);
     lastConsumedPcmPtsUs_.store(0);
+    audioSinkWriteCount_.store(0);
+    audioSinkWrittenByteCount_.store(0);
+    audioSinkWriteErrorCount_.store(0);
+    audioSinkLastErrorCode_.store(0);
+    lastAudioSinkWriteCostUs_.store(-1);
+    totalAudioSinkWriteCostUs_.store(0);
+    audioSinkWriteCostSampleCount_.store(0);
+    maxAudioSinkWriteCostUs_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);

@@ -26,6 +26,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.example.motro.databinding.ActivityMediaPlayerBinding;
 import com.example.motro.databinding.ViewMediaPlayerControlsBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
+import com.example.motro.ffmpeg.LiveAudioPcmSink;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -89,6 +90,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private volatile int surfaceHeight;
     private volatile boolean destroyed;
     private long playerHandle;
+    private LiveAudioPcmSink audioPcmSink;
     private long lastPlaybackInfoHandle;
     private long lastPlaybackInfoTimeMs;
     private long lastPlaybackInfoRenderedFrames;
@@ -926,6 +928,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 Log.d(TAG, "playerHandle=" + playerHandle);
                 if (playerHandle != 0) {
                     Log.d(TAG, "setPlayerEventListener=" + FFmpegNative.setPlayerEventListener(playerHandle, playerEventListener));
+                    audioPcmSink = new LiveAudioPcmSink();
+                    Log.d(TAG, "setAudioCallback=" + FFmpegNative.setAudioCallback(playerHandle, audioPcmSink));
                 }
             }
             return playerHandle;

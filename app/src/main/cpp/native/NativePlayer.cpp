@@ -58,6 +58,11 @@ constexpr AVSampleFormat kAudioPcmOutputFormat = AV_SAMPLE_FMT_S16;
 constexpr int kAudioSinkCmdPauseFlush = 1;
 constexpr int kAudioSinkCmdRelease = 2;
 
+// A5: AudioTrack playback-head clock / A-V sync tuning.
+constexpr int64_t kAudioClockStaleMs = 500;         // clock considered stale if not refreshed within this window
+constexpr int64_t kAudioMasterMaxWaitUs = 150000;   // bounded max wait for video to catch up to audio (150 ms)
+constexpr int kAudioMasterWaitPollMs = 2;           // poll interval while waiting for the audio clock
+
 // AGC tuning constants.
 constexpr int kAgcUpdateIntervalFrames = 5;
 constexpr int kAgcPixelStep = 4;
@@ -395,8 +400,9 @@ bool isValidPts(int64_t ptsUs) {
     return ptsUs != AV_NOPTS_VALUE && ptsUs >= 0;
 }
 
-bool isAudioPlaybackMasterAvailable(bool sourceHasAudio, bool audioEnabled, bool audioPlayable, int64_t audioClockUs) {
-    return sourceHasAudio && audioEnabled && audioPlayable && audioClockUs > 0;
+bool isAudioPlaybackMasterAvailable(bool sourceHasAudio, bool audioEnabled, bool audioPlayable,
+                                    bool audioPlaybackClockValid, bool audioClockStale) {
+    return sourceHasAudio && audioEnabled && audioPlayable && audioPlaybackClockValid && !audioClockStale;
 }
 
 bool isNetworkUrl(const std::string &url) {
@@ -1152,6 +1158,7 @@ std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
     jobject newRef = nullptr;
     jmethodID writeMethod = nullptr;
     jmethodID controlMethod = nullptr;
+    jmethodID headMethod = nullptr;
     if (callback != nullptr) {
         newRef = env->NewGlobalRef(callback);
         if (newRef == nullptr) {
@@ -1161,12 +1168,13 @@ std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
         if (sinkClass != nullptr) {
             writeMethod = env->GetMethodID(sinkClass, "onAudioPcm", "(Ljava/nio/ByteBuffer;IJ)I");
             controlMethod = env->GetMethodID(sinkClass, "onAudioControl", "(I)I");
+            headMethod = env->GetMethodID(sinkClass, "getPlaybackHeadFrames", "()I");
             if (env->ExceptionCheck()) {
                 env->ExceptionClear();
             }
             env->DeleteLocalRef(sinkClass);
         }
-        if (writeMethod == nullptr || controlMethod == nullptr) {
+        if (writeMethod == nullptr || controlMethod == nullptr || headMethod == nullptr) {
             env->DeleteGlobalRef(newRef);
             return jsonError(-1, "audio sink methods not found");
         }
@@ -1180,6 +1188,7 @@ std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
         audioSinkGlobalRef_ = newRef;
         audioSinkWriteMethodId_ = writeMethod;
         audioSinkControlMethodId_ = controlMethod;
+        audioSinkHeadMethodId_ = headMethod;
     }
 
     const bool callbackSet = newRef != nullptr;
@@ -1256,6 +1265,7 @@ std::string NativePlayer::enableAudio(bool enabled) {
         audioPcmQueue_.requestStop();
         sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
         stopAudioOutputWorker();
+        invalidateAudioClock();
         audioFlushRequested_.store(true);
         audioPlayError_.clear();
     } else {
@@ -1493,6 +1503,7 @@ std::string NativePlayer::stop() {
     audioPcmQueue_.requestStop();
     sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
     stopAudioOutputWorker();
+    invalidateAudioClock();
 
     if (remuxRecorder_.isRecording()) {
         LOGI("stopPlayer auto stop active recorder");
@@ -1826,10 +1837,16 @@ std::string NativePlayer::getStats() {
         << "\"audioEnabled\":" << (audioEnabled_.load() ? "true" : "false") << ","
         << "\"audioPlayable\":" << (audioPlayable_.load() ? "true" : "false") << ","
         // audioClockUs is LEGACY / PRE-PLAYBACK: it mirrors the last compressed
-        // audio packet PTS and is NOT a speaker playback clock. audioPlaybackClockValid
-        // stays false until Slice A5 derives the clock from the AudioTrack playback head.
+        // audio packet PTS and is NOT a speaker playback clock. The real audible
+        // clock is audioPlaybackClockUs (AudioTrack playback head).
         << "\"audioClockUs\":" << audioClockUs_.load() << ","
-        << "\"audioPlaybackClockValid\":false,"
+        << "\"audioPlaybackClockValid\":" << (audioPlaybackClockValid_.load() ? "true" : "false") << ","
+        << "\"audioPlaybackClockUs\":" << audioPlaybackClockUs_.load() << ","
+        << "\"audioPlaybackHeadFrames\":" << audioPlaybackHeadFrames_.load() << ","
+        << "\"audioClockGeneration\":" << audioClockGeneration_.load() << ","
+        << "\"audioClockResetCount\":" << audioClockResetCount_.load() << ","
+        << "\"audioClockStaleCount\":" << audioClockStaleCount_.load() << ","
+        << "\"audioVideoDiffUs\":" << audioVideoDiffUs_.load() << ","
         << "\"videoClockUs\":" << videoClockUs_.load() << ","
         << "\"wallClockUs\":" << wallClockUs_.load() << ","
         << "\"lastReadPacketTimeMs\":" << lastReadPacketTimeMs_.load() << ","
@@ -2821,7 +2838,10 @@ void NativePlayer::resetRealtimeClockForFormatDiscontinuity() {
 
 SyncMaster NativePlayer::effectiveSyncMaster(const PlayerOptions &options) const {
     if (options.syncMaster == SyncMaster::AUDIO) {
-        if (isAudioPlaybackMasterAvailable(sourceHasAudio_.load(), audioEnabled_.load(), audioPlayable_.load(), audioClockUs_.load())) {
+        const int64_t lastUpdate = audioClockLastUpdateMs_.load();
+        const bool stale = lastUpdate > 0 && (nowMs() - lastUpdate) > kAudioClockStaleMs;
+        if (isAudioPlaybackMasterAvailable(sourceHasAudio_.load(), audioEnabled_.load(), audioPlayable_.load(),
+                                           audioPlaybackClockValid_.load(), stale)) {
             return SyncMaster::AUDIO;
         }
         return SyncMaster::VIDEO;
@@ -2839,11 +2859,14 @@ bool NativePlayer::resolveMasterClockUs(const PlayerOptions &options, int64_t vi
     effectiveMaster = effectiveSyncMaster(options);
 
     if (effectiveMaster == SyncMaster::AUDIO) {
-        const int64_t audioClockUs = audioClockUs_.load();
-        if (audioClockUs <= 0) {
+        const int64_t audioClockUs = audioPlaybackClockUs_.load();
+        if (!audioPlaybackClockValid_.load() || audioClockUs <= 0) {
             return false;
         }
         masterClockUs = audioClockUs;
+        if (isValidPts(videoPtsUs)) {
+            audioVideoDiffUs_.store(videoPtsUs - audioClockUs);
+        }
         return true;
     }
 
@@ -3287,8 +3310,10 @@ void NativePlayer::audioOutputWorkerLoop() {
         audioWorkerConsumedSampleCount_.fetch_add(block.sampleCount);
         audioWorkerConsumedByteCount_.fetch_add(static_cast<int64_t>(block.data.size()));
         lastConsumedPcmPtsUs_.store(block.startPtsUs);
-        // A4: hand the owned PCM block to the JNI sink (AudioTrack.write).
+        // A5: publish the AudioTrack playback-head based clock (rebase on a new
+        // generation), then hand the block to the JNI sink (AudioTrack.write).
         if (env != nullptr && !block.data.empty()) {
+            updateAudioPlaybackClock(env, block);
             writeAudioPcmToSink(env, block);
         }
         block.data.clear();
@@ -3323,6 +3348,9 @@ void NativePlayer::stopAudioOutputWorker() {
 void NativePlayer::flushAudioPcmForDiscontinuity() {
     audioPcmQueue_.flush();
     audioQueueGeneration_.fetch_add(1);
+    // The AudioTrack playback-head base and media timeline are now invalid; the
+    // new source generation must re-anchor before audio becomes the master.
+    invalidateAudioClock();
     // Clear stale AudioTrack-buffered data too, so the new source generation
     // never plays old audio. onAudioPcm lazily resumes playback on next write.
     sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
@@ -3337,6 +3365,105 @@ void NativePlayer::recomputeAudioPlayable() {
                           && audioDecodeOpened_.load()
                           && audioSinkReady_.load();
     audioPlayable_.store(playable);
+}
+
+int32_t NativePlayer::queryAudioPlaybackHead(JNIEnv *env) {
+    if (env == nullptr) {
+        return -1;
+    }
+    jobject sinkLocal = nullptr;
+    jmethodID headMethod = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audioSinkMutex_);
+        if (audioSinkGlobalRef_ == nullptr || audioSinkHeadMethodId_ == nullptr) {
+            return -1;
+        }
+        sinkLocal = env->NewLocalRef(audioSinkGlobalRef_);
+        headMethod = audioSinkHeadMethodId_;
+    }
+    if (sinkLocal == nullptr) {
+        return -1;
+    }
+    const jint head = env->CallIntMethod(sinkLocal, headMethod);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(sinkLocal);
+        return -1;
+    }
+    env->DeleteLocalRef(sinkLocal);
+    return static_cast<int32_t>(head);
+}
+
+void NativePlayer::invalidateAudioClock() {
+    audioPlaybackClockValid_.store(false);
+}
+
+void NativePlayer::updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Block &block) {
+    const int32_t rawHead = queryAudioPlaybackHead(env);
+    if (rawHead < 0) {
+        if (audioPlaybackClockValid_.load()) {
+            audioPlaybackClockValid_.store(false);
+            audioClockStaleCount_.fetch_add(1);
+        }
+        return;
+    }
+    // Rebase on a new generation or when the clock is not yet valid.
+    const bool rebase = !audioPlaybackClockValid_.load()
+                        || block.generation != audioClockGeneration_.load();
+    if (rebase) {
+        if (block.startPtsUs <= 0) {
+            // No valid media PTS yet; cannot anchor the media timeline.
+            return;
+        }
+        audioClockGeneration_.store(block.generation);
+        audioClockBaseMediaPtsUs_.store(block.startPtsUs);
+        audioPlaybackHeadRaw32_.store(rawHead);
+        audioPlaybackHeadExtended64_.store(0);
+        audioClockResetCount_.fetch_add(1);
+    }
+    // Convert the raw 32-bit playback head into a monotonic 64-bit played-frame
+    // count. The uint32 subtraction handles the 32-bit wraparound.
+    const int32_t lastRaw = audioPlaybackHeadRaw32_.load();
+    const int64_t delta = static_cast<int32_t>(static_cast<uint32_t>(rawHead) - static_cast<uint32_t>(lastRaw));
+    audioPlaybackHeadExtended64_.fetch_add(delta);
+    audioPlaybackHeadRaw32_.store(rawHead);
+
+    const int64_t played = audioPlaybackHeadExtended64_.load();
+    const int64_t clockUs = audioClockBaseMediaPtsUs_.load() + played * 1000000 / kAudioPcmOutputSampleRate;
+    audioPlaybackHeadFrames_.store(played);
+    audioPlaybackClockUs_.store(clockUs);
+    audioPlaybackClockValid_.store(true);
+    audioClockLastUpdateMs_.store(nowMs());
+}
+
+void NativePlayer::waitForAudioMasterIfEarly(int64_t ptsUs) {
+    if (!isValidPts(ptsUs)) {
+        return;
+    }
+    PlayerOptions optionsSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        optionsSnapshot = playerOptions_;
+    }
+    if (effectiveSyncMaster(optionsSnapshot) != SyncMaster::AUDIO) {
+        return;
+    }
+    // Bounded wait: video is ahead of the audible audio clock; wait for it to
+    // catch up. Never block on a stale/invalid clock and always bound the wait.
+    const int64_t waitStartUs = steadyNowUs();
+    while (!stopRequested_.load()) {
+        if (!audioPlaybackClockValid_.load()) {
+            return;
+        }
+        const int64_t clockUs = audioPlaybackClockUs_.load();
+        if (ptsUs - clockUs <= 0) {
+            return;
+        }
+        if (steadyNowUs() - waitStartUs >= kAudioMasterMaxWaitUs) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kAudioMasterWaitPollMs));
+    }
 }
 
 bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &block) {
@@ -3387,6 +3514,9 @@ bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &
     if (exception || written < 0) {
         ++audioSinkWriteErrorCount_;
         audioSinkLastErrorCode_.store(exception ? -1 : written);
+        // AudioTrack write failure invalidates the playback clock; video must
+        // fall back to its own master until a later write re-anchors the clock.
+        invalidateAudioClock();
         return false;
     }
     audioSinkWriteCount_.fetch_add(1);
@@ -3435,6 +3565,7 @@ void NativePlayer::deleteAudioSinkGlobalRef(JNIEnv *env) {
     audioSinkGlobalRef_ = nullptr;
     audioSinkWriteMethodId_ = nullptr;
     audioSinkControlMethodId_ = nullptr;
+    audioSinkHeadMethodId_ = nullptr;
     audioSinkReady_.store(false);
 }
 
@@ -4246,6 +4377,11 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
     }
 
     const bool drop = shouldDropRealtimeFrame(ptsUs);
+    if (!drop) {
+        // Video follows audio: wait (bounded) if this frame is ahead of the
+        // audible clock before releasing it to the surface.
+        waitForAudioMasterIfEarly(ptsUs);
+    }
     const int64_t releaseStartUs = steadyNowUs();
     const int releaseResult = av_mediacodec_release_buffer(buffer, drop ? 0 : 1);
     const int64_t releaseCostUs = steadyNowUs() - releaseStartUs;
@@ -4544,6 +4680,10 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         return true;
     }
 
+    // Video follows audio: wait (bounded) if this frame is ahead of the audible
+    // clock before rendering it.
+    waitForAudioMasterIfEarly(ptsUs);
+
     PlayerOptions optionsSnapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -4781,6 +4921,17 @@ void NativePlayer::resetStats() {
     totalAudioSinkWriteCostUs_.store(0);
     audioSinkWriteCostSampleCount_.store(0);
     maxAudioSinkWriteCostUs_.store(0);
+    audioPlaybackClockUs_.store(0);
+    audioPlaybackClockValid_.store(false);
+    audioPlaybackHeadFrames_.store(0);
+    audioClockGeneration_.store(0);
+    audioClockBaseMediaPtsUs_.store(0);
+    audioPlaybackHeadRaw32_.store(0);
+    audioPlaybackHeadExtended64_.store(0);
+    audioClockLastUpdateMs_.store(0);
+    audioClockResetCount_.store(0);
+    audioClockStaleCount_.store(0);
+    audioVideoDiffUs_.store(0);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);

@@ -80,6 +80,19 @@ public final class LiveAudioPcmSink {
         }
     }
 
+    /**
+     * Called from the native audio output worker thread. Returns the raw 32-bit
+     * AudioTrack playback-head frame position (0 when the track is not created).
+     * The native side converts this into a monotonic 64-bit played-frame count.
+     */
+    public int getPlaybackHeadFrames() {
+        AudioTrack track = audioTrack;
+        if (track == null) {
+            return 0;
+        }
+        return track.getPlaybackHeadPosition();
+    }
+
     private AudioTrack ensureStarted() {
         if (audioTrack == null) {
             audioTrack = createTrack();

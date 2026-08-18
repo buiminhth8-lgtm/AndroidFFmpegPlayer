@@ -190,6 +190,10 @@ private:
     void sendAudioSinkControl(int command, const char *commandName);
     void deleteAudioSinkGlobalRef(JNIEnv *env);
     void recomputeAudioPlayable();
+    void updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Block &block);
+    int32_t queryAudioPlaybackHead(JNIEnv *env);
+    void invalidateAudioClock();
+    void waitForAudioMasterIfEarly(int64_t ptsUs);
     void resetRealtimeClock();
     void saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs);
     void clearLastFrame();
@@ -456,6 +460,7 @@ private:
     jobject audioSinkGlobalRef_ = nullptr;
     jmethodID audioSinkWriteMethodId_ = nullptr;
     jmethodID audioSinkControlMethodId_ = nullptr;
+    jmethodID audioSinkHeadMethodId_ = nullptr;
     std::atomic<bool> audioSinkReady_{false};
     std::atomic<int64_t> audioSinkWriteCount_{0};
     std::atomic<int64_t> audioSinkWrittenByteCount_{0};
@@ -465,6 +470,18 @@ private:
     std::atomic<int64_t> totalAudioSinkWriteCostUs_{0};
     std::atomic<int64_t> audioSinkWriteCostSampleCount_{0};
     std::atomic<int64_t> maxAudioSinkWriteCostUs_{0};
+    // A5: AudioTrack playback-head based clock (video follows audio).
+    std::atomic<int64_t> audioPlaybackClockUs_{0};
+    std::atomic<bool> audioPlaybackClockValid_{false};
+    std::atomic<int64_t> audioPlaybackHeadFrames_{0};
+    std::atomic<int64_t> audioClockGeneration_{0};
+    std::atomic<int64_t> audioClockBaseMediaPtsUs_{0};
+    std::atomic<int32_t> audioPlaybackHeadRaw32_{0};
+    std::atomic<int64_t> audioPlaybackHeadExtended64_{0};
+    std::atomic<int64_t> audioClockLastUpdateMs_{0};
+    std::atomic<int64_t> audioClockResetCount_{0};
+    std::atomic<int64_t> audioClockStaleCount_{0};
+    std::atomic<int64_t> audioVideoDiffUs_{0};
     std::atomic<bool> reconnectEnabled_{true};
     std::atomic<bool> reconnecting_{false};
     std::atomic<bool> infiniteReconnect_{true};

@@ -48,10 +48,12 @@ std::string escapeJson(const std::string &value) {
     return out.str();
 }
 
-std::string jsonError(int errorCode, const std::string &message) {
+std::string jsonError(const std::string &errorCode, const std::string &message) {
     std::ostringstream out;
-    out << "{\"success\":false,\"errorCode\":" << errorCode
-        << ",\"errorMessage\":\"" << escapeJson(message) << "\"}";
+    out << "{\"success\":false,\"errorCode\":\"" << escapeJson(errorCode) << "\","
+        << "\"message\":\"" << escapeJson(message) << "\","
+        << "\"errorMessage\":\"" << escapeJson(message) << "\","
+        << "\"snapshotCaptureMode\":\"native_rgba\"}";
     return out.str();
 }
 
@@ -62,7 +64,9 @@ std::string jsonSuccess(const std::string &outputPath, int width, int height, in
         << "\"width\":" << width << ","
         << "\"height\":" << height << ","
         << "\"ptsUs\":" << ptsUs << ","
-        << "\"format\":\"" << format << "\"}";
+        << "\"format\":\"" << format << "\","
+        << "\"source\":\"native_rgba\","
+        << "\"snapshotCaptureMode\":\"native_rgba\"}";
     return out.str();
 }
 
@@ -137,11 +141,11 @@ void appendChunk(std::vector<uint8_t> &png, const char type[4], const std::vecto
 std::string writeFile(const std::string &path, const std::vector<uint8_t> &bytes) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
-        return jsonError(-1, "failed to open snapshot output file");
+        return jsonError("SNAPSHOT_IO_ERROR", "failed to open snapshot output file");
     }
     file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!file.good()) {
-        return jsonError(-1, "failed to write snapshot output file");
+        return jsonError("SNAPSHOT_IO_ERROR", "failed to write snapshot output file");
     }
     return std::string();
 }
@@ -211,12 +215,12 @@ std::string saveJpeg(const std::string &outputPath,
                      int64_t ptsUs) {
     const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (codec == nullptr) {
-        return jsonError(-1, "FFmpeg mjpeg encoder is not available; use .png for snapshot");
+        return jsonError("SNAPSHOT_UNSUPPORTED", "FFmpeg mjpeg encoder is not available; use .png for snapshot");
     }
 
     AVCodecContext *codecContext = avcodec_alloc_context3(codec);
     if (codecContext == nullptr) {
-        return jsonError(-1, "avcodec_alloc_context3 failed for mjpeg encoder");
+        return jsonError("SNAPSHOT_IO_ERROR", "avcodec_alloc_context3 failed for mjpeg encoder");
     }
     codecContext->width = width;
     codecContext->height = height;
@@ -227,7 +231,7 @@ std::string saveJpeg(const std::string &outputPath,
     int result = avcodec_open2(codecContext, codec, nullptr);
     if (result < 0) {
         avcodec_free_context(&codecContext);
-        return jsonError(result, "avcodec_open2 failed for mjpeg encoder");
+        return jsonError("SNAPSHOT_IO_ERROR", "avcodec_open2 failed for mjpeg encoder");
     }
 
     AVFrame *frame = av_frame_alloc();
@@ -236,7 +240,7 @@ std::string saveJpeg(const std::string &outputPath,
         av_frame_free(&frame);
         av_packet_free(&packet);
         avcodec_free_context(&codecContext);
-        return jsonError(-1, "failed to allocate mjpeg frame/packet");
+        return jsonError("SNAPSHOT_IO_ERROR", "failed to allocate mjpeg frame/packet");
     }
 
     frame->format = codecContext->pix_fmt;
@@ -247,7 +251,7 @@ std::string saveJpeg(const std::string &outputPath,
         av_frame_free(&frame);
         av_packet_free(&packet);
         avcodec_free_context(&codecContext);
-        return jsonError(result, "av_frame_get_buffer failed for mjpeg snapshot");
+        return jsonError("SNAPSHOT_IO_ERROR", "av_frame_get_buffer failed for mjpeg snapshot");
     }
 
     SwsContext *sws = sws_getContext(width, height, AV_PIX_FMT_RGBA,
@@ -257,7 +261,7 @@ std::string saveJpeg(const std::string &outputPath,
         av_frame_free(&frame);
         av_packet_free(&packet);
         avcodec_free_context(&codecContext);
-        return jsonError(-1, "sws_getContext failed for jpg snapshot");
+        return jsonError("SNAPSHOT_IO_ERROR", "sws_getContext failed for jpg snapshot");
     }
 
     const uint8_t *srcData[] = {rgba.data(), nullptr, nullptr, nullptr};
@@ -274,7 +278,7 @@ std::string saveJpeg(const std::string &outputPath,
         av_frame_free(&frame);
         av_packet_free(&packet);
         avcodec_free_context(&codecContext);
-        return jsonError(result, "failed to encode jpg snapshot");
+        return jsonError("SNAPSHOT_IO_ERROR", "failed to encode jpg snapshot");
     }
 
     std::vector<uint8_t> bytes(packet->data, packet->data + packet->size);
@@ -302,14 +306,14 @@ std::string SnapshotManager::saveRgba(const std::string &outputPath,
     LOGI("takePlayerSnapshot outputPath=%s", outputPath.c_str());
 
     if (outputPath.empty()) {
-        return jsonError(-1, "outputPath is empty");
+        return jsonError("SNAPSHOT_IO_ERROR", "outputPath is empty");
     }
     const std::string parent = parentDirectory(outputPath);
     if (!directoryExists(parent)) {
-        return jsonError(-1, "outputPath parent directory does not exist: " + parent);
+        return jsonError("SNAPSHOT_IO_ERROR", "outputPath parent directory does not exist: " + parent);
     }
     if (width <= 0 || height <= 0 || stride < width * 4 || rgba.empty()) {
-        return jsonError(-1, "invalid snapshot frame");
+        return jsonError("SNAPSHOT_NO_FRAME", "invalid snapshot frame");
     }
 
     if (endsWith(outputPath, ".png")) {
@@ -318,5 +322,5 @@ std::string SnapshotManager::saveRgba(const std::string &outputPath,
     if (endsWith(outputPath, ".jpg") || endsWith(outputPath, ".jpeg")) {
         return saveJpeg(outputPath, rgba, width, height, stride, ptsUs);
     }
-    return jsonError(-1, "unsupported snapshot format; use .png or .jpg");
+    return jsonError("SNAPSHOT_UNSUPPORTED", "unsupported snapshot format; use .png or .jpg");
 }

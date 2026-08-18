@@ -19,8 +19,9 @@ struct ANativeWindow;
 // Input: AV_PIX_FMT_NV12 (Y plane + interleaved UV), stride-aware.
 // Output: current SurfaceView via EGL; no sws_scale, no RGBA CPU conversion.
 //
-// Lifecycle: setSurface stores the SurfaceView window; renderNv12 lazily creates
-// EGL + program + textures on the calling (playback) thread; release tears down.
+// Lifecycle: set/clear only publish the latest Surface request. The playback
+// thread applies it from syncSurface/renderNv12, owns EGL/GL, and preserves the
+// context/program/textures across a transient EGLSurface detach.
 class NativeNv12GlRenderer {
 public:
     NativeNv12GlRenderer();
@@ -32,7 +33,13 @@ public:
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     void clearSurface();
     void release();
+    bool syncSurface();
     bool isReady() const;
+    int64_t getEglContextCreateCount() const;
+    int64_t getEglSurfaceCreateCount() const;
+    int64_t getEglOwnerThreadId() const;
+    uint64_t getSurfaceGeneration() const;
+    uint64_t getAppliedSurfaceGeneration() const;
     // Actual thermal mode applied on the last successful render (0 original, 1 white_hot, 2 ironbow).
     int getLastAppliedThermalMode() const;
 
@@ -46,6 +53,13 @@ public:
                             int thermalMode, float gamma, float blackPoint, float whitePoint);
 
 private:
+    enum class PendingSurfaceAction {
+        NONE,
+        ATTACH,
+        DETACH
+    };
+
+    void applyPendingSurfaceLocked();
     bool ensureGlLocked(std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
     bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
@@ -55,6 +69,12 @@ private:
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    ANativeWindow *pendingWindow_ = nullptr;
+    PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    uint64_t surfaceGeneration_ = 0;
+    uint64_t appliedSurfaceGeneration_ = 0;
+    int pendingSurfaceWidth_ = 0;
+    int pendingSurfaceHeight_ = 0;
     EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
     EGLSurface eglSurface_ = EGL_NO_SURFACE;
     EGLContext eglContext_ = EGL_NO_CONTEXT;
@@ -85,6 +105,9 @@ private:
     GLuint ironbowTexture_ = 0;
     GLuint textures_[2] = {0, 0};
     std::atomic<int> lastAppliedThermalMode_{0};
+    std::atomic<int64_t> eglContextCreateCount_{0};
+    std::atomic<int64_t> eglSurfaceCreateCount_{0};
+    std::atomic<int64_t> eglOwnerThreadId_{0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;
     int frameWidth_ = 0;

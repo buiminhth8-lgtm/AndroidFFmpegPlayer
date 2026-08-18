@@ -17,7 +17,7 @@ struct ANativeWindow;
 // MediaCodec decoder SurfaceTexture (GL_TEXTURE_EXTERNAL_OES) consumer.
 //
 // Lifecycle:
-//   setSurface(...)              - store the SurfaceView ANativeWindow (any thread)
+//   setSurface(...)              - publish latest SurfaceView request (any thread)
 //   prepareForOesDecode(env,...) - create EGL + OES texture + SurfaceTexture +
 //                                  decoder Surface + frame listener (prepare thread)
 //   renderOesFrame(env)          - updateTexImage + draw + swap (EGL owner / playback thread)
@@ -38,7 +38,7 @@ public:
     NativeOesRenderer &operator=(const NativeOesRenderer &) = delete;
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
-    bool prepareForOesDecode(JNIEnv *env, intptr_t handle, std::string &errorMessage);
+    bool prepareForOesDecode(JNIEnv *env, int64_t handle, std::string &errorMessage);
     // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
     // whitePoint apply to white_hot and ironbow only (window in luminance 0..1 domain).
     // agcEnabled selects the OES AGC effective window when valid; runAgc triggers a
@@ -46,8 +46,10 @@ public:
     bool renderOesFrame(JNIEnv *env, int frameWidth, int frameHeight, int thermalMode,
                         float gamma, float blackPoint, float whitePoint,
                         bool agcEnabled, bool runAgc);
+    void clearSurface();
     void release();
     bool isPrepared() const;
+    bool hasSurface() const;
     jobject getDecoderSurfaceGlobalRef() const;
     int64_t getSurfaceRecreateCount() const;
     int64_t getContextRecreateCount() const;
@@ -61,6 +63,13 @@ public:
     int64_t getAgcReadbackErrorCount() const;
 
 private:
+    enum class PendingSurfaceAction {
+        NONE,
+        ATTACH,
+        DETACH
+    };
+
+    bool applyPendingSurfaceLocked(JNIEnv *env);
     bool ensureGlLocked(JNIEnv *env, std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
     bool ensureAgcGlLocked(std::string &errorMessage);
@@ -73,6 +82,12 @@ private:
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    ANativeWindow *pendingWindow_ = nullptr;
+    PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    uint64_t surfaceGeneration_ = 0;
+    uint64_t appliedSurfaceGeneration_ = 0;
+    int pendingSurfaceWidth_ = 0;
+    int pendingSurfaceHeight_ = 0;
     EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
     EGLSurface eglSurface_ = EGL_NO_SURFACE;
     EGLContext eglContext_ = EGL_NO_CONTEXT;

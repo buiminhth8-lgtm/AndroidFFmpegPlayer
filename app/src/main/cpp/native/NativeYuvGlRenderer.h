@@ -7,6 +7,7 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -36,11 +37,27 @@ public:
                             const uint8_t *uData, int uStride,
                             const uint8_t *vData, int vStride,
                             int width, int height, int thermalMode, const ThermalRenderParams &params);
+    void clearSurface();
     void release();
+    bool syncSurface();
     bool hasSurface() const;
+    int64_t getEglContextCreateCount() const;
+    int64_t getEglSurfaceCreateCount() const;
+    int64_t getEglOwnerThreadId() const;
+    uint64_t getSurfaceGeneration() const;
+    uint64_t getAppliedSurfaceGeneration() const;
 
 private:
+    enum class PendingSurfaceAction {
+        NONE,
+        ATTACH,
+        DETACH
+    };
+
+    void applyPendingSurfaceLocked();
     bool ensureGlLocked(std::string &errorMessage);
+    bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    void releaseEglSurfaceLocked();
     void releaseGlLocked();
     bool compileProgramLocked(std::string &errorMessage);
     const uint8_t *compactPlane(const uint8_t *src, int srcStride, int width, int height, std::vector<uint8_t> &buffer);
@@ -59,6 +76,12 @@ private:
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    ANativeWindow *pendingWindow_ = nullptr;
+    PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    uint64_t surfaceGeneration_ = 0;
+    uint64_t appliedSurfaceGeneration_ = 0;
+    int pendingSurfaceWidth_ = 0;
+    int pendingSurfaceHeight_ = 0;
     EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
     EGLSurface eglSurface_ = EGL_NO_SURFACE;
     EGLContext eglContext_ = EGL_NO_CONTEXT;
@@ -71,6 +94,9 @@ private:
     GLint ironbowPaletteLocation_ = -1;
     GLuint ironbowTexture_ = 0;
     GLuint textures_[3] = {0, 0, 0};
+    std::atomic<int64_t> eglContextCreateCount_{0};
+    std::atomic<int64_t> eglSurfaceCreateCount_{0};
+    std::atomic<int64_t> eglOwnerThreadId_{0};
     int surfaceWidth_ = 0;
     int surfaceHeight_ = 0;
     std::vector<uint8_t> compactY_;

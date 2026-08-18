@@ -48,6 +48,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
     private static final float MIN_WINDOW_SPAN = 0.01f;
+    private static final String SNAPSHOT_REQUIRES_SURFACE_CAPTURE = "SNAPSHOT_REQUIRES_SURFACE_CAPTURE";
     public static final String EXTRA_URL = "com.example.motro.extra.URL";
     public static final String EXTRA_HARDWARE_DECODE = "com.example.motro.extra.HARDWARE_DECODE";
     public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
@@ -60,6 +61,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean playbackInfoRequestInFlight = new AtomicBoolean(false);
+    private final AtomicInteger surfaceGeneration = new AtomicInteger();
     private final Runnable playbackInfoRunnable = new Runnable() {
         @Override
         public void run() {
@@ -211,6 +213,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
             @Override
             public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+                surfaceGeneration.incrementAndGet();
                 surfaceReady = false;
                 surfaceWidth = 0;
                 surfaceHeight = 0;
@@ -225,6 +228,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void updateSurfaceFromHolder(@NonNull SurfaceHolder holder, int width, int height) {
         Surface surface = holder.getSurface();
+        surfaceGeneration.incrementAndGet();
         currentSurface = surface;
         surfaceReady = surface != null && surface.isValid();
         surfaceWidth = width;
@@ -261,6 +265,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + "\nbuildConfig=" + FFmpegNative.getFFmpegBuildConfig()
                         + "\ndecoders=" + FFmpegNative.getAvailableDecoders()
                         + "\nmediaCodec=" + FFmpegNative.getMediaCodecInfo()));
+        findViewById(R.id.infoButton).setOnLongClickListener(v -> {
+            runNative("Player Lifetime Stress", () -> FFmpegNative.runDebugCommand(
+                    new String[]{"-player-lifetime-stress"}));
+            return true;
+        });
 
         findViewById(R.id.probeButton).setOnClickListener(v -> runNative("Probe", () ->
                 FFmpegNative.probe(requireUrl(), readTimeoutMs())));
@@ -699,8 +708,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
             long reconnectAttempt = stats.optLong("reconnectAttempt", stats.optLong("reconnectAttemptCount", 0));
             String reconnectError = stats.optString("reconnectLastError", stats.optString("lastReconnectError", ""));
             String mode = stats.optString("renderMode", "unknown");
-            String renderInputType = stats.optString("renderInputType", "none");
             String codec = stats.optString("actualDecoderName", stats.optString("videoCodecName", ""));
+            String decodeBackend = stats.optString("decodeBackend", "unknown");
+            String frameOutputType = stats.optString("frameOutputType", "unknown");
+            String renderer = stats.optString("renderer", "unknown");
+            String requestedRenderer = stats.optString("requestedRenderer", "unknown");
+            boolean renderFallbackUsed = stats.optBoolean("renderFallbackUsed", false);
+            boolean decoderFallbackUsed = stats.optBoolean("hardwareDecodeFallbackUsed", false);
+            String renderFallbackReason = stats.optString("renderFallbackReason", "");
             String frameFormat = stats.optString("frameFormat", "");
             long dropped = stats.optLong("droppedVideoFrameCount", 0);
             long videoBitRate = stats.optLong("videoBitRate", 0);
@@ -719,8 +734,39 @@ public class MediaPlayerActivity extends AppCompatActivity {
             int videoHeight = stats.optInt("videoHeight", 0);
             int frameYStride = stats.optInt("frameYStride", 0);
             String frameColorRange = stats.optString("frameColorRange", "unknown");
-            long yuvGlRendered = stats.optLong("yuvGlRenderedFrameCount", 0);
-            long yuvGlFallback = stats.optLong("yuvGlFallbackFrameCount", 0);
+            long rendererFrames;
+            long rendererFallbackFrames;
+            switch (renderer) {
+                case "nv12_gl":
+                    rendererFrames = stats.optLong("nv12GlRenderedFrameCount", 0);
+                    rendererFallbackFrames = stats.optLong("nv12GlFallbackFrameCount", 0);
+                    break;
+                case "yuv_gl":
+                    rendererFrames = stats.optLong("yuvGlRenderedFrameCount", 0);
+                    rendererFallbackFrames = stats.optLong("yuvGlFallbackFrameCount", 0);
+                    break;
+                case "oes_gl":
+                    rendererFrames = stats.optLong("oesFrameRenderedCount", 0);
+                    rendererFallbackFrames = 0;
+                    break;
+                case "direct_surface":
+                    rendererFrames = stats.optLong("hardwareRenderedFrameCount", 0);
+                    rendererFallbackFrames = 0;
+                    break;
+                case "rgba_nativewindow":
+                    rendererFrames = stats.optLong("softwareRenderedFrameCount", 0);
+                    rendererFallbackFrames = "nv12_gl".equals(requestedRenderer)
+                            ? stats.optLong("nv12GlFallbackFrameCount", 0)
+                            : stats.optLong("yuvGlFallbackFrameCount", 0);
+                    break;
+                default:
+                    rendererFrames = 0;
+                    rendererFallbackFrames = 0;
+                    break;
+            }
+            String fallbackDisplay = renderFallbackUsed
+                    ? "render:" + (TextUtils.isEmpty(renderFallbackReason) ? "yes" : renderFallbackReason)
+                    : (decoderFallbackUsed ? "decoder" : "none");
             String resolution = videoWidth > 0 && videoHeight > 0
                     ? videoWidth + "x" + videoHeight
                     : "--";
@@ -797,9 +843,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
-                            + " | " + mode
-                            + " | " + renderInputType
-                            + " | " + codec
+                            + " | decoder=" + codec + " (" + decodeBackend + ")"
+                            + "\noutput=" + frameOutputType
+                            + " | renderer=" + renderer
+                            + " | requested=" + requestedRenderer
                             + "\n" + resolution
                             + " | " + frameFormat
                             + " | Y stride=" + frameYStride
@@ -810,8 +857,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + "\nbitrate " + formatKbps(videoKbps)
                             + "  transfer " + formatKbPerSec(transferKbPerSec)
                             + "  nominal " + nominalBitrate
-                            + "\nyuv-gl rendered=" + yuvGlRendered
-                            + " fallback=" + yuvGlFallback
+                            + "\nrenderer frames=" + rendererFrames
+                            + " fallback frames=" + rendererFallbackFrames
+                            + " | fallback=" + fallbackDisplay
                             + "  packets " + stats.optLong("readPacketCount", 0)
                             + "  frames " + renderedFrames
                             + "\nreconnect attempt=" + reconnectAttempt
@@ -1071,46 +1119,109 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private String takePlayerSnapshotCompat(long handle, String outputPath) throws Exception {
         String nativeResult = FFmpegNative.takePlayerSnapshot(handle, outputPath);
-        if (nativeResult != null && nativeResult.contains("\"success\":true")) {
+        final JSONObject nativeSnapshot;
+        try {
+            nativeSnapshot = new JSONObject(nativeResult == null ? "" : nativeResult);
+        } catch (Throwable parseError) {
+            return snapshotError(
+                    "SNAPSHOT_PROTOCOL_ERROR",
+                    "Native snapshot returned invalid JSON",
+                    nativeResult,
+                    null);
+        }
+        if (nativeSnapshot.optBoolean("success", false)) {
+            Log.i(TAG, "snapshot route=native_rgba");
             return nativeResult;
         }
-        if (nativeResult == null
-                || !nativeResult.contains("Snapshot is not supported")) {
+        String errorCode = nativeSnapshot.optString("errorCode", "");
+        if (!SNAPSHOT_REQUIRES_SURFACE_CAPTURE.equals(errorCode)) {
             return nativeResult;
         }
-        return takeSurfaceSnapshotWithPixelCopy(outputPath, nativeResult);
+        Log.i(TAG, "snapshot route=surface_pixelcopy");
+        return takeSurfaceSnapshotWithPixelCopy(handle, outputPath, nativeResult);
     }
 
-    private String takeSurfaceSnapshotWithPixelCopy(String outputPath, String nativeResult) throws Exception {
-        Surface surface = currentSurface;
-        if (!surfaceReady || surface == null || !surface.isValid()) {
-            return jsonError("PixelCopy snapshot failed: surface is not ready")
-                    + "\nnativeSnapshot=" + nativeResult;
+    private String takeSurfaceSnapshotWithPixelCopy(long handle,
+                                                    String outputPath,
+                                                    String nativeResult) throws Exception {
+        if (destroyed || handle == 0 || handle != getPlayerHandle()) {
+            return snapshotError(
+                    "SNAPSHOT_PLAYER_RELEASED",
+                    "PixelCopy snapshot cancelled because the player was released",
+                    nativeResult,
+                    null);
         }
+        SurfaceHolder holder = binding.playerPreviewView.getHolder();
+        Surface surface = holder == null ? null : holder.getSurface();
+        if (!surfaceReady || surface == null || !surface.isValid()) {
+            return snapshotError(
+                    "SNAPSHOT_NO_SURFACE",
+                    "PixelCopy snapshot failed: surface is not ready",
+                    nativeResult,
+                    null);
+        }
+        int targetSurfaceGeneration = surfaceGeneration.get();
         int width = surfaceWidth;
         int height = surfaceHeight;
         if (width <= 0 || height <= 0) {
-            return jsonError("PixelCopy snapshot failed: surface size is not ready")
-                    + "\nnativeSnapshot=" + nativeResult;
+            return snapshotError(
+                    "SNAPSHOT_NO_SURFACE",
+                    "PixelCopy snapshot failed: surface size is not ready",
+                    nativeResult,
+                    null);
         }
 
         Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
         CountDownLatch latch = new CountDownLatch(1);
         AtomicInteger copyResult = new AtomicInteger(PixelCopy.ERROR_UNKNOWN);
-        mainHandler.post(() -> PixelCopy.request(surface, bitmap, result -> {
-            copyResult.set(result);
-            latch.countDown();
-        }, mainHandler));
+        mainHandler.post(() -> {
+            try {
+                PixelCopy.request(surface, bitmap, result -> {
+                    copyResult.set(result);
+                    latch.countDown();
+                }, mainHandler);
+            } catch (Throwable requestError) {
+                copyResult.set(PixelCopy.ERROR_SOURCE_INVALID);
+                latch.countDown();
+            }
+        });
 
         if (!latch.await(1500, TimeUnit.MILLISECONDS)) {
-            bitmap.recycle();
-            return jsonError("PixelCopy snapshot timed out")
-                    + "\nnativeSnapshot=" + nativeResult;
+            // PixelCopy can still own the destination after this timeout. Do
+            // not recycle it while the asynchronous copy may still complete.
+            return snapshotError(
+                    "SNAPSHOT_PIXELCOPY_ERROR",
+                    "PixelCopy snapshot timed out",
+                    nativeResult,
+                    PixelCopy.ERROR_TIMEOUT);
         }
-        if (copyResult.get() != PixelCopy.SUCCESS) {
+        int result = copyResult.get();
+        if (result != PixelCopy.SUCCESS) {
             bitmap.recycle();
-            return jsonError("PixelCopy snapshot failed result=" + copyResult.get())
-                    + "\nnativeSnapshot=" + nativeResult;
+            return snapshotError(
+                    pixelCopyErrorCode(result),
+                    "PixelCopy snapshot failed result=" + result,
+                    nativeResult,
+                    result);
+        }
+        if (destroyed || handle != getPlayerHandle()) {
+            bitmap.recycle();
+            return snapshotError(
+                    "SNAPSHOT_PLAYER_RELEASED",
+                    "PixelCopy completed after the player was released",
+                    nativeResult,
+                    result);
+        }
+        if (targetSurfaceGeneration != surfaceGeneration.get()
+                || currentSurface != surface
+                || !surfaceReady
+                || !surface.isValid()) {
+            bitmap.recycle();
+            return snapshotError(
+                    "SNAPSHOT_NO_SURFACE",
+                    "PixelCopy completed after the video surface changed",
+                    nativeResult,
+                    result);
         }
 
         File outputFile = new File(outputPath);
@@ -1119,10 +1230,18 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 : Bitmap.CompressFormat.PNG;
         try (OutputStream output = new FileOutputStream(outputFile)) {
             if (!bitmap.compress(format, 95, output)) {
-                bitmap.recycle();
-                return jsonError("PixelCopy snapshot encode failed")
-                        + "\nnativeSnapshot=" + nativeResult;
+                return snapshotError(
+                        "SNAPSHOT_IO_ERROR",
+                        "PixelCopy snapshot encode failed",
+                        nativeResult,
+                        result);
             }
+        } catch (Throwable saveError) {
+            return snapshotError(
+                    "SNAPSHOT_IO_ERROR",
+                    "PixelCopy snapshot save failed: " + saveError.getMessage(),
+                    nativeResult,
+                    result);
         } finally {
             bitmap.recycle();
         }
@@ -1134,7 +1253,37 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 + "\"height\":" + height + ","
                 + "\"format\":\"" + (format == Bitmap.CompressFormat.JPEG ? "jpg" : "png") + "\","
                 + "\"source\":\"pixelcopy\","
+                + "\"snapshotCaptureMode\":\"surface_pixelcopy\","
                 + "\"nativeSnapshot\":\"" + escapeJson(nativeResult) + "\"}";
+    }
+
+    private String pixelCopyErrorCode(int result) {
+        if (result == PixelCopy.ERROR_SOURCE_NO_DATA) {
+            return "SNAPSHOT_NO_FRAME";
+        }
+        if (result == PixelCopy.ERROR_SOURCE_INVALID) {
+            return "SNAPSHOT_NO_SURFACE";
+        }
+        return "SNAPSHOT_PIXELCOPY_ERROR";
+    }
+
+    private String snapshotError(String errorCode,
+                                 String message,
+                                 String nativeResult,
+                                 Integer pixelCopyResult) {
+        StringBuilder out = new StringBuilder();
+        out.append("{\"success\":false,")
+                .append("\"errorCode\":\"").append(escapeJson(errorCode)).append("\",")
+                .append("\"message\":\"").append(escapeJson(message)).append("\",")
+                .append("\"errorMessage\":\"").append(escapeJson(message)).append("\",")
+                .append("\"snapshotCaptureMode\":\"surface_pixelcopy\"");
+        if (pixelCopyResult != null) {
+            out.append(",\"pixelCopyResult\":").append(pixelCopyResult);
+        }
+        if (nativeResult != null) {
+            out.append(",\"nativeSnapshot\":\"").append(escapeJson(nativeResult)).append("\"");
+        }
+        return out.append('}').toString();
     }
 
     private boolean isJpegPath(String path) {
@@ -1158,6 +1307,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void clearSurfaceReferenceOnly() {
+        surfaceGeneration.incrementAndGet();
         currentSurface = null;
         surfaceReady = false;
         surfaceWidth = 0;

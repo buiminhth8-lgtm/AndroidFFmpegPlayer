@@ -45,6 +45,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private static final String TAG = "FFmpegPlayer";
     private static final String TAG_STATS = "FFmpegPlayerStats";
+    private static final String TAG_AUDIO_LIFECYCLE = "FFmpegAudioLifecycle";
     private static final String TAG_EVENT = "FFmpegPlayerEvent";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
@@ -872,6 +873,29 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + windowLine);
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
+                Log.d(TAG_AUDIO_LIFECYCLE,
+                        "handle=" + handle
+                                + " player=" + playerState
+                                + " audio=" + stats.optString("audioLifecycleState", "unknown")
+                                + " enabled=" + stats.optBoolean("audioEnabled", false)
+                                + " source=" + stats.optBoolean("sourceHasAudio", false)
+                                + " playable=" + stats.optBoolean("audioPlayable", false)
+                                + " worker=" + stats.optBoolean("audioWorkerRunning", false)
+                                + " sink=" + stats.optBoolean("audioSinkReady", false)
+                                + " clock=" + stats.optBoolean("audioPlaybackClockValid", false)
+                                + " generation=" + stats.optLong("audioGeneration", 0)
+                                + " flush=" + stats.optLong("audioQueueFlushCount", 0)
+                                + " start/join=" + stats.optLong("audioWorkerStartCount", 0)
+                                + "/" + stats.optLong("audioWorkerJoinCount", 0)
+                                + " restart=" + stats.optLong("audioSinkRestartCount", 0)
+                                + " reconnect=" + stats.optLong("audioReconnectRecoveryCount", 0)
+                                + " stale=" + stats.optLong("audioWorkerStaleBlockCount", 0)
+                                + " cancel=" + stats.optLong("audioSinkControlledCancelCount", 0)
+                                + " sinkError=" + stats.optLong("audioSinkWriteErrorCount", 0)
+                                + " queueUs=" + stats.optLong("audioQueueDurationUs", 0)
+                                + " master=" + stats.optString("effectiveSyncMaster", "unknown")
+                                + " recording=" + stats.optBoolean("recording", false)
+                                + " recordAudio=" + stats.optLong("recordAudioPacketCount", 0));
             }
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");

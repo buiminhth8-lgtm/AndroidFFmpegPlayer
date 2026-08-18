@@ -186,8 +186,11 @@ private:
     void startAudioOutputWorker();
     void stopAudioOutputWorker();
     void flushAudioPcmForDiscontinuity();
+    void resetAudioDecoderForDiscontinuity(const char *reason);
+    void startAudioSinkForCurrentGeneration();
+    void degradeAudioPlayback();
     bool writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &block);
-    void sendAudioSinkControl(int command, const char *commandName);
+    bool sendAudioSinkControl(int command, const char *commandName);
     void deleteAudioSinkGlobalRef(JNIEnv *env);
     void recomputeAudioPlayable();
     void updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Block &block);
@@ -420,6 +423,7 @@ private:
     std::atomic<bool> audioCallbackSet_{false};
     // A1: decoded audio frame pipeline (no PCM yet; decode -> count -> discard).
     std::atomic<bool> audioFlushRequested_{false};
+    std::atomic<bool> audioResumeDiscontinuityRequested_{false};
     std::atomic<int64_t> audioDecodedSampleCount_{0};
     std::atomic<int64_t> audioDecodeErrorCount_{0};
     std::atomic<int64_t> lastDecodedAudioPtsUs_{0};
@@ -455,6 +459,9 @@ private:
     std::atomic<int64_t> audioWorkerConsumedSampleCount_{0};
     std::atomic<int64_t> audioWorkerConsumedByteCount_{0};
     std::atomic<int64_t> lastConsumedPcmPtsUs_{0};
+    std::atomic<int64_t> audioWorkerStartCount_{0};
+    std::atomic<int64_t> audioWorkerJoinCount_{0};
+    std::atomic<int64_t> audioWorkerStaleBlockCount_{0};
     // A4: JNI PCM sink (Android AudioTrack) owned by the Java LiveAudioPcmSink.
     mutable std::mutex audioSinkMutex_;
     jobject audioSinkGlobalRef_ = nullptr;
@@ -465,6 +472,9 @@ private:
     std::atomic<int64_t> audioSinkWriteCount_{0};
     std::atomic<int64_t> audioSinkWrittenByteCount_{0};
     std::atomic<int64_t> audioSinkWriteErrorCount_{0};
+    std::atomic<int64_t> audioSinkControlledCancelCount_{0};
+    std::atomic<int64_t> audioSinkRestartCount_{0};
+    std::atomic<int64_t> audioReconnectRecoveryCount_{0};
     std::atomic<int> audioSinkLastErrorCode_{0};
     std::atomic<int64_t> lastAudioSinkWriteCostUs_{-1};
     std::atomic<int64_t> totalAudioSinkWriteCostUs_{0};

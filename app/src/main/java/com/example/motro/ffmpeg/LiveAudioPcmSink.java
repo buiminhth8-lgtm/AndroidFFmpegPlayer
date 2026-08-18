@@ -6,6 +6,7 @@ import android.media.AudioTrack;
 import android.util.Log;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Owns the Android AudioTrack used for live PCM monitoring. All methods are
@@ -23,14 +24,22 @@ public final class LiveAudioPcmSink {
     public static final int CMD_PAUSE_FLUSH = 1;
     public static final int CMD_RELEASE = 2;
 
+    // Native treats this as an expected lifecycle cancellation rather than an
+    // AudioTrack failure. It is intentionally outside Android's error range.
+    public static final int WRITE_CANCELLED = -10000;
+
     private static final int SAMPLE_RATE = 48000;
     private static final int CHANNEL_OUT = AudioFormat.CHANNEL_OUT_STEREO;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
+    private static final long MAX_WRITE_WAIT_NANOS = 250_000_000L;
+    private static final long WRITE_RETRY_NANOS = 2_000_000L;
 
-    // Accessed from the audio worker thread and the lifecycle control thread;
-    // volatile gives safe reference publication. Release is always invoked after
-    // the worker has been joined, so there is no write-vs-release race.
+    // Accessed from the audio worker thread and the lifecycle control thread.
+    // Lifecycle commands never wait for a blocking write: writes are
+    // non-blocking and an epoch invalidates any in-flight old-generation block.
     private volatile AudioTrack audioTrack;
+    private volatile boolean acceptingWrites;
+    private final AtomicLong lifecycleEpoch = new AtomicLong();
     private int minBufferBytes = -1;
 
     public LiveAudioPcmSink() {
@@ -38,25 +47,50 @@ public final class LiveAudioPcmSink {
 
     /**
      * Called from the native audio output worker thread. Writes the PCM block
-     * synchronously (WRITE_BLOCKING) and returns the number of bytes written, or
-     * a negative AudioTrack error code. Creates/starts the AudioTrack lazily.
+     * without an unbounded AudioTrack wait and returns the number of bytes
+     * written, or a negative AudioTrack error code. Creates/starts AudioTrack
+     * lazily. A partial write is returned to native as an audio-only failure so
+     * the live pipeline can drop forward rather than block Stop/Release.
      * The caller must keep {@code pcm} alive until this method returns.
      */
     public int onAudioPcm(ByteBuffer pcm, int sizeBytes, long ptsUs) {
+        final long epoch = lifecycleEpoch.get();
+        if (!acceptingWrites) {
+            return WRITE_CANCELLED;
+        }
         AudioTrack track = ensureStarted();
         if (track == null) {
             return AudioTrack.ERROR_INVALID_OPERATION;
         }
         int total = 0;
+        final long deadlineNanos = System.nanoTime() + MAX_WRITE_WAIT_NANOS;
         while (total < sizeBytes) {
-            int written = track.write(pcm, sizeBytes - total, AudioTrack.WRITE_BLOCKING);
+            if (!acceptingWrites || lifecycleEpoch.get() != epoch) {
+                pauseFlushTrack(track);
+                return WRITE_CANCELLED;
+            }
+            int written = track.write(pcm, sizeBytes - total, AudioTrack.WRITE_NON_BLOCKING);
             if (written < 0) {
                 return written;
             }
             if (written == 0) {
-                break;
+                if (System.nanoTime() >= deadlineNanos) {
+                    break;
+                }
+                // WRITE_NON_BLOCKING keeps lifecycle cancellation observable.
+                // A short bounded retry window lets AudioTrack drain normally
+                // without ever entering the platform's indefinite write wait.
+                java.util.concurrent.locks.LockSupport.parkNanos(WRITE_RETRY_NANOS);
+                continue;
             }
             total += written;
+        }
+        if (!acceptingWrites || lifecycleEpoch.get() != epoch) {
+            // A lifecycle reset may race immediately after the non-blocking
+            // write. Flush once more before returning so bytes from the old
+            // epoch cannot become audible after CMD_START.
+            pauseFlushTrack(track);
+            return WRITE_CANCELLED;
         }
         return total;
     }
@@ -68,11 +102,17 @@ public final class LiveAudioPcmSink {
     public int onAudioControl(int command) {
         switch (command) {
             case CMD_START:
-                return ensureStarted() != null ? 0 : AudioTrack.ERROR_INVALID_OPERATION;
+                lifecycleEpoch.incrementAndGet();
+                acceptingWrites = true;
+                return 0; // Track remains lazy-created on the worker thread.
             case CMD_PAUSE_FLUSH:
+                acceptingWrites = false;
+                lifecycleEpoch.incrementAndGet();
                 pauseFlush();
                 return 0;
             case CMD_RELEASE:
+                acceptingWrites = false;
+                lifecycleEpoch.incrementAndGet();
                 release();
                 return 0;
             default:
@@ -142,6 +182,10 @@ public final class LiveAudioPcmSink {
         if (track == null) {
             return;
         }
+        pauseFlushTrack(track);
+    }
+
+    private void pauseFlushTrack(AudioTrack track) {
         try {
             track.pause();
             track.flush();

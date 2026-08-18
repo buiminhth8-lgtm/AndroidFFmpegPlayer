@@ -52,11 +52,13 @@ constexpr int kAudioPcmOutputSampleRate = 48000;
 constexpr int kAudioPcmOutputChannels = 2;
 constexpr AVSampleFormat kAudioPcmOutputFormat = AV_SAMPLE_FMT_S16;
 
-// A4 Java AudioTrack sink control commands (mirror LiveAudioPcmSink). START is
-// intentionally not sent: onAudioPcm lazily creates/plays the AudioTrack on the
-// worker thread, avoiding a cross-thread create race.
+// Java AudioTrack sink control commands (mirror LiveAudioPcmSink). START only
+// opens a new write epoch; onAudioPcm still lazily creates/plays AudioTrack on
+// the audio worker thread.
+constexpr int kAudioSinkCmdStart = 0;
 constexpr int kAudioSinkCmdPauseFlush = 1;
 constexpr int kAudioSinkCmdRelease = 2;
+constexpr int kAudioSinkWriteCancelled = -10000;
 
 // A5: AudioTrack playback-head clock / A-V sync tuning.
 constexpr int64_t kAudioClockStaleMs = 500;         // clock considered stale if not refreshed within this window
@@ -1180,6 +1182,18 @@ std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
         }
     }
 
+    // Replace/clear is a lifecycle boundary. Stop the worker first so the old
+    // Java sink has no in-flight native callback, then release its AudioTrack
+    // before deleting the GlobalRef. A worker-held local ref would be memory
+    // safe, but would otherwise leave the old AudioTrack alive and audible.
+    if (audioCallbackSet_.load()) {
+        flushAudioPcmForDiscontinuity();
+        audioPcmQueue_.requestStop();
+        stopAudioOutputWorker();
+        sendAudioSinkControl(kAudioSinkCmdRelease, "callback_replace_release");
+        audioFlushRequested_.store(true);
+    }
+
     {
         std::lock_guard<std::mutex> lock(audioSinkMutex_);
         if (audioSinkGlobalRef_ != nullptr) {
@@ -1203,6 +1217,18 @@ std::string NativePlayer::setAudioCallback(JNIEnv *env, jobject callback) {
         audioPlayError_.clear();
     }
     recomputeAudioPlayable();
+
+    if (callbackSet && audioEnabled_.load() && !pauseRequested_.load()) {
+        PlayerState stateSnapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stateSnapshot = state_;
+        }
+        if (stateSnapshot == PlayerState::Playing || stateSnapshot == PlayerState::Reconnected) {
+            startAudioSinkForCurrentGeneration();
+            startAudioOutputWorker();
+        }
+    }
 
     LOGI("setAudioCallback callbackSet=%d sourceHasAudio=%d audioEnabled=%d audioSinkReady=%d audioPlayable=%d",
          callbackSet ? 1 : 0, sourceHasAudio_.load() ? 1 : 0,
@@ -1254,36 +1280,47 @@ std::string NativePlayer::enableAudio(bool enabled) {
 
     // A0 freeze: audioEnabled_ records only the user's live-monitoring request.
     // It does NOT mean source presence, decoder state, recorder state, or sink
-    // state. Those are sourceHasAudio_, audioDecodeOpened_, audioCallbackSet_,
-    // and audioPlayable_ respectively.
-    if (!enabled) {
-        // Stop the output worker, flush the queue, and pause/flush the AudioTrack
-        // so no stale audio keeps playing. Then request the playback thread to
-        // flush the audio decoder + swr. A later ON starts from the live edge.
-        audioEnabled_.store(false);
-        audioPcmQueue_.flush();
-        audioPcmQueue_.requestStop();
-        sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
-        stopAudioOutputWorker();
-        invalidateAudioClock();
-        audioFlushRequested_.store(true);
-        audioPlayError_.clear();
-    } else {
-        // Request the playback thread to flush the audio decoder + swr, then
-        // start the output worker (which resets the queue and clears the stop
-        // flag), then enable production. The worker is ready before any PCM can
-        // be enqueued; onAudioPcm lazily creates/plays the AudioTrack.
-        audioFlushRequested_.store(true);
-        startAudioOutputWorker();
-        audioEnabled_.store(true);
-        if (!sourceHasAudio_.load()) {
+    // state. A repeated request is a no-op: Activity Start reapplies the option,
+    // and must not create a new generation or restart a healthy sink.
+    const bool wasEnabled = audioEnabled_.load();
+    if (wasEnabled != enabled) {
+        if (!enabled) {
+            // Close production first, then invalidate both queued and
+            // AudioTrack-buffered data before joining the worker. The playback
+            // thread flushes decoder/SWR state at its next safe boundary.
+            audioEnabled_.store(false);
+            flushAudioPcmForDiscontinuity();
+            audioPcmQueue_.requestStop();
+            stopAudioOutputWorker();
+            audioFlushRequested_.store(true);
             audioPlayError_.clear();
-        } else if (!audioDecodeOpened_.load()) {
-            audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
-        } else if (!audioSinkReady_.load()) {
-            audioPlayError_ = "audio sink is not set";
         } else {
-            audioPlayError_.clear();
+            // Build a fresh generation before allowing production. Only start
+            // worker/sink while playback is active; enabling in IDLE/PREPARED
+            // records policy but leaves no background worker behind.
+            flushAudioPcmForDiscontinuity();
+            audioFlushRequested_.store(true);
+            audioEnabled_.store(true);
+            PlayerState stateSnapshot;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stateSnapshot = state_;
+            }
+            const bool playbackActive = stateSnapshot == PlayerState::Playing
+                                        || stateSnapshot == PlayerState::Reconnected;
+            if (playbackActive && !pauseRequested_.load()) {
+                startAudioSinkForCurrentGeneration();
+                startAudioOutputWorker();
+            }
+            if (!sourceHasAudio_.load()) {
+                audioPlayError_.clear();
+            } else if (!audioDecodeOpened_.load()) {
+                audioPlayError_ = audioDecodeError_.empty() ? "audio decoder not opened" : audioDecodeError_;
+            } else if (!audioSinkReady_.load()) {
+                audioPlayError_ = "audio sink is not set";
+            } else {
+                audioPlayError_.clear();
+            }
         }
     }
     recomputeAudioPlayable();
@@ -1401,24 +1438,38 @@ std::string NativePlayer::start() {
     }
 
     bool shouldPrepareRealtimeInput = false;
+    bool resumeFromPause = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == PlayerState::Playing) {
             return jsonSuccess("player already playing");
         }
         if (state_ == PlayerState::Paused && playbackThread_.joinable()) {
+            audioResumeDiscontinuityRequested_.store(true);
             pauseRequested_.store(false);
             state_ = PlayerState::Playing;
-            LOGI("startPlayer resume player=%p", this);
-            return jsonSuccess("player resumed");
+            resumeFromPause = true;
+        } else {
+            if (state_ != PlayerState::Prepared) {
+                return jsonError(-1, "player is not prepared");
+            }
+            if (playbackThread_.joinable()) {
+                return jsonError(-1, "playback thread is already running");
+            }
+            shouldPrepareRealtimeInput = isRealtimeInput_;
         }
-        if (state_ != PlayerState::Prepared) {
-            return jsonError(-1, "player is not prepared");
+    }
+
+    if (resumeFromPause) {
+        // Pause already established a new audio generation and stopped output.
+        // The playback thread performs codec flush/keyframe catch-up at its
+        // safe boundary; sink and worker resume only for the current generation.
+        if (audioEnabled_.load()) {
+            startAudioSinkForCurrentGeneration();
+            startAudioOutputWorker();
         }
-        if (playbackThread_.joinable()) {
-            return jsonError(-1, "playback thread is already running");
-        }
-        shouldPrepareRealtimeInput = isRealtimeInput_;
+        LOGI("startPlayer resume player=%p", this);
+        return jsonSuccess("player resumed");
     }
 
     if (shouldPrepareRealtimeInput && !prepareRealtimeInputForStart()) {
@@ -1438,13 +1489,14 @@ std::string NativePlayer::start() {
         startPlayTimeMs_.store(nowMs());
         startToFirstFrameMs_.store(-1);
         state_ = PlayerState::Playing;
-        // Restart the audio output worker when live audio monitoring is still
-        // requested (prepare() stops it). It is idempotent and resets the queue.
-        if (audioEnabled_.load()) {
-            startAudioOutputWorker();
-        }
-        playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
     }
+    // Restart sink/worker when monitoring is still requested. Prepare stops the
+    // worker but preserves the user's audioEnabled policy.
+    if (audioEnabled_.load()) {
+        startAudioSinkForCurrentGeneration();
+        startAudioOutputWorker();
+    }
+    playbackThread_ = std::thread(&NativePlayer::playbackLoop, this);
     LOGI("startPlayer player=%p inputOpenCount=%lld decoderOpenCount=%lld hardwareDecoderOpenCount=%lld reused=%d",
          this,
          static_cast<long long>(inputOpenCount_.load()),
@@ -1459,12 +1511,21 @@ std::string NativePlayer::pause() {
         return jsonError(-1, "player is released");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != PlayerState::Playing) {
-        return jsonError(-1, "player is not playing");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != PlayerState::Playing && state_ != PlayerState::Reconnected) {
+            return jsonError(-1, "player is not playing");
+        }
+        pauseRequested_.store(true);
+        state_ = PlayerState::Paused;
     }
-    pauseRequested_.store(true);
-    state_ = PlayerState::Paused;
+    // Stop future PCM production, flush queue + AudioTrack, invalidate clock,
+    // and deterministically join the worker. Realtime input remains open and
+    // its playback thread continues draining packets at the live edge.
+    flushAudioPcmForDiscontinuity();
+    audioPcmQueue_.requestStop();
+    stopAudioOutputWorker();
+    audioFlushRequested_.store(true);
     LOGI("pausePlayer player=%p", this);
     return jsonSuccess("player paused");
 }
@@ -1478,10 +1539,6 @@ std::string NativePlayer::stop() {
     const bool shouldJoin = playbackThread_.joinable();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ == PlayerState::Idle && !shouldJoin && formatContext_ == nullptr) {
-            state_ = PlayerState::Stopped;
-            return jsonSuccess("player stopped");
-        }
         if (state_ != PlayerState::Released) {
             state_ = PlayerState::Stopping;
         }
@@ -1489,21 +1546,24 @@ std::string NativePlayer::stop() {
         pauseRequested_.store(false);
     }
 
+    // Block/flush output before waiting for the producer thread. Java writes
+    // are non-blocking, so worker join is deterministic and never depends on
+    // AudioTrack buffer drain. This also covers IDLE/PREPARED Release paths.
+    flushAudioPcmForDiscontinuity();
+    audioPcmQueue_.requestStop();
+    stopAudioOutputWorker();
+
     if (shouldJoin) {
         playbackThread_.join();
     }
+    // A producer already inside conversion may observe stop after the first
+    // flush. Clear once more after join; no producer remains at this point.
+    audioPcmQueue_.flush();
     reconnecting_.store(false);
     waitingSource_.store(false);
     setRendererFallbackReason(rendererState_, 0);
-
-    // Stop consumption, pause/flush the AudioTrack (unblocks any pending
-    // blocking write), then stop and join the audio output worker (no-op when
-    // audio was disabled).
-    audioPcmQueue_.flush();
-    audioPcmQueue_.requestStop();
-    sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
-    stopAudioOutputWorker();
-    invalidateAudioClock();
+    audioResumeDiscontinuityRequested_.store(false);
+    audioFlushRequested_.store(false);
 
     if (remuxRecorder_.isRecording()) {
         LOGI("stopPlayer auto stop active recorder");
@@ -1609,6 +1669,32 @@ std::string NativePlayer::getStats() {
             : nullptr;
     const std::string decodedAudioSampleFormatNameStr = decodedAudioSampleFormatName == nullptr
             ? "unknown" : decodedAudioSampleFormatName;
+    std::string audioLifecycleState;
+    if (!audioEnabled_.load()) {
+        audioLifecycleState = "disabled";
+    } else if (state == PlayerState::Stopping || state == PlayerState::Stopped
+               || state == PlayerState::Released) {
+        audioLifecycleState = "stopped";
+    } else if (state == PlayerState::Paused || pauseRequested_.load()) {
+        audioLifecycleState = "paused";
+    } else if (state == PlayerState::Disconnected || state == PlayerState::Reconnecting
+               || state == PlayerState::WaitingSource || reconnecting_.load()) {
+        audioLifecycleState = "reconnecting";
+    } else if (!sourceHasAudio_.load()) {
+        audioLifecycleState = "no_audio";
+    } else if (!audioDecodeOpened_.load()) {
+        audioLifecycleState = "decoder_unavailable";
+    } else if (!audioCallbackSet_.load()) {
+        audioLifecycleState = "sink_unavailable";
+    } else if (!audioWorkerRunning_.load()) {
+        audioLifecycleState = state == PlayerState::Prepared ? "prepared" : "worker_stopped";
+    } else if (!audioSinkReady_.load()) {
+        audioLifecycleState = "sink_error";
+    } else if (!audioPlaybackClockValid_.load()) {
+        audioLifecycleState = "starting";
+    } else {
+        audioLifecycleState = "playing";
+    }
     const int64_t avgReadFrameCostUs = averageUs(totalReadFrameCostUs_.load(), readFrameCostSampleCount_.load());
     const int64_t avgDecodeCostUs = averageUs(totalDecodeCostUs_.load(), decodeCostSampleCount_.load());
     const int64_t avgSwsScaleCostUs = averageUs(totalSwsScaleCostUs_.load(), swsScaleCostSampleCount_.load());
@@ -1811,7 +1897,12 @@ std::string NativePlayer::getStats() {
         << "\"audioQueueDroppedSampleCount\":" << audioPcmQueue_.droppedSampleCount() << ","
         << "\"audioQueueFlushCount\":" << audioPcmQueue_.flushCount() << ","
         << "\"audioQueueGeneration\":" << audioQueueGeneration_.load() << ","
+        << "\"audioGeneration\":" << audioQueueGeneration_.load() << ","
+        << "\"audioLifecycleState\":\"" << audioLifecycleState << "\","
         << "\"audioWorkerRunning\":" << (audioWorkerRunning_.load() ? "true" : "false") << ","
+        << "\"audioWorkerStartCount\":" << audioWorkerStartCount_.load() << ","
+        << "\"audioWorkerJoinCount\":" << audioWorkerJoinCount_.load() << ","
+        << "\"audioWorkerStaleBlockCount\":" << audioWorkerStaleBlockCount_.load() << ","
         << "\"audioWorkerConsumedBlockCount\":" << audioWorkerConsumedBlockCount_.load() << ","
         << "\"audioWorkerConsumedSampleCount\":" << audioWorkerConsumedSampleCount_.load() << ","
         << "\"audioWorkerConsumedByteCount\":" << audioWorkerConsumedByteCount_.load() << ","
@@ -1820,6 +1911,9 @@ std::string NativePlayer::getStats() {
         << "\"audioSinkWriteCount\":" << audioSinkWriteCount_.load() << ","
         << "\"audioSinkWrittenByteCount\":" << audioSinkWrittenByteCount_.load() << ","
         << "\"audioSinkWriteErrorCount\":" << audioSinkWriteErrorCount_.load() << ","
+        << "\"audioSinkControlledCancelCount\":" << audioSinkControlledCancelCount_.load() << ","
+        << "\"audioSinkRestartCount\":" << audioSinkRestartCount_.load() << ","
+        << "\"audioReconnectRecoveryCount\":" << audioReconnectRecoveryCount_.load() << ","
         << "\"audioSinkLastErrorCode\":" << audioSinkLastErrorCode_.load() << ","
         << "\"lastAudioSinkWriteCostUs\":" << lastAudioSinkWriteCostUs_.load() << ","
         << "\"avgAudioSinkWriteCostUs\":" << averageUs(totalAudioSinkWriteCostUs_.load(), audioSinkWriteCostSampleCount_.load()) << ","
@@ -2924,6 +3018,7 @@ void NativePlayer::decodeAudioPacket(const AVPacket *packet) {
         drainAudioDecodedFrames();
     } else if (sendResult < 0 && sendResult != AVERROR_EOF) {
         ++audioDecodeErrorCount_;
+        degradeAudioPlayback();
         logRateLimitedAudioDecodeError(sendResult);
     } else {
         drainAudioDecodedFrames();
@@ -2966,6 +3061,7 @@ void NativePlayer::drainAudioDecodedFrames() {
             break;
         } else {
             ++audioDecodeErrorCount_;
+            degradeAudioPlayback();
             logRateLimitedAudioDecodeError(ret);
             break;
         }
@@ -2999,6 +3095,7 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
 
     if (inputSampleRate <= 0 || inputChannels <= 0 || inputFormat == AV_SAMPLE_FMT_NONE) {
         ++audioResampleErrorCount_;
+        degradeAudioPlayback();
         logRateLimitedAudioResampleError("invalid input audio format");
         return false;
     }
@@ -3011,21 +3108,32 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
         inputLayoutMask = frame->ch_layout.u.mask;
     }
 
+    const bool hadConfiguredSwr = audioSwrContext_ != nullptr;
     const bool identityChanged = audioSwrContext_ == nullptr
             || audioSwrInputSampleFormat_ != static_cast<int>(inputFormat)
             || audioSwrInputSampleRate_ != inputSampleRate
             || audioSwrInputChannels_ != inputChannels
             || audioSwrInputLayoutMask_ != inputLayoutMask;
     if (identityChanged) {
+        if (hadConfiguredSwr) {
+            // A mid-session decoded format change is a real audio
+            // discontinuity. Discard old-format queued/AudioTrack bytes and
+            // force the next output block to establish a new clock base.
+            flushAudioPcmForDiscontinuity();
+            if (audioEnabled_.load() && !pauseRequested_.load()) {
+                startAudioSinkForCurrentGeneration();
+            }
+        }
         if (!configureAudioSwrContext(static_cast<int>(inputFormat), inputSampleRate,
                                       inputLayoutMask, inputChannels)) {
             ++audioResampleErrorCount_;
+            degradeAudioPlayback();
             logRateLimitedAudioResampleError("swr_alloc_set_opts2/swr_init failed");
             return false;
         }
         audioSwrReconfigureCount_.fetch_add(1);
         const char *fmtName = av_get_sample_fmt_name(inputFormat);
-        LOGI("audio swr reconfigured input=%dHz/%dch/%s output=%dkHz/2/s16 reconfigureCount=%lld",
+        LOGI("audio swr reconfigured input=%dHz/%dch/%s output=%dHz/2/s16 reconfigureCount=%lld",
              inputSampleRate, inputChannels, fmtName == nullptr ? "unknown" : fmtName,
              kAudioPcmOutputSampleRate, static_cast<long long>(audioSwrReconfigureCount_.load()));
     }
@@ -3038,6 +3146,7 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
     if (requestedOutSamples <= 0
         || requestedOutSamples > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         ++audioResampleErrorCount_;
+        degradeAudioPlayback();
         logRateLimitedAudioResampleError("invalid output sample count");
         return false;
     }
@@ -3045,8 +3154,9 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
             * static_cast<int64_t>(kAudioPcmOutputChannels)
             * static_cast<int64_t>(sizeof(int16_t));
     if (requiredBytes <= 0
-        || requiredBytes > static_cast<int64_t>(std::numeric_limits<size_t>::max())) {
+        || static_cast<uint64_t>(requiredBytes) > std::numeric_limits<size_t>::max()) {
         ++audioResampleErrorCount_;
+        degradeAudioPlayback();
         logRateLimitedAudioResampleError("PCM buffer size overflow");
         return false;
     }
@@ -3066,6 +3176,7 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
 
     if (convertedSamples < 0) {
         ++audioResampleErrorCount_;
+        degradeAudioPlayback();
         logRateLimitedAudioResampleError("swr_convert failed");
         return false;
     }
@@ -3081,7 +3192,7 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
     if (!audioPcmFirstConvertLogged_) {
         audioPcmFirstConvertLogged_ = true;
         const char *fmtName = av_get_sample_fmt_name(inputFormat);
-        LOGI("audio pcm ready input=%dHz/%dch/%s output=%dkHz/2/s16 convertedSamples=%d bytes=%lld",
+        LOGI("audio pcm ready input=%dHz/%dch/%s output=%dHz/2/s16 convertedSamples=%d bytes=%lld",
              inputSampleRate, inputChannels, fmtName == nullptr ? "unknown" : fmtName,
              kAudioPcmOutputSampleRate, convertedSamples, static_cast<long long>(pcmBytes));
     }
@@ -3104,7 +3215,7 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
     // A3: hand the PCM block to the bounded output queue. The block owns a copy
     // of the PCM bytes (the scratch buffer is reused on the next frame). The
     // producer never waits for queue space; overflow drops the oldest blocks.
-    if (audioEnabled_.load()) {
+    if (audioEnabled_.load() && !pauseRequested_.load() && !stopRequested_.load()) {
         AudioPcmQueue::Block block;
         block.data.assign(audioPcmBuffer_.data(), audioPcmBuffer_.data() + static_cast<size_t>(pcmBytes));
         block.startPtsUs = pcmStartPtsUs;
@@ -3112,6 +3223,9 @@ bool NativePlayer::convertAudioFrameToPcm(AVFrame *frame) {
         block.generation = audioQueueGeneration_.load();
         audioPcmQueue_.enqueue(std::move(block));
     }
+    // A valid conversion recovers decoder/SWR-only degradation. Sink failures
+    // remain non-playable until a full AudioTrack write succeeds.
+    recomputeAudioPlayable();
     return true;
 }
 
@@ -3293,6 +3407,10 @@ void NativePlayer::audioOutputWorkerLoop() {
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env == nullptr) {
         LOGE("audio output worker: JNIEnv unavailable; PCM will be discarded");
+        ++audioSinkWriteErrorCount_;
+        audioSinkLastErrorCode_.store(-1);
+        audioSinkReady_.store(false);
+        degradeAudioPlayback();
     }
     AudioPcmQueue::Block block;
     while (true) {
@@ -3306,18 +3424,28 @@ void NativePlayer::audioOutputWorkerLoop() {
             // playback thread never blocks. Never enabled in production.
             std::this_thread::sleep_for(std::chrono::milliseconds(testDelayMs));
         }
+        if (!audioEnabled_.load()
+            || pauseRequested_.load()
+            || stopRequested_.load()
+            || block.generation != audioQueueGeneration_.load()) {
+            audioWorkerStaleBlockCount_.fetch_add(1);
+            block.data.clear();
+            continue;
+        }
         audioWorkerConsumedBlockCount_.fetch_add(1);
         audioWorkerConsumedSampleCount_.fetch_add(block.sampleCount);
         audioWorkerConsumedByteCount_.fetch_add(static_cast<int64_t>(block.data.size()));
         lastConsumedPcmPtsUs_.store(block.startPtsUs);
-        // A5: publish the AudioTrack playback-head based clock (rebase on a new
-        // generation), then hand the block to the JNI sink (AudioTrack.write).
+        // Publish the AudioTrack playback-head based clock (rebase on a new
+        // generation), then hand the block to the JNI sink. The Java sink uses
+        // a non-blocking write and its own lifecycle epoch.
         if (env != nullptr && !block.data.empty()) {
             updateAudioPlaybackClock(env, block);
             writeAudioPcmToSink(env, block);
         }
         block.data.clear();
     }
+    audioWorkerRunning_.store(false);
     detachCurrentThreadIfNeeded(attached);
     LOGI("audio output worker ended");
 }
@@ -3329,6 +3457,7 @@ void NativePlayer::startAudioOutputWorker() {
     }
     audioPcmQueue_.resetForRestart();
     audioWorkerRunning_.store(true);
+    audioWorkerStartCount_.fetch_add(1);
     audioOutputWorkerThread_ = std::thread(&NativePlayer::audioOutputWorkerLoop, this);
 }
 
@@ -3342,18 +3471,63 @@ void NativePlayer::stopAudioOutputWorker() {
         audioPcmQueue_.requestStop();
         worker.join();
         audioWorkerRunning_.store(false);
+        audioWorkerJoinCount_.fetch_add(1);
     }
 }
 
 void NativePlayer::flushAudioPcmForDiscontinuity() {
     audioPcmQueue_.flush();
-    audioQueueGeneration_.fetch_add(1);
+    const int64_t generation = audioQueueGeneration_.fetch_add(1) + 1;
     // The AudioTrack playback-head base and media timeline are now invalid; the
     // new source generation must re-anchor before audio becomes the master.
     invalidateAudioClock();
+    audioClockGeneration_.store(generation);
+    audioClockBaseMediaPtsUs_.store(0);
+    audioPlaybackHeadRaw32_.store(0);
+    audioPlaybackHeadExtended64_.store(0);
+    audioPlaybackHeadFrames_.store(0);
+    audioPlaybackClockUs_.store(0);
+    audioClockLastUpdateMs_.store(0);
+    audioVideoDiffUs_.store(0);
     // Clear stale AudioTrack-buffered data too, so the new source generation
     // never plays old audio. onAudioPcm lazily resumes playback on next write.
     sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
+}
+
+void NativePlayer::resetAudioDecoderForDiscontinuity(const char *reason) {
+    // Called only by the playback thread: decoder/SWR state is never touched
+    // concurrently from a JNI lifecycle thread.
+    if (audioCodecContext_ != nullptr) {
+        avcodec_flush_buffers(audioCodecContext_);
+    }
+    if (audioSwrContext_ != nullptr) {
+        swr_free(&audioSwrContext_);
+    }
+    audioSwrInputLayoutMask_ = 0;
+    audioSwrInputSampleFormat_ = -1;
+    audioSwrInputSampleRate_ = 0;
+    audioSwrInputChannels_ = 0;
+    audioPcmBuffer_.clear();
+    LOGI("audio decoder/SWR reset reason=%s generation=%lld",
+         reason == nullptr ? "unknown" : reason,
+         static_cast<long long>(audioQueueGeneration_.load()));
+}
+
+void NativePlayer::startAudioSinkForCurrentGeneration() {
+    if (!audioEnabled_.load() || pauseRequested_.load() || !audioCallbackSet_.load()) {
+        return;
+    }
+    if (sendAudioSinkControl(kAudioSinkCmdStart, "start")) {
+        audioSinkReady_.store(true);
+        audioSinkLastErrorCode_.store(0);
+        audioSinkRestartCount_.fetch_add(1);
+        recomputeAudioPlayable();
+    }
+}
+
+void NativePlayer::degradeAudioPlayback() {
+    audioPlayable_.store(false);
+    invalidateAudioClock();
 }
 
 void NativePlayer::recomputeAudioPlayable() {
@@ -3467,9 +3641,19 @@ void NativePlayer::waitForAudioMasterIfEarly(int64_t ptsUs) {
 }
 
 bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &block) {
+    if (!audioEnabled_.load()
+        || pauseRequested_.load()
+        || stopRequested_.load()
+        || block.generation != audioQueueGeneration_.load()) {
+        audioSinkControlledCancelCount_.fetch_add(1);
+        invalidateAudioClock();
+        return false;
+    }
     if (env == nullptr) {
         ++audioSinkWriteErrorCount_;
         audioSinkLastErrorCode_.store(-1);
+        audioSinkReady_.store(false);
+        degradeAudioPlayback();
         return false;
     }
     jobject sinkLocal = nullptr;
@@ -3477,6 +3661,8 @@ bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &
     {
         std::lock_guard<std::mutex> lock(audioSinkMutex_);
         if (audioSinkGlobalRef_ == nullptr || audioSinkWriteMethodId_ == nullptr) {
+            audioSinkReady_.store(false);
+            degradeAudioPlayback();
             return false;
         }
         sinkLocal = env->NewLocalRef(audioSinkGlobalRef_);
@@ -3485,6 +3671,8 @@ bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &
     if (sinkLocal == nullptr) {
         ++audioSinkWriteErrorCount_;
         audioSinkLastErrorCode_.store(-1);
+        audioSinkReady_.store(false);
+        degradeAudioPlayback();
         return false;
     }
 
@@ -3493,6 +3681,8 @@ bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &
     if (buffer == nullptr) {
         ++audioSinkWriteErrorCount_;
         audioSinkLastErrorCode_.store(-1);
+        audioSinkReady_.store(false);
+        degradeAudioPlayback();
         env->DeleteLocalRef(sinkLocal);
         return false;
     }
@@ -3511,26 +3701,41 @@ bool NativePlayer::writeAudioPcmToSink(JNIEnv *env, const AudioPcmQueue::Block &
     env->DeleteLocalRef(buffer);
     env->DeleteLocalRef(sinkLocal);
 
-    if (exception || written < 0) {
+    if (written == kAudioSinkWriteCancelled
+        || !audioEnabled_.load()
+        || pauseRequested_.load()
+        || stopRequested_.load()
+        || block.generation != audioQueueGeneration_.load()) {
+        audioSinkControlledCancelCount_.fetch_add(1);
+        invalidateAudioClock();
+        return false;
+    }
+    if (exception || written < 0 || written != static_cast<jint>(block.data.size())) {
         ++audioSinkWriteErrorCount_;
-        audioSinkLastErrorCode_.store(exception ? -1 : written);
+        audioSinkLastErrorCode_.store(exception || written >= 0 ? AVERROR(EAGAIN) : written);
+        if (written > 0) {
+            audioSinkWrittenByteCount_.fetch_add(written);
+        }
+        audioSinkReady_.store(false);
         // AudioTrack write failure invalidates the playback clock; video must
         // fall back to its own master until a later write re-anchors the clock.
-        invalidateAudioClock();
+        degradeAudioPlayback();
         return false;
     }
     audioSinkWriteCount_.fetch_add(1);
     audioSinkWrittenByteCount_.fetch_add(written);
     audioSinkLastErrorCode_.store(0);
+    audioSinkReady_.store(true);
+    recomputeAudioPlayable();
     return true;
 }
 
-void NativePlayer::sendAudioSinkControl(int command, const char *commandName) {
+bool NativePlayer::sendAudioSinkControl(int command, const char *commandName) {
     bool attached = false;
     JNIEnv *env = getJniEnvForCurrentThread(attached);
     if (env == nullptr) {
         LOGE("audio sink control %s: JNIEnv unavailable", commandName);
-        return;
+        return false;
     }
     jobject sinkLocal = nullptr;
     jmethodID controlMethod = nullptr;
@@ -3538,20 +3743,24 @@ void NativePlayer::sendAudioSinkControl(int command, const char *commandName) {
         std::lock_guard<std::mutex> lock(audioSinkMutex_);
         if (audioSinkGlobalRef_ == nullptr || audioSinkControlMethodId_ == nullptr) {
             detachCurrentThreadIfNeeded(attached);
-            return;
+            return false;
         }
         sinkLocal = env->NewLocalRef(audioSinkGlobalRef_);
         controlMethod = audioSinkControlMethodId_;
     }
+    bool success = false;
     if (sinkLocal != nullptr) {
-        env->CallIntMethod(sinkLocal, controlMethod, static_cast<jint>(command));
+        const jint result = env->CallIntMethod(sinkLocal, controlMethod, static_cast<jint>(command));
         if (env->ExceptionCheck()) {
             LOGE("audio sink control %s threw", commandName);
             env->ExceptionClear();
+        } else {
+            success = result >= 0;
         }
         env->DeleteLocalRef(sinkLocal);
     }
     detachCurrentThreadIfNeeded(attached);
+    return success;
 }
 
 void NativePlayer::deleteAudioSinkGlobalRef(JNIEnv *env) {
@@ -3856,6 +4065,9 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
         LOGI("reconnect while recorder active; remux recorder keeps output context and resumes when packets return");
     }
 
+    // Isolate the old audio generation immediately at disconnect. Do not let
+    // queued/AudioTrack PCM play throughout reconnect delay/open retries.
+    flushAudioPcmForDiscontinuity();
     releaseFfmpegResources();
     resetRealtimeClock();
 
@@ -3918,9 +4130,14 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
                 }
             }
             resetRealtimeClock();
-            // New source generation: flush stale queued PCM so the new stream
-            // enqueues from its live edge (generation also advances).
-            flushAudioPcmForDiscontinuity();
+            if (audioEnabled_.load() && !pauseRequested_.load()) {
+                startAudioSinkForCurrentGeneration();
+                startAudioOutputWorker();
+            }
+            if (audioEnabled_.load() && sourceHasAudio_.load() && audioDecodeOpened_.load()) {
+                audioReconnectRecoveryCount_.fetch_add(1);
+            }
+            recomputeAudioPlayable();
             beginStartupKeyFrameWait("reconnect");
             if (!startupKeyFrameWaitActive_.load()) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -4017,6 +4234,9 @@ bool NativePlayer::switchTransportInput() {
     }
 
     LOGI("switch RTSP transport mode=%s url=%s", mode.c_str(), currentUrl.c_str());
+    // Transport switch is also a source discontinuity: isolate audio before
+    // closing the old input rather than after the new input has opened.
+    flushAudioPcmForDiscontinuity();
     releaseFfmpegResources();
     clearLastFrame();
 
@@ -4029,8 +4249,11 @@ bool NativePlayer::switchTransportInput() {
     }
 
     resetRealtimeClock();
-    // New source generation: flush stale queued PCM and advance the generation.
-    flushAudioPcmForDiscontinuity();
+    if (audioEnabled_.load() && !paused) {
+        startAudioSinkForCurrentGeneration();
+        startAudioOutputWorker();
+    }
+    recomputeAudioPlayable();
     beginStartupKeyFrameWait("transport_switch");
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -4059,27 +4282,28 @@ void NativePlayer::playbackLoop() {
             continue;
         }
 
-        if (pauseRequested_.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            continue;
+        if (audioResumeDiscontinuityRequested_.exchange(false)) {
+            // Realtime Pause keeps draining compressed packets. Resume flushes
+            // decoder reference state and waits for a fresh video keyframe;
+            // audio starts from the current packet edge with a new generation.
+            resetAudioDecoderForDiscontinuity("resume");
+            audioFlushRequested_.store(false);
+            resetRealtimeClock();
+            if (isRealtimeInput_) {
+                if (videoCodecContext_ != nullptr) {
+                    avcodec_flush_buffers(videoCodecContext_);
+                }
+                beginStartupKeyFrameWait("resume");
+            }
         }
 
-        // Audio OFF -> ON transition boundary: flush the audio decoder and reset the
-        // swr context on the playback thread so the next ON never emits stale
-        // pre-toggle frames or stale resampler-delayed samples.
         if (audioFlushRequested_.exchange(false)) {
-            if (audioCodecContext_ != nullptr) {
-                avcodec_flush_buffers(audioCodecContext_);
-            }
-            if (audioSwrContext_ != nullptr) {
-                swr_free(&audioSwrContext_);
-            }
-            audioSwrInputLayoutMask_ = 0;
-            audioSwrInputSampleFormat_ = -1;
-            audioSwrInputSampleRate_ = 0;
-            audioSwrInputChannels_ = 0;
-            audioPcmBuffer_.clear();
-            LOGI("audio decoder flushed for playback toggle");
+            resetAudioDecoderForDiscontinuity("audio_toggle");
+        }
+
+        if (pauseRequested_.load() && !realtimeInput) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
         }
 
         const int64_t readStartUs = steadyNowUs();
@@ -4149,6 +4373,14 @@ void NativePlayer::playbackLoop() {
 
         if (remuxRecorder_.isRecording()) {
             remuxRecorder_.onPacket(packet_, formatContext_);
+        }
+
+        if (pauseRequested_.load() || audioResumeDiscontinuityRequested_.load()) {
+            // Realtime Pause deliberately keeps the demux/socket at live edge
+            // and preserves the recorder's compressed packet path, but neither
+            // decoder nor renderer receives paused packets.
+            av_packet_unref(packet_);
+            continue;
         }
 
         if (shouldDropRealtimePacket(packet_)) {
@@ -4913,9 +5145,15 @@ void NativePlayer::resetStats() {
     audioWorkerConsumedSampleCount_.store(0);
     audioWorkerConsumedByteCount_.store(0);
     lastConsumedPcmPtsUs_.store(0);
+    audioWorkerStartCount_.store(0);
+    audioWorkerJoinCount_.store(0);
+    audioWorkerStaleBlockCount_.store(0);
     audioSinkWriteCount_.store(0);
     audioSinkWrittenByteCount_.store(0);
     audioSinkWriteErrorCount_.store(0);
+    audioSinkControlledCancelCount_.store(0);
+    audioSinkRestartCount_.store(0);
+    audioReconnectRecoveryCount_.store(0);
     audioSinkLastErrorCode_.store(0);
     lastAudioSinkWriteCostUs_.store(-1);
     totalAudioSinkWriteCostUs_.store(0);
@@ -4932,6 +5170,8 @@ void NativePlayer::resetStats() {
     audioClockResetCount_.store(0);
     audioClockStaleCount_.store(0);
     audioVideoDiffUs_.store(0);
+    audioFlushRequested_.store(false);
+    audioResumeDiscontinuityRequested_.store(false);
     renderedFrameCount_.store(0);
     droppedVideoFrameCount_.store(0);
     hardwareDecodedFrameCount_.store(0);

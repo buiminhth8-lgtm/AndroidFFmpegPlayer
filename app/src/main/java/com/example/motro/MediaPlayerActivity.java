@@ -149,7 +149,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void initDefaults() {
         String initialUrl = getIntent().getStringExtra(EXTRA_URL);
-        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
+        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:556/main.mov" : initialUrl);
         controlsBinding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);

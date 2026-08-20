@@ -44,6 +44,10 @@ namespace {
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
+// LAT2: bounded timing correlation capacity. Covers the ~1-2 frames in flight
+// plus decoder reorder headroom; never grows unbounded.
+constexpr size_t kStageTimingMaxRecords = 256;
+
 // A3 test-only hook (default 0 = production behavior unchanged).
 std::atomic<int> g_audio_worker_test_delay_ms{0};
 
@@ -1931,6 +1935,28 @@ std::string NativePlayer::getStats() {
         << "\"decodedPtsBackwardCount\":" << decodedPtsBackwardCount_.load() << ","
         << "\"renderedPtsBackwardCount\":" << renderedPtsBackwardCount_.load() << ","
         << "\"latencyPtsResetCount\":" << latencyPtsResetCount_.load() << ","
+        << "\"stageTimingGeneration\":" << videoPtsGeneration_.load() << ","
+        << "\"stageTimingSampleCount\":" << stageTimingSampleCount_.load() << ","
+        << "\"lastDemuxReturnToDecoderSubmitUs\":" << demuxSubmitTiming_.last.load() << ","
+        << "\"avgDemuxReturnToDecoderSubmitUs\":" << averageUs(demuxSubmitTiming_.total.load(), demuxSubmitTiming_.count.load()) << ","
+        << "\"maxDemuxReturnToDecoderSubmitUs\":" << demuxSubmitTiming_.max.load() << ","
+        << "\"lastDecoderSubmitToOutputUs\":" << decoderTiming_.last.load() << ","
+        << "\"avgDecoderSubmitToOutputUs\":" << averageUs(decoderTiming_.total.load(), decoderTiming_.count.load()) << ","
+        << "\"maxDecoderSubmitToOutputUs\":" << decoderTiming_.max.load() << ","
+        << "\"lastDecodedOutputToRenderBeginUs\":" << decodeRenderTiming_.last.load() << ","
+        << "\"avgDecodedOutputToRenderBeginUs\":" << averageUs(decodeRenderTiming_.total.load(), decodeRenderTiming_.count.load()) << ","
+        << "\"maxDecodedOutputToRenderBeginUs\":" << decodeRenderTiming_.max.load() << ","
+        << "\"lastRenderBeginToSubmitUs\":" << renderTiming_.last.load() << ","
+        << "\"avgRenderBeginToSubmitUs\":" << averageUs(renderTiming_.total.load(), renderTiming_.count.load()) << ","
+        << "\"maxRenderBeginToSubmitUs\":" << renderTiming_.max.load() << ","
+        << "\"lastPacketReadyToRenderSubmitUs\":" << packetRenderTiming_.last.load() << ","
+        << "\"avgPacketReadyToRenderSubmitUs\":" << averageUs(packetRenderTiming_.total.load(), packetRenderTiming_.count.load()) << ","
+        << "\"maxPacketReadyToRenderSubmitUs\":" << packetRenderTiming_.max.load() << ","
+        << "\"decoderTimingUnmatchedCount\":" << decoderTimingUnmatchedCount_.load() << ","
+        << "\"renderTimingUnmatchedCount\":" << renderTimingUnmatchedCount_.load() << ","
+        << "\"stageTimingEvictionCount\":" << stageTimingEvictionCount_.load() << ","
+        << "\"stageTimingResetCount\":" << stageTimingResetCount_.load() << ","
+        << "\"stageTimingClockAnomalyCount\":" << stageTimingClockAnomalyCount_.load() << ","
         << "\"videoWidth\":" << decodedVideoWidth << ","
         << "\"videoHeight\":" << decodedVideoHeight << ","
         << "\"decodedFormatGeneration\":" << decodedFormatGeneration << ","
@@ -3036,6 +3062,126 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     decoderPtsBackwardCount_.store(0);
     decodedPtsBackwardCount_.store(0);
     renderedPtsBackwardCount_.store(0);
+    // LAT2: clear timing correlation records so old/new sessions never cross.
+    resetStageTimingCorrelation();
+}
+
+void NativePlayer::resetStageTimingCorrelation() {
+    stageTimingRecords_.clear();
+    demuxSubmitTiming_.last.store(-1);
+    demuxSubmitTiming_.total.store(0);
+    demuxSubmitTiming_.count.store(0);
+    demuxSubmitTiming_.max.store(0);
+    decoderTiming_.last.store(-1);
+    decoderTiming_.total.store(0);
+    decoderTiming_.count.store(0);
+    decoderTiming_.max.store(0);
+    decodeRenderTiming_.last.store(-1);
+    decodeRenderTiming_.total.store(0);
+    decodeRenderTiming_.count.store(0);
+    decodeRenderTiming_.max.store(0);
+    renderTiming_.last.store(-1);
+    renderTiming_.total.store(0);
+    renderTiming_.count.store(0);
+    renderTiming_.max.store(0);
+    packetRenderTiming_.last.store(-1);
+    packetRenderTiming_.total.store(0);
+    packetRenderTiming_.count.store(0);
+    packetRenderTiming_.max.store(0);
+    stageTimingSampleCount_.store(0);
+    decoderTimingUnmatchedCount_.store(0);
+    renderTimingUnmatchedCount_.store(0);
+    stageTimingEvictionCount_.store(0);
+    stageTimingClockAnomalyCount_.store(0);
+    stageTimingResetCount_.fetch_add(1);
+}
+
+bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
+    const int64_t t0 = record.packetReadyMonoUs;
+    const int64_t t1 = record.decoderSubmitMonoUs;
+    const int64_t t2 = record.decodedOutputMonoUs;
+    const int64_t t3 = record.renderBeginMonoUs;
+    const int64_t t4 = record.renderSubmitMonoUs;
+    if (t0 < 0 || t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0) {
+        return false;
+    }
+    // All timestamps share one monotonic clock, so a completed frame must be
+    // non-decreasing. Violations indicate a correlation bug, not clamp-worthy.
+    if (t1 < t0 || t2 < t1 || t3 < t2 || t4 < t3) {
+        stageTimingClockAnomalyCount_.fetch_add(1);
+        return false;
+    }
+    recordCost(demuxSubmitTiming_.last, demuxSubmitTiming_.total, demuxSubmitTiming_.count,
+               demuxSubmitTiming_.max, t1 - t0);
+    recordCost(decoderTiming_.last, decoderTiming_.total, decoderTiming_.count,
+               decoderTiming_.max, t2 - t1);
+    recordCost(decodeRenderTiming_.last, decodeRenderTiming_.total, decodeRenderTiming_.count,
+               decodeRenderTiming_.max, t3 - t2);
+    recordCost(renderTiming_.last, renderTiming_.total, renderTiming_.count,
+               renderTiming_.max, t4 - t3);
+    recordCost(packetRenderTiming_.last, packetRenderTiming_.total, packetRenderTiming_.count,
+               packetRenderTiming_.max, t4 - t0);
+    stageTimingSampleCount_.fetch_add(1);
+    return true;
+}
+
+void NativePlayer::recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs) {
+    if (generation < 0 || ptsUs < 0 || monoUs < 0) {
+        return;
+    }
+
+    VideoStageTiming *record = nullptr;
+    for (VideoStageTiming &candidate : stageTimingRecords_) {
+        if (candidate.generation == generation && candidate.ptsUs == ptsUs) {
+            record = &candidate;
+            break;
+        }
+    }
+
+    if (record == nullptr && stage != StageTimingPoint::PacketReady) {
+        // Output-side event without a matching packet record is a correlation
+        // miss, never a fabricated record.
+        if (stage == StageTimingPoint::DecodedOutput) {
+            decoderTimingUnmatchedCount_.fetch_add(1);
+        } else if (stage == StageTimingPoint::RenderBegin) {
+            renderTimingUnmatchedCount_.fetch_add(1);
+        }
+        return;
+    }
+
+    if (record == nullptr) {
+        if (stageTimingRecords_.size() >= kStageTimingMaxRecords) {
+            stageTimingRecords_.pop_front();
+            stageTimingEvictionCount_.fetch_add(1);
+        }
+        stageTimingRecords_.push_back(VideoStageTiming{});
+        record = &stageTimingRecords_.back();
+        record->generation = generation;
+        record->ptsUs = ptsUs;
+    }
+
+    switch (stage) {
+        case StageTimingPoint::PacketReady:
+            record->packetReadyMonoUs = monoUs;
+            break;
+        case StageTimingPoint::DecoderSubmit:
+            record->decoderSubmitMonoUs = monoUs;
+            break;
+        case StageTimingPoint::DecodedOutput:
+            record->decodedOutputMonoUs = monoUs;
+            break;
+        case StageTimingPoint::RenderBegin:
+            record->renderBeginMonoUs = monoUs;
+            break;
+        case StageTimingPoint::RenderSubmit:
+            record->renderSubmitMonoUs = monoUs;
+            finalizeStageTiming(*record);
+            break;
+    }
+}
+
+void NativePlayer::recordStageTimingRenderSubmit(int64_t ptsUs) {
+    recordVideoStageTiming(videoPtsGeneration_.load(), ptsUs, StageTimingPoint::RenderSubmit, steadyNowUs());
 }
 
 SyncMaster NativePlayer::effectiveSyncMaster(const PlayerOptions &options) const {
@@ -4504,6 +4650,7 @@ void NativePlayer::playbackLoop() {
         if (packet_->stream_index == videoStreamIndex_) {
             videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
+            const int64_t packetReadyMonoUs = steadyNowUs();
             // LAT1 P0: video packet demuxed and identified (media timeline us).
             if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
                 bool packetPtsValid = false;
@@ -4516,6 +4663,9 @@ void NativePlayer::playbackLoop() {
                         if (packetPtsUs < maxVideoPacketPtsUs_.load()) {
                             videoPtsBackwardCount_.fetch_add(1);
                         }
+                        // LAT2 T0: demux return for this video packet (monotonic).
+                        recordVideoStageTiming(videoPtsGeneration_.load(), packetPtsUs,
+                                               StageTimingPoint::PacketReady, packetReadyMonoUs);
                     }
                 }
                 videoPacketPtsValid_.store(packetPtsValid);
@@ -4601,6 +4751,9 @@ void NativePlayer::playbackLoop() {
                 if (inputPtsUs < maxDecoderInputPtsUs_.load()) {
                     decoderPtsBackwardCount_.fetch_add(1);
                 }
+                // LAT2 T1: packet submitted to decoder (monotonic, same packet PTS).
+                recordVideoStageTiming(videoPtsGeneration_.load(), inputPtsUs,
+                                       StageTimingPoint::DecoderSubmit, sendStartUs);
             } else {
                 latestDecoderInputPtsUs_.store(-1);
                 decoderInputPtsValid_.store(false);
@@ -4649,6 +4802,9 @@ void NativePlayer::playbackLoop() {
                             if (framePtsUs < maxDecodedFramePtsUs_.load()) {
                                 decodedPtsBackwardCount_.fetch_add(1);
                             }
+                            // LAT2 T2: decoded frame output (monotonic).
+                            recordVideoStageTiming(videoPtsGeneration_.load(), framePtsUs,
+                                                   StageTimingPoint::DecodedOutput, steadyNowUs());
                         }
                     }
                     decodedFramePtsValid_.store(framePtsValid);
@@ -4853,6 +5009,7 @@ bool NativePlayer::renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs) {
     hardwareRenderedFrameCount_.fetch_add(1);
     commitRendererSuccess(rendererState_, 5, false);  // direct_surface
     markFrameRendered();
+    recordStageTimingRenderSubmit(ptsUs);
     return true;
 }
 
@@ -5097,6 +5254,11 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         latestRenderedFramePtsUs_.store(-1);
         renderedFramePtsValid_.store(false);
     }
+    // LAT2 T3: render begin (frame enters the render mainline, monotonic).
+    if (isValidPts(ptsUs)) {
+        recordVideoStageTiming(videoPtsGeneration_.load(), ptsUs,
+                               StageTimingPoint::RenderBegin, steadyNowUs());
+    }
     lastVideoFrameTimeMs_.store(nowMs());
     if (sourceFormat == AV_PIX_FMT_MEDIACODEC) {
         return renderMediaCodecFrame(frame, ptsUs);
@@ -5139,6 +5301,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         && optionsSnapshot.usingHardwareDecoder) {
         // NV12 GL success bypasses sws_scale / RGBA / ANativeWindow entirely.
         if (renderNv12GlFrame(frame, frameWidth, frameHeight, ptsUs)) {
+            recordStageTimingRenderSubmit(ptsUs);
             return true;
         }
         // render failure falls through to the safe sws/RGBA path (counted + logged in renderNv12GlFrame).
@@ -5152,6 +5315,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
             return true;
         }
         if (renderSoftwareYuvGlFrame(frame, frameWidth, frameHeight)) {
+            recordStageTimingRenderSubmit(ptsUs);
             return true;
         }
         setRendererFallbackReason(rendererState_, 2);
@@ -5241,6 +5405,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     softwareRenderedFrameCount_.fetch_add(1);
     commitRendererSuccess(rendererState_, 1, true);  // rgba_nativewindow
     markFrameRendered();
+    recordStageTimingRenderSubmit(ptsUs);
     return true;
 }
 
@@ -5502,6 +5667,7 @@ void NativePlayer::resetStats() {
     decodedPtsBackwardCount_.store(0);
     renderedPtsBackwardCount_.store(0);
     latencyPtsResetCount_.store(0);
+    stageTimingResetCount_.store(0);
 }
 
 void NativePlayer::releaseFfmpegResources() {

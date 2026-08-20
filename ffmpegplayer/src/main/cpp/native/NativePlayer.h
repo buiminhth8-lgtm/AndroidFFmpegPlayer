@@ -139,6 +139,34 @@ public:
     std::string release();
 
 private:
+    // LAT2 stage-timing capture points along the video pipeline (single monotonic clock).
+    enum class StageTimingPoint {
+        PacketReady = 0,    // T0: av_read_frame returned a video packet
+        DecoderSubmit = 1,  // T1: packet submitted to decoder
+        DecodedOutput = 2,  // T2: decoded frame output from decoder
+        RenderBegin = 3,    // T3: frame enters the render mainline
+        RenderSubmit = 4    // T4: eglSwapBuffers / submit operation returned
+    };
+
+    // Bounded per-(generation, pts) timing record; all timestamps are monotonic us.
+    struct VideoStageTiming {
+        int64_t generation = -1;
+        int64_t ptsUs = -1;
+        int64_t packetReadyMonoUs = -1;
+        int64_t decoderSubmitMonoUs = -1;
+        int64_t decodedOutputMonoUs = -1;
+        int64_t renderBeginMonoUs = -1;
+        int64_t renderSubmitMonoUs = -1;
+    };
+
+    // last/avg/max accumulator for a single stage duration.
+    struct StageTimingMetric {
+        std::atomic<int64_t> last{-1};
+        std::atomic<int64_t> total{0};
+        std::atomic<int64_t> count{0};
+        std::atomic<int64_t> max{0};
+    };
+
     static int interruptCallback(void *opaque);
 
     void playbackLoop();
@@ -163,6 +191,10 @@ private:
                                            int yStride, int colorRange);
     void resetRealtimeClockForFormatDiscontinuity();
     void resetVideoPtsDiagnostics();
+    void recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs);
+    void recordStageTimingRenderSubmit(int64_t ptsUs);
+    void resetStageTimingCorrelation();
+    bool finalizeStageTiming(VideoStageTiming &record);
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
@@ -418,6 +450,21 @@ private:
     std::atomic<int64_t> decodedPtsBackwardCount_{0};
     std::atomic<int64_t> renderedPtsBackwardCount_{0};
     std::atomic<int64_t> latencyPtsResetCount_{0};
+    // LAT2 monotonic stage timing (single steady monotonic clock; diagnostics only).
+    // Records and metric accumulators are owned by the playback thread; getStats()
+    // only reads the atomics, so no mutex is needed for the bounded deque.
+    std::deque<VideoStageTiming> stageTimingRecords_;
+    StageTimingMetric demuxSubmitTiming_;
+    StageTimingMetric decoderTiming_;
+    StageTimingMetric decodeRenderTiming_;
+    StageTimingMetric renderTiming_;
+    StageTimingMetric packetRenderTiming_;
+    std::atomic<int64_t> stageTimingSampleCount_{0};
+    std::atomic<int64_t> decoderTimingUnmatchedCount_{0};
+    std::atomic<int64_t> renderTimingUnmatchedCount_{0};
+    std::atomic<int64_t> stageTimingEvictionCount_{0};
+    std::atomic<int64_t> stageTimingResetCount_{0};
+    std::atomic<int64_t> stageTimingClockAnomalyCount_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};

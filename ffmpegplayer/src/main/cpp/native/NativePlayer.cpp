@@ -403,6 +403,10 @@ bool isValidPts(int64_t ptsUs) {
     return ptsUs != AV_NOPTS_VALUE && ptsUs >= 0;
 }
 
+int64_t rescaleToUs(int64_t ts, AVRational timeBase) {
+    return av_rescale_q(ts, timeBase, AV_TIME_BASE_Q);
+}
+
 bool isAudioPlaybackMasterAvailable(bool sourceHasAudio, bool audioEnabled, bool audioPlayable,
                                     bool audioPlaybackClockValid, bool audioClockStale) {
     return sourceHasAudio && audioEnabled && audioPlayable && audioPlaybackClockValid && !audioClockStale;
@@ -622,7 +626,8 @@ std::string NativePlayer::clearSurface() {
 
 int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage) {
     if (resetStreamMetadata) {
-sourceHasVideo_.store(false);
+        resetVideoPtsDiagnostics();
+        sourceHasVideo_.store(false);
         sourceHasAudio_.store(false);
         audioDecodeOpened_.store(false);
         audioPlayable_.store(false);
@@ -1689,6 +1694,26 @@ std::string NativePlayer::getStats() {
         prevStatsDecodeCount_.store(decodedCount);
         prevStatsTimeMs_.store(nowMsValue);
     }
+    // LAT1 media-timeline PTS backlog (all us on the same video media timeline).
+    // Computed from max-seen watermarks (robust to B-frame reorder) within the
+    // current generation. -1 means invalid (no PTS / reset / new generation).
+    const int64_t maxVideoPkt = maxVideoPacketPtsUs_.load();
+    const int64_t maxDecIn = maxDecoderInputPtsUs_.load();
+    const int64_t maxDecOut = maxDecodedFramePtsUs_.load();
+    const int64_t maxRend = maxRenderedFramePtsUs_.load();
+    if (maxVideoPkt >= 0 && maxDecIn >= 0 && maxDecOut >= 0 && maxRend >= 0) {
+        demuxToDecoderBacklogUs_.store(maxVideoPkt - maxDecIn);
+        decoderBacklogUs_.store(maxDecIn - maxDecOut);
+        renderBacklogUs_.store(maxDecOut - maxRend);
+        clientMediaBacklogUs_.store(maxVideoPkt - maxRend);
+        clientMediaBacklogValid_.store(true);
+    } else {
+        demuxToDecoderBacklogUs_.store(-1);
+        decoderBacklogUs_.store(-1);
+        renderBacklogUs_.store(-1);
+        clientMediaBacklogUs_.store(-1);
+        clientMediaBacklogValid_.store(false);
+    }
     const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
     const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
             ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
@@ -1883,6 +1908,29 @@ std::string NativePlayer::getStats() {
         << "\"metadataFps\":" << fps << ","
         << "\"measuredDecodeFps\":" << measuredDecodeFps_.load() << ","
         << "\"measuredRenderFps\":" << measuredRenderFps_.load() << ","
+        << "\"videoPtsGeneration\":" << videoPtsGeneration_.load() << ","
+        << "\"latestVideoPacketPtsUs\":" << latestVideoPacketPtsUs_.load() << ","
+        << "\"videoPacketPtsValid\":" << (videoPacketPtsValid_.load() ? "true" : "false") << ","
+        << "\"latestDecoderInputPtsUs\":" << latestDecoderInputPtsUs_.load() << ","
+        << "\"decoderInputPtsValid\":" << (decoderInputPtsValid_.load() ? "true" : "false") << ","
+        << "\"latestDecodedFramePtsUs\":" << latestDecodedFramePtsUs_.load() << ","
+        << "\"decodedFramePtsValid\":" << (decodedFramePtsValid_.load() ? "true" : "false") << ","
+        << "\"latestRenderedFramePtsUs\":" << latestRenderedFramePtsUs_.load() << ","
+        << "\"renderedFramePtsValid\":" << (renderedFramePtsValid_.load() ? "true" : "false") << ","
+        << "\"maxVideoPacketPtsUs\":" << maxVideoPkt << ","
+        << "\"maxDecoderInputPtsUs\":" << maxDecIn << ","
+        << "\"maxDecodedFramePtsUs\":" << maxDecOut << ","
+        << "\"maxRenderedFramePtsUs\":" << maxRend << ","
+        << "\"demuxToDecoderBacklogUs\":" << demuxToDecoderBacklogUs_.load() << ","
+        << "\"decoderBacklogUs\":" << decoderBacklogUs_.load() << ","
+        << "\"renderBacklogUs\":" << renderBacklogUs_.load() << ","
+        << "\"clientMediaBacklogUs\":" << clientMediaBacklogUs_.load() << ","
+        << "\"clientMediaBacklogValid\":" << (clientMediaBacklogValid_.load() ? "true" : "false") << ","
+        << "\"videoPtsBackwardCount\":" << videoPtsBackwardCount_.load() << ","
+        << "\"decoderPtsBackwardCount\":" << decoderPtsBackwardCount_.load() << ","
+        << "\"decodedPtsBackwardCount\":" << decodedPtsBackwardCount_.load() << ","
+        << "\"renderedPtsBackwardCount\":" << renderedPtsBackwardCount_.load() << ","
+        << "\"latencyPtsResetCount\":" << latencyPtsResetCount_.load() << ","
         << "\"videoWidth\":" << decodedVideoWidth << ","
         << "\"videoHeight\":" << decodedVideoHeight << ","
         << "\"decodedFormatGeneration\":" << decodedFormatGeneration << ","
@@ -2942,6 +2990,7 @@ bool NativePlayer::commitDecodedVideoFormatIfChanged(int frameWidth, int frameHe
 }
 
 void NativePlayer::resetRealtimeClockForFormatDiscontinuity() {
+    resetVideoPtsDiagnostics();
     PlayerState state;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -2958,6 +3007,35 @@ void NativePlayer::resetRealtimeClockForFormatDiscontinuity() {
     LOGI("realtime clock reset for decoded format discontinuity clearedCatchupGate=%d count=%lld",
          clearedCatchupGate ? 1 : 0,
          static_cast<long long>(realtimeClockFormatResetCount_.load()));
+}
+
+void NativePlayer::resetVideoPtsDiagnostics() {
+    // LAT1: invalidate all media-timeline PTS diagnostics for this generation and
+    // advance the generation. Call on new input session, reconnect, format
+    // discontinuity, and stats reset so stale PTS never leaks across timelines.
+    videoPtsGeneration_.fetch_add(1);
+    latestVideoPacketPtsUs_.store(-1);
+    videoPacketPtsValid_.store(false);
+    latestDecoderInputPtsUs_.store(-1);
+    decoderInputPtsValid_.store(false);
+    latestDecodedFramePtsUs_.store(-1);
+    decodedFramePtsValid_.store(false);
+    latestRenderedFramePtsUs_.store(-1);
+    renderedFramePtsValid_.store(false);
+    maxVideoPacketPtsUs_.store(-1);
+    maxDecoderInputPtsUs_.store(-1);
+    maxDecodedFramePtsUs_.store(-1);
+    maxRenderedFramePtsUs_.store(-1);
+    demuxToDecoderBacklogUs_.store(-1);
+    decoderBacklogUs_.store(-1);
+    renderBacklogUs_.store(-1);
+    clientMediaBacklogUs_.store(-1);
+    clientMediaBacklogValid_.store(false);
+    latencyPtsResetCount_.fetch_add(1);
+    videoPtsBackwardCount_.store(0);
+    decoderPtsBackwardCount_.store(0);
+    decodedPtsBackwardCount_.store(0);
+    renderedPtsBackwardCount_.store(0);
 }
 
 SyncMaster NativePlayer::effectiveSyncMaster(const PlayerOptions &options) const {
@@ -4426,6 +4504,25 @@ void NativePlayer::playbackLoop() {
         if (packet_->stream_index == videoStreamIndex_) {
             videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
+            // LAT1 P0: video packet demuxed and identified (media timeline us).
+            if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
+                bool packetPtsValid = false;
+                if (packet_->pts != AV_NOPTS_VALUE) {
+                    const int64_t packetPtsUs = rescaleToUs(packet_->pts, formatContext_->streams[videoStreamIndex_]->time_base);
+                    if (isValidPts(packetPtsUs)) {
+                        latestVideoPacketPtsUs_.store(packetPtsUs);
+                        packetPtsValid = true;
+                        updateMax(maxVideoPacketPtsUs_, packetPtsUs);
+                        if (packetPtsUs < maxVideoPacketPtsUs_.load()) {
+                            videoPtsBackwardCount_.fetch_add(1);
+                        }
+                    }
+                }
+                videoPacketPtsValid_.store(packetPtsValid);
+                if (!packetPtsValid) {
+                    latestVideoPacketPtsUs_.store(-1);
+                }
+            }
         } else if (packet_->stream_index == audioStreamIndex_) {
             audioPacketCount_.fetch_add(1);
             audioPacketBytes_.fetch_add(packetSize);
@@ -4495,6 +4592,19 @@ void NativePlayer::playbackLoop() {
                 av_packet_unref(packet_);
                 continue;
             }
+            // LAT1 P1: packet accepted by the decoder (same packet PTS, media timeline us).
+            if (videoPacketPtsValid_.load()) {
+                const int64_t inputPtsUs = latestVideoPacketPtsUs_.load();
+                latestDecoderInputPtsUs_.store(inputPtsUs);
+                decoderInputPtsValid_.store(true);
+                updateMax(maxDecoderInputPtsUs_, inputPtsUs);
+                if (inputPtsUs < maxDecoderInputPtsUs_.load()) {
+                    decoderPtsBackwardCount_.fetch_add(1);
+                }
+            } else {
+                latestDecoderInputPtsUs_.store(-1);
+                decoderInputPtsValid_.store(false);
+            }
 
             PlayerOptions optionsSnapshot;
             {
@@ -4526,6 +4636,26 @@ void NativePlayer::playbackLoop() {
                     break;
                 }
                 recordCost(lastReceiveFrameCostUs_, totalDecodeCostUs_, decodeCostSampleCount_, maxDecodeCostUs_, receiveCostUs);
+
+                // LAT1 P2: decoded frame output from the decoder (media timeline us).
+                if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
+                    bool framePtsValid = false;
+                    if (decodedFrame_->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        const int64_t framePtsUs = rescaleToUs(decodedFrame_->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base);
+                        if (isValidPts(framePtsUs)) {
+                            latestDecodedFramePtsUs_.store(framePtsUs);
+                            framePtsValid = true;
+                            updateMax(maxDecodedFramePtsUs_, framePtsUs);
+                            if (framePtsUs < maxDecodedFramePtsUs_.load()) {
+                                decodedPtsBackwardCount_.fetch_add(1);
+                            }
+                        }
+                    }
+                    decodedFramePtsValid_.store(framePtsValid);
+                    if (!framePtsValid) {
+                        latestDecodedFramePtsUs_.store(-1);
+                    }
+                }
 
                 if (latestFrameOnly && decodedFrame_->format != AV_PIX_FMT_MEDIACODEC) {
                     if (hasLatestFrame) {
@@ -4955,6 +5085,17 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     }
     if (isValidPts(ptsUs)) {
         videoClockUs_.store(ptsUs);
+        // LAT1 P3: frame committed to the render path (media timeline us).
+        latestRenderedFramePtsUs_.store(ptsUs);
+        renderedFramePtsValid_.store(true);
+        updateMax(maxRenderedFramePtsUs_, ptsUs);
+        if (ptsUs < maxRenderedFramePtsUs_.load()) {
+            renderedPtsBackwardCount_.fetch_add(1);
+        }
+    } else {
+        // LAT1 P3: no valid media PTS for this rendered frame.
+        latestRenderedFramePtsUs_.store(-1);
+        renderedFramePtsValid_.store(false);
     }
     lastVideoFrameTimeMs_.store(nowMs());
     if (sourceFormat == AV_PIX_FMT_MEDIACODEC) {
@@ -5355,6 +5496,12 @@ void NativePlayer::resetStats() {
     lastReconnectErrorCode_.store(0);
     lastReconnectError_.clear();
     lastFrameFormatName_.clear();
+    resetVideoPtsDiagnostics();
+    videoPtsBackwardCount_.store(0);
+    decoderPtsBackwardCount_.store(0);
+    decodedPtsBackwardCount_.store(0);
+    renderedPtsBackwardCount_.store(0);
+    latencyPtsResetCount_.store(0);
 }
 
 void NativePlayer::releaseFfmpegResources() {

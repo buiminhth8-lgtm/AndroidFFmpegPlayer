@@ -162,6 +162,7 @@ private:
     bool commitDecodedVideoFormatIfChanged(int frameWidth, int frameHeight, int frameFormat,
                                            int yStride, int colorRange);
     void resetRealtimeClockForFormatDiscontinuity();
+    void resetVideoPtsDiagnostics();
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
     bool renderNv12GlFrame(AVFrame *frame, int frameWidth, int frameHeight, int64_t ptsUs);
@@ -393,6 +394,30 @@ private:
     std::atomic<int64_t> prevStatsDecodeCount_{0};
     std::atomic<int64_t> prevStatsRenderCount_{0};
     std::atomic<int64_t> prevStatsTimeMs_{0};
+    // LAT1 PTS backlog diagnostics (media timeline us; diagnostics only).
+    std::atomic<int64_t> videoPtsGeneration_{0};
+    std::atomic<int64_t> latestVideoPacketPtsUs_{-1};
+    std::atomic<bool> videoPacketPtsValid_{false};
+    std::atomic<int64_t> latestDecoderInputPtsUs_{-1};
+    std::atomic<bool> decoderInputPtsValid_{false};
+    std::atomic<int64_t> latestDecodedFramePtsUs_{-1};
+    std::atomic<bool> decodedFramePtsValid_{false};
+    std::atomic<int64_t> latestRenderedFramePtsUs_{-1};
+    std::atomic<bool> renderedFramePtsValid_{false};
+    std::atomic<int64_t> maxVideoPacketPtsUs_{-1};
+    std::atomic<int64_t> maxDecoderInputPtsUs_{-1};
+    std::atomic<int64_t> maxDecodedFramePtsUs_{-1};
+    std::atomic<int64_t> maxRenderedFramePtsUs_{-1};
+    std::atomic<int64_t> demuxToDecoderBacklogUs_{-1};
+    std::atomic<int64_t> decoderBacklogUs_{-1};
+    std::atomic<int64_t> renderBacklogUs_{-1};
+    std::atomic<int64_t> clientMediaBacklogUs_{-1};
+    std::atomic<bool> clientMediaBacklogValid_{false};
+    std::atomic<int64_t> videoPtsBackwardCount_{0};
+    std::atomic<int64_t> decoderPtsBackwardCount_{0};
+    std::atomic<int64_t> decodedPtsBackwardCount_{0};
+    std::atomic<int64_t> renderedPtsBackwardCount_{0};
+    std::atomic<int64_t> latencyPtsResetCount_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};

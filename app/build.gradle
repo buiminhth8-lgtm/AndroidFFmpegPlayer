@@ -31,19 +31,6 @@ android {
             abiFilters "armeabi-v7a", "arm64-v8a"
         }
     }
-    
-
-    sourceSets {
-        main {
-            jniLibs.srcDirs = ['../ffmpegplayer/src/main/jniLibs']
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path file('../ffmpegplayer/src/main/cpp/CMakeLists.txt')
-        }
-    }
     packagingOptions {
         jniLibs {
             useLegacyPackaging true
@@ -112,5 +99,6 @@ dependencies {
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"  // 濡傛灉浣犲湪 Android 涓婁娇鐢?
     //Android Utils
+    implementation project(':ffmpegplayer')
     implementation 'com.blankj:utilcodex:1.31.1'
 }

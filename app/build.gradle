@@ -101,4 +101,5 @@ dependencies {
     //Android Utils
     implementation project(':ffmpegplayer')
     implementation 'com.blankj:utilcodex:1.31.1'
+    testImplementation 'junit:junit:4.13.2'
 }

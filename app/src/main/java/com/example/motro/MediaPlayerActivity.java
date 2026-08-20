@@ -83,6 +83,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private RadioGroup latencyModeRadioGroup;
     private TextView playbackInfoTextView;
     private int statsLogCounter;
+    private long latencyStatsSeq;
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
@@ -886,6 +887,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + windowLine);
             if (++statsLogCounter % 5 == 0) {
                 Log.d(TAG_STATS, statsJson);
+                logCompactLatencyStats(stats);
                 Log.d(TAG_AUDIO_LIFECYCLE,
                         "player=" + player
                                 + " player=" + playerState
@@ -920,6 +922,96 @@ public class MediaPlayerActivity extends AppCompatActivity {
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
         }
+    }
+
+    /**
+     * LAT3 diagnostics log-output fix: emit the compact, Logcat-safe latency
+     * lines from the exact same getStats() snapshot that produced the full
+     * FFmpegPlayerStats JSON (no second native snapshot). All four lines share
+     * one monotonic diagnostics sequence so they can be correlated even when
+     * interleaved with other log output. Stats JSON/API contract is untouched.
+     */
+    private void logCompactLatencyStats(JSONObject stats) {
+        final long seq = ++latencyStatsSeq;
+
+        final LatencyStatsFormatter.StateInfo stateInfo = new LatencyStatsFormatter.StateInfo(
+                stats.optLong("handle", 0),
+                stats.optString("state", "unknown"),
+                stats.optLong("videoPtsGeneration", 0),
+                stats.optLong("stageTimingGeneration", 0),
+                stats.optBoolean("steadyStateValid", false),
+                stats.optDouble("measuredDecodeFps", 0),
+                stats.optDouble("measuredRenderFps", 0),
+                stats.optString("decodeBackend", "unknown"),
+                stats.optString("frameOutputType", "unknown"),
+                stats.optString("renderer", "unknown"),
+                stats.optLong("videoPacketCount", 0),
+                stats.optLong("videoFrameCount", 0),
+                stats.optLong("renderedFrameCount", 0));
+
+        final LatencyStatsFormatter.MediaInfo mediaInfo = new LatencyStatsFormatter.MediaInfo(
+                stats.optBoolean("clientMediaBacklogValid", false),
+                stats.optLong("demuxToDecoderBacklogUs", -1),
+                stats.optLong("decoderBacklogUs", -1),
+                stats.optLong("renderBacklogUs", -1),
+                stats.optLong("clientMediaBacklogUs", -1),
+                stats.optLong("demuxToDecoderBacklogP50Us", -1),
+                stats.optLong("demuxToDecoderBacklogP95Us", -1),
+                stats.optLong("demuxToDecoderBacklogP99Us", -1),
+                stats.optLong("demuxToDecoderBacklogDistCount", 0),
+                stats.optLong("decoderBacklogP50Us", -1),
+                stats.optLong("decoderBacklogP95Us", -1),
+                stats.optLong("decoderBacklogP99Us", -1),
+                stats.optLong("decoderBacklogDistCount", 0),
+                stats.optLong("renderBacklogP50Us", -1),
+                stats.optLong("renderBacklogP95Us", -1),
+                stats.optLong("renderBacklogP99Us", -1),
+                stats.optLong("renderBacklogDistCount", 0),
+                stats.optLong("clientMediaBacklogP50Us", -1),
+                stats.optLong("clientMediaBacklogP95Us", -1),
+                stats.optLong("clientMediaBacklogP99Us", -1),
+                stats.optLong("clientMediaBacklogDistCount", 0));
+
+        final LatencyStatsFormatter.StageInfo stageInfo = new LatencyStatsFormatter.StageInfo(
+                stats.optLong("demuxReturnToDecoderSubmitP50Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitP95Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitP99Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitDistCount", 0),
+                stats.optLong("decoderSubmitToOutputP50Us", -1),
+                stats.optLong("decoderSubmitToOutputP95Us", -1),
+                stats.optLong("decoderSubmitToOutputP99Us", -1),
+                stats.optLong("decoderSubmitToOutputDistCount", 0),
+                stats.optLong("decodedOutputToRenderBeginP50Us", -1),
+                stats.optLong("decodedOutputToRenderBeginP95Us", -1),
+                stats.optLong("decodedOutputToRenderBeginP99Us", -1),
+                stats.optLong("decodedOutputToRenderBeginDistCount", 0),
+                stats.optLong("renderBeginToSubmitP50Us", -1),
+                stats.optLong("renderBeginToSubmitP95Us", -1),
+                stats.optLong("renderBeginToSubmitP99Us", -1),
+                stats.optLong("renderBeginToSubmitDistCount", 0),
+                stats.optLong("packetReadyToRenderSubmitP50Us", -1),
+                stats.optLong("packetReadyToRenderSubmitP95Us", -1),
+                stats.optLong("packetReadyToRenderSubmitP99Us", -1),
+                stats.optLong("packetReadyToRenderSubmitDistCount", 0));
+
+        final LatencyStatsFormatter.HealthInfo healthInfo = new LatencyStatsFormatter.HealthInfo(
+                stats.optLong("stageTimingSampleCount", 0),
+                stats.optLong("packetReadyToRenderSubmitDistCount", 0),
+                stats.optLong("clientMediaBacklogDistCount", 0),
+                stats.optLong("decoderTimingUnmatchedCount", 0),
+                stats.optLong("renderTimingUnmatchedCount", 0),
+                stats.optLong("stageTimingForcedEvictionCount", 0),
+                stats.optLong("stageTimingResetCount", 0),
+                stats.optLong("stageTimingClockAnomalyCount", 0),
+                stats.optLong("videoPtsBackwardCount", 0),
+                stats.optLong("decoderPtsBackwardCount", 0),
+                stats.optLong("decodedPtsBackwardCount", 0),
+                stats.optLong("renderedPtsBackwardCount", 0));
+
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stageLine(seq, stageInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.healthLine(seq, healthInfo));
     }
 
     private void resetPlaybackInfoCounters() {

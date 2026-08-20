@@ -35,13 +35,13 @@ android {
 
     sourceSets {
         main {
-            jniLibs.srcDirs = ['src/main/jniLibs']
+            jniLibs.srcDirs = ['../ffmpegplayer/src/main/jniLibs']
         }
     }
 
     externalNativeBuild {
         cmake {
-            path file('src/main/cpp/CMakeLists.txt')
+            path file('../ffmpegplayer/src/main/cpp/CMakeLists.txt')
         }
     }
     packagingOptions {

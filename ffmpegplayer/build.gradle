@@ -26,13 +26,13 @@ android {
                 exclude 'com/example/motro/ExoplayerPlayerActivity.java'
                 exclude 'com/example/motro/PlayerLauncherActivity.java'
             }
-            jniLibs.srcDirs = ['../app/src/main/jniLibs']
+            jniLibs.srcDirs = ['src/main/jniLibs']
         }
     }
 
     externalNativeBuild {
         cmake {
-            path file('../app/src/main/cpp/CMakeLists.txt')
+            path file('src/main/cpp/CMakeLists.txt')
         }
     }
 

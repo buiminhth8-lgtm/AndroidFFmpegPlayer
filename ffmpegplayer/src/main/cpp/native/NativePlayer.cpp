@@ -48,6 +48,11 @@ constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 // plus decoder reorder headroom; never grows unbounded.
 constexpr size_t kStageTimingMaxRecords = 256;
 
+// LAT3: warm-up samples excluded from steady-state distribution percentiles.
+// ~25fps => ~120 samples ~= 5s, past freshness flush / keyframe wait / EGL
+// create / MediaCodec warm-up before steady state converges.
+constexpr int64_t kStageTimingWarmupSamples = 120;
+
 // A3 test-only hook (default 0 = production behavior unchanged).
 std::atomic<int> g_audio_worker_test_delay_ms{0};
 
@@ -537,6 +542,68 @@ bool containsInsensitive(const std::string &value, const char *needle) {
 }
 
 } // namespace
+
+void LatencyDistribution::addSample(int64_t us) {
+    if (us < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    samples_[static_cast<size_t>(head_)] = us;
+    head_ = (head_ + 1) % static_cast<int>(kLatencyDistributionWindow);
+    if (count_ < static_cast<int>(kLatencyDistributionWindow)) {
+        ++count_;
+    }
+}
+
+void LatencyDistribution::reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    count_ = 0;
+    head_ = 0;
+}
+
+int64_t LatencyDistribution::percentileIndex(int pct, int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    int64_t rank = (static_cast<int64_t>(pct) * n + 99) / 100;
+    if (rank < 1) {
+        rank = 1;
+    }
+    if (rank > n) {
+        rank = n;
+    }
+    return rank - 1;
+}
+
+LatencyDistribution::Snapshot LatencyDistribution::snapshot() const {
+    Snapshot snap;
+    std::vector<int64_t> sorted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (count_ <= 0) {
+            return snap;
+        }
+        sorted.reserve(static_cast<size_t>(count_));
+        for (int i = 0; i < count_; ++i) {
+            const int idx = (head_ - count_ + i + static_cast<int>(kLatencyDistributionWindow))
+                            % static_cast<int>(kLatencyDistributionWindow);
+            sorted.push_back(samples_[static_cast<size_t>(idx)]);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end());
+    const int n = static_cast<int>(sorted.size());
+    int64_t sum = 0;
+    for (int64_t v : sorted) {
+        sum += v;
+    }
+    snap.count = n;
+    snap.avg = n > 0 ? sum / n : 0;
+    snap.p50 = sorted[static_cast<size_t>(percentileIndex(50, n))];
+    snap.p95 = sorted[static_cast<size_t>(percentileIndex(95, n))];
+    snap.p99 = sorted[static_cast<size_t>(percentileIndex(99, n))];
+    snap.max = sorted.back();
+    return snap;
+}
 
 void NativePlayer::setJavaVm(JavaVM *javaVm) {
     g_native_player_java_vm = javaVm;
@@ -1718,6 +1785,24 @@ std::string NativePlayer::getStats() {
         clientMediaBacklogUs_.store(-1);
         clientMediaBacklogValid_.store(false);
     }
+    // LAT3: sample LAT1 media backlog into steady-state distributions (polling
+    // cadence; only after warm-up so startup transients don't skew percentiles).
+    if (clientMediaBacklogValid_.load() && steadyStateValid_.load()) {
+        demuxBacklogDist_.addSample(demuxToDecoderBacklogUs_.load());
+        decoderBacklogDist_.addSample(decoderBacklogUs_.load());
+        renderBacklogDist_.addSample(renderBacklogUs_.load());
+        clientMediaBacklogDist_.addSample(clientMediaBacklogUs_.load());
+    }
+    // LAT3: distribution snapshots (bounded rolling window; steady-state only).
+    const LatencyDistribution::Snapshot demuxBacklogDist = demuxBacklogDist_.snapshot();
+    const LatencyDistribution::Snapshot decoderBacklogDist = decoderBacklogDist_.snapshot();
+    const LatencyDistribution::Snapshot renderBacklogDist = renderBacklogDist_.snapshot();
+    const LatencyDistribution::Snapshot clientMediaBacklogDist = clientMediaBacklogDist_.snapshot();
+    const LatencyDistribution::Snapshot demuxSubmitDist = demuxSubmitDist_.snapshot();
+    const LatencyDistribution::Snapshot decoderResidenceDist = decoderResidenceDist_.snapshot();
+    const LatencyDistribution::Snapshot decodeRenderDist = decodeRenderDist_.snapshot();
+    const LatencyDistribution::Snapshot renderSubmitDist = renderSubmitDist_.snapshot();
+    const LatencyDistribution::Snapshot packetRenderDist = packetRenderDist_.snapshot();
     const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
     const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
             ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
@@ -1937,24 +2022,69 @@ std::string NativePlayer::getStats() {
         << "\"latencyPtsResetCount\":" << latencyPtsResetCount_.load() << ","
         << "\"stageTimingGeneration\":" << videoPtsGeneration_.load() << ","
         << "\"stageTimingSampleCount\":" << stageTimingSampleCount_.load() << ","
+        << "\"steadyStateValid\":" << (steadyStateValid_.load() ? "true" : "false") << ","
         << "\"lastDemuxReturnToDecoderSubmitUs\":" << demuxSubmitTiming_.last.load() << ","
         << "\"avgDemuxReturnToDecoderSubmitUs\":" << averageUs(demuxSubmitTiming_.total.load(), demuxSubmitTiming_.count.load()) << ","
         << "\"maxDemuxReturnToDecoderSubmitUs\":" << demuxSubmitTiming_.max.load() << ","
+        << "\"demuxReturnToDecoderSubmitP50Us\":" << demuxSubmitDist.p50 << ","
+        << "\"demuxReturnToDecoderSubmitP95Us\":" << demuxSubmitDist.p95 << ","
+        << "\"demuxReturnToDecoderSubmitP99Us\":" << demuxSubmitDist.p99 << ","
+        << "\"demuxReturnToDecoderSubmitDistCount\":" << demuxSubmitDist.count << ","
         << "\"lastDecoderSubmitToOutputUs\":" << decoderTiming_.last.load() << ","
         << "\"avgDecoderSubmitToOutputUs\":" << averageUs(decoderTiming_.total.load(), decoderTiming_.count.load()) << ","
         << "\"maxDecoderSubmitToOutputUs\":" << decoderTiming_.max.load() << ","
+        << "\"decoderSubmitToOutputP50Us\":" << decoderResidenceDist.p50 << ","
+        << "\"decoderSubmitToOutputP95Us\":" << decoderResidenceDist.p95 << ","
+        << "\"decoderSubmitToOutputP99Us\":" << decoderResidenceDist.p99 << ","
+        << "\"decoderSubmitToOutputDistCount\":" << decoderResidenceDist.count << ","
         << "\"lastDecodedOutputToRenderBeginUs\":" << decodeRenderTiming_.last.load() << ","
         << "\"avgDecodedOutputToRenderBeginUs\":" << averageUs(decodeRenderTiming_.total.load(), decodeRenderTiming_.count.load()) << ","
         << "\"maxDecodedOutputToRenderBeginUs\":" << decodeRenderTiming_.max.load() << ","
+        << "\"decodedOutputToRenderBeginP50Us\":" << decodeRenderDist.p50 << ","
+        << "\"decodedOutputToRenderBeginP95Us\":" << decodeRenderDist.p95 << ","
+        << "\"decodedOutputToRenderBeginP99Us\":" << decodeRenderDist.p99 << ","
+        << "\"decodedOutputToRenderBeginDistCount\":" << decodeRenderDist.count << ","
         << "\"lastRenderBeginToSubmitUs\":" << renderTiming_.last.load() << ","
         << "\"avgRenderBeginToSubmitUs\":" << averageUs(renderTiming_.total.load(), renderTiming_.count.load()) << ","
         << "\"maxRenderBeginToSubmitUs\":" << renderTiming_.max.load() << ","
+        << "\"renderBeginToSubmitP50Us\":" << renderSubmitDist.p50 << ","
+        << "\"renderBeginToSubmitP95Us\":" << renderSubmitDist.p95 << ","
+        << "\"renderBeginToSubmitP99Us\":" << renderSubmitDist.p99 << ","
+        << "\"renderBeginToSubmitDistCount\":" << renderSubmitDist.count << ","
         << "\"lastPacketReadyToRenderSubmitUs\":" << packetRenderTiming_.last.load() << ","
         << "\"avgPacketReadyToRenderSubmitUs\":" << averageUs(packetRenderTiming_.total.load(), packetRenderTiming_.count.load()) << ","
         << "\"maxPacketReadyToRenderSubmitUs\":" << packetRenderTiming_.max.load() << ","
+        << "\"packetReadyToRenderSubmitP50Us\":" << packetRenderDist.p50 << ","
+        << "\"packetReadyToRenderSubmitP95Us\":" << packetRenderDist.p95 << ","
+        << "\"packetReadyToRenderSubmitP99Us\":" << packetRenderDist.p99 << ","
+        << "\"packetReadyToRenderSubmitDistCount\":" << packetRenderDist.count << ","
+        << "\"demuxToDecoderBacklogP50Us\":" << demuxBacklogDist.p50 << ","
+        << "\"demuxToDecoderBacklogP95Us\":" << demuxBacklogDist.p95 << ","
+        << "\"demuxToDecoderBacklogP99Us\":" << demuxBacklogDist.p99 << ","
+        << "\"demuxToDecoderBacklogAvgUs\":" << demuxBacklogDist.avg << ","
+        << "\"demuxToDecoderBacklogMaxUs\":" << demuxBacklogDist.max << ","
+        << "\"demuxToDecoderBacklogDistCount\":" << demuxBacklogDist.count << ","
+        << "\"decoderBacklogP50Us\":" << decoderBacklogDist.p50 << ","
+        << "\"decoderBacklogP95Us\":" << decoderBacklogDist.p95 << ","
+        << "\"decoderBacklogP99Us\":" << decoderBacklogDist.p99 << ","
+        << "\"decoderBacklogAvgUs\":" << decoderBacklogDist.avg << ","
+        << "\"decoderBacklogMaxUs\":" << decoderBacklogDist.max << ","
+        << "\"decoderBacklogDistCount\":" << decoderBacklogDist.count << ","
+        << "\"renderBacklogP50Us\":" << renderBacklogDist.p50 << ","
+        << "\"renderBacklogP95Us\":" << renderBacklogDist.p95 << ","
+        << "\"renderBacklogP99Us\":" << renderBacklogDist.p99 << ","
+        << "\"renderBacklogAvgUs\":" << renderBacklogDist.avg << ","
+        << "\"renderBacklogMaxUs\":" << renderBacklogDist.max << ","
+        << "\"renderBacklogDistCount\":" << renderBacklogDist.count << ","
+        << "\"clientMediaBacklogP50Us\":" << clientMediaBacklogDist.p50 << ","
+        << "\"clientMediaBacklogP95Us\":" << clientMediaBacklogDist.p95 << ","
+        << "\"clientMediaBacklogP99Us\":" << clientMediaBacklogDist.p99 << ","
+        << "\"clientMediaBacklogAvgUs\":" << clientMediaBacklogDist.avg << ","
+        << "\"clientMediaBacklogMaxUs\":" << clientMediaBacklogDist.max << ","
+        << "\"clientMediaBacklogDistCount\":" << clientMediaBacklogDist.count << ","
         << "\"decoderTimingUnmatchedCount\":" << decoderTimingUnmatchedCount_.load() << ","
         << "\"renderTimingUnmatchedCount\":" << renderTimingUnmatchedCount_.load() << ","
-        << "\"stageTimingEvictionCount\":" << stageTimingEvictionCount_.load() << ","
+        << "\"stageTimingForcedEvictionCount\":" << stageTimingForcedEvictionCount_.load() << ","
         << "\"stageTimingResetCount\":" << stageTimingResetCount_.load() << ","
         << "\"stageTimingClockAnomalyCount\":" << stageTimingClockAnomalyCount_.load() << ","
         << "\"videoWidth\":" << decodedVideoWidth << ","
@@ -3091,9 +3221,20 @@ void NativePlayer::resetStageTimingCorrelation() {
     stageTimingSampleCount_.store(0);
     decoderTimingUnmatchedCount_.store(0);
     renderTimingUnmatchedCount_.store(0);
-    stageTimingEvictionCount_.store(0);
+    stageTimingForcedEvictionCount_.store(0);
     stageTimingClockAnomalyCount_.store(0);
     stageTimingResetCount_.fetch_add(1);
+    // LAT3: clear steady-state distribution windows and warm-up gate.
+    demuxBacklogDist_.reset();
+    decoderBacklogDist_.reset();
+    renderBacklogDist_.reset();
+    clientMediaBacklogDist_.reset();
+    demuxSubmitDist_.reset();
+    decoderResidenceDist_.reset();
+    decodeRenderDist_.reset();
+    renderSubmitDist_.reset();
+    packetRenderDist_.reset();
+    steadyStateValid_.store(false);
 }
 
 bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
@@ -3111,17 +3252,32 @@ bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
         stageTimingClockAnomalyCount_.fetch_add(1);
         return false;
     }
+    const int64_t demuxSubmitUs = t1 - t0;
+    const int64_t decoderResidenceUs = t2 - t1;
+    const int64_t decodeRenderUs = t3 - t2;
+    const int64_t renderUs = t4 - t3;
+    const int64_t packetRenderUs = t4 - t0;
     recordCost(demuxSubmitTiming_.last, demuxSubmitTiming_.total, demuxSubmitTiming_.count,
-               demuxSubmitTiming_.max, t1 - t0);
+               demuxSubmitTiming_.max, demuxSubmitUs);
     recordCost(decoderTiming_.last, decoderTiming_.total, decoderTiming_.count,
-               decoderTiming_.max, t2 - t1);
+               decoderTiming_.max, decoderResidenceUs);
     recordCost(decodeRenderTiming_.last, decodeRenderTiming_.total, decodeRenderTiming_.count,
-               decodeRenderTiming_.max, t3 - t2);
+               decodeRenderTiming_.max, decodeRenderUs);
     recordCost(renderTiming_.last, renderTiming_.total, renderTiming_.count,
-               renderTiming_.max, t4 - t3);
+               renderTiming_.max, renderUs);
     recordCost(packetRenderTiming_.last, packetRenderTiming_.total, packetRenderTiming_.count,
-               packetRenderTiming_.max, t4 - t0);
-    stageTimingSampleCount_.fetch_add(1);
+               packetRenderTiming_.max, packetRenderUs);
+    // LAT3: exclude warm-up samples from the steady-state distribution window;
+    // ALL_TIME last/avg/max above always keeps the full history.
+    const int64_t newCount = stageTimingSampleCount_.fetch_add(1) + 1;
+    if (newCount > kStageTimingWarmupSamples) {
+        steadyStateValid_.store(true);
+        demuxSubmitDist_.addSample(demuxSubmitUs);
+        decoderResidenceDist_.addSample(decoderResidenceUs);
+        decodeRenderDist_.addSample(decodeRenderUs);
+        renderSubmitDist_.addSample(renderUs);
+        packetRenderDist_.addSample(packetRenderUs);
+    }
     return true;
 }
 
@@ -3130,15 +3286,15 @@ void NativePlayer::recordVideoStageTiming(int64_t generation, int64_t ptsUs, Sta
         return;
     }
 
-    VideoStageTiming *record = nullptr;
-    for (VideoStageTiming &candidate : stageTimingRecords_) {
-        if (candidate.generation == generation && candidate.ptsUs == ptsUs) {
-            record = &candidate;
+    auto recordIt = stageTimingRecords_.end();
+    for (auto it = stageTimingRecords_.begin(); it != stageTimingRecords_.end(); ++it) {
+        if (it->generation == generation && it->ptsUs == ptsUs) {
+            recordIt = it;
             break;
         }
     }
 
-    if (record == nullptr && stage != StageTimingPoint::PacketReady) {
+    if (recordIt == stageTimingRecords_.end() && stage != StageTimingPoint::PacketReady) {
         // Output-side event without a matching packet record is a correlation
         // miss, never a fabricated record.
         if (stage == StageTimingPoint::DecodedOutput) {
@@ -3149,33 +3305,39 @@ void NativePlayer::recordVideoStageTiming(int64_t generation, int64_t ptsUs, Sta
         return;
     }
 
-    if (record == nullptr) {
+    if (recordIt == stageTimingRecords_.end()) {
         if (stageTimingRecords_.size() >= kStageTimingMaxRecords) {
+            // Forced eviction of an unresolved record (completed records are
+            // retired on RenderSubmit, so this only happens on correlation stalls).
             stageTimingRecords_.pop_front();
-            stageTimingEvictionCount_.fetch_add(1);
+            stageTimingForcedEvictionCount_.fetch_add(1);
         }
         stageTimingRecords_.push_back(VideoStageTiming{});
-        record = &stageTimingRecords_.back();
-        record->generation = generation;
-        record->ptsUs = ptsUs;
+        recordIt = stageTimingRecords_.end();
+        --recordIt;
+        recordIt->generation = generation;
+        recordIt->ptsUs = ptsUs;
     }
 
     switch (stage) {
         case StageTimingPoint::PacketReady:
-            record->packetReadyMonoUs = monoUs;
+            recordIt->packetReadyMonoUs = monoUs;
             break;
         case StageTimingPoint::DecoderSubmit:
-            record->decoderSubmitMonoUs = monoUs;
+            recordIt->decoderSubmitMonoUs = monoUs;
             break;
         case StageTimingPoint::DecodedOutput:
-            record->decodedOutputMonoUs = monoUs;
+            recordIt->decodedOutputMonoUs = monoUs;
             break;
         case StageTimingPoint::RenderBegin:
-            record->renderBeginMonoUs = monoUs;
+            recordIt->renderBeginMonoUs = monoUs;
             break;
         case StageTimingPoint::RenderSubmit:
-            record->renderSubmitMonoUs = monoUs;
-            finalizeStageTiming(*record);
+            recordIt->renderSubmitMonoUs = monoUs;
+            // Retire the completed (or anomalous) record so only in-flight records
+            // remain bounded; keeps stageTimingForcedEvictionCount meaningful.
+            finalizeStageTiming(*recordIt);
+            stageTimingRecords_.erase(recordIt);
             break;
     }
 }

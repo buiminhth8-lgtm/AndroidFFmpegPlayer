@@ -11,6 +11,7 @@
 
 #include <jni.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -91,6 +92,35 @@ enum class PlayerState {
     Stopped,
     Error,
     Released
+};
+
+// LAT3 bounded rolling-window latency distribution. Fixed-size ring (no unbounded
+// growth); percentiles are nearest-rank over the most recent samples. The mutex
+// critical sections are tiny (one slot write on add, one copy on snapshot).
+constexpr size_t kLatencyDistributionWindow = 1024;
+
+class LatencyDistribution {
+public:
+    struct Snapshot {
+        int64_t count = 0;
+        int64_t avg = 0;
+        int64_t p50 = 0;
+        int64_t p95 = 0;
+        int64_t p99 = 0;
+        int64_t max = 0;
+    };
+
+    void addSample(int64_t us);
+    void reset();
+    Snapshot snapshot() const;
+
+private:
+    static int64_t percentileIndex(int pct, int n);
+
+    mutable std::mutex mutex_;
+    std::array<int64_t, kLatencyDistributionWindow> samples_{};
+    int count_ = 0;
+    int head_ = 0;
 };
 
 class NativePlayer {
@@ -462,9 +492,20 @@ private:
     std::atomic<int64_t> stageTimingSampleCount_{0};
     std::atomic<int64_t> decoderTimingUnmatchedCount_{0};
     std::atomic<int64_t> renderTimingUnmatchedCount_{0};
-    std::atomic<int64_t> stageTimingEvictionCount_{0};
+    std::atomic<int64_t> stageTimingForcedEvictionCount_{0};
     std::atomic<int64_t> stageTimingResetCount_{0};
     std::atomic<int64_t> stageTimingClockAnomalyCount_{0};
+    // LAT3 distribution (bounded rolling window, steady-state percentiles).
+    LatencyDistribution demuxBacklogDist_;
+    LatencyDistribution decoderBacklogDist_;
+    LatencyDistribution renderBacklogDist_;
+    LatencyDistribution clientMediaBacklogDist_;
+    LatencyDistribution demuxSubmitDist_;
+    LatencyDistribution decoderResidenceDist_;
+    LatencyDistribution decodeRenderDist_;
+    LatencyDistribution renderSubmitDist_;
+    LatencyDistribution packetRenderDist_;
+    std::atomic<bool> steadyStateValid_{false};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};

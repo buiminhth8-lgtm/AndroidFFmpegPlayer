@@ -1668,6 +1668,27 @@ std::string NativePlayer::getStats() {
 
     wallClockUs_.store(steadyNowUs());
     const std::string effectiveSyncMasterValue = effectiveSyncMasterName(optionsSnapshot);
+    // LAT0 measured FPS (monotonic wall-time delta between getStats snapshots).
+    {
+        const int64_t nowMsValue = nowMs();
+        const int64_t renderedCount = videoFrameCount_.load();
+        const int64_t decodedCount = hardwareDecodedFrameCount_.load() + softwareDecodedFrameCount_.load();
+        const int64_t prevTime = prevStatsTimeMs_.load();
+        if (prevTime > 0 && nowMsValue > prevTime) {
+            const int64_t dtMs = nowMsValue - prevTime;
+            if (dtMs >= 1000) {
+                if (renderedCount >= prevStatsRenderCount_.load()) {
+                    measuredRenderFps_.store((renderedCount - prevStatsRenderCount_.load()) * 1000.0 / dtMs);
+                }
+                if (decodedCount >= prevStatsDecodeCount_.load()) {
+                    measuredDecodeFps_.store((decodedCount - prevStatsDecodeCount_.load()) * 1000.0 / dtMs);
+                }
+            }
+        }
+        prevStatsRenderCount_.store(renderedCount);
+        prevStatsDecodeCount_.store(decodedCount);
+        prevStatsTimeMs_.store(nowMsValue);
+    }
     const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
     const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
             ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
@@ -1858,7 +1879,10 @@ std::string NativePlayer::getStats() {
         << "\"streamBitRate\":" << streamBitRate_.load() << ","
         << "\"videoBitRate\":" << videoBitRate_.load() << ","
         << "\"audioBitRate\":" << audioBitRate_.load() << ","
-        << "\"fps\":" << fps << ","
+<< "\"fps\":" << fps << ","
+        << "\"metadataFps\":" << fps << ","
+        << "\"measuredDecodeFps\":" << measuredDecodeFps_.load() << ","
+        << "\"measuredRenderFps\":" << measuredRenderFps_.load() << ","
         << "\"videoWidth\":" << decodedVideoWidth << ","
         << "\"videoHeight\":" << decodedVideoHeight << ","
         << "\"decodedFormatGeneration\":" << decodedFormatGeneration << ","
@@ -5268,6 +5292,11 @@ void NativePlayer::resetStats() {
     lastFrameCacheCandidateCount_.store(0);
     lastReadPacketTimeMs_.store(0);
     lastVideoFrameTimeMs_.store(0);
+    measuredDecodeFps_.store(0.0);
+    measuredRenderFps_.store(0.0);
+    prevStatsDecodeCount_.store(0);
+    prevStatsRenderCount_.store(0);
+    prevStatsTimeMs_.store(0);
     lastAudioFrameTimeMs_.store(0);
     lastRenderTimeMs_.store(0);
     lastSnapshotTimeMs_.store(0);

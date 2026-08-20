@@ -385,6 +385,14 @@ private:
     std::atomic<uint32_t> rendererState_{0};
     std::atomic<int64_t> lastReadPacketTimeMs_{0};
     std::atomic<int64_t> lastVideoFrameTimeMs_{0};
+    // LAT0 FPS diagnostics: metadataFps is the stream-declared rate; measured
+    // decode/render fps are computed from monotonic wall-time deltas between
+    // getStats() snapshots (heuristic, not per-frame).
+    std::atomic<double> measuredDecodeFps_{0.0};
+    std::atomic<double> measuredRenderFps_{0.0};
+    std::atomic<int64_t> prevStatsDecodeCount_{0};
+    std::atomic<int64_t> prevStatsRenderCount_{0};
+    std::atomic<int64_t> prevStatsTimeMs_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};

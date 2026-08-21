@@ -68,6 +68,24 @@ public class LatencyStatsFormatterTest {
                 0, 0, 0, 0);
     }
 
+    private static LatencyStatsFormatter.PreT0Info validPreT0() {
+        return new LatencyStatsFormatter.PreT0Info(
+                39800, 44200, 80100, 1024,
+                40000, 41500, 80000, 1024,
+                40000, 12, 4,
+                2, 1, 0, 0,
+                0, 1, 0, 0);
+    }
+
+    private static LatencyStatsFormatter.PreT0Info notReadyPreT0() {
+        return new LatencyStatsFormatter.PreT0Info(
+                0, 0, 0, 0,
+                0, 0, 0, 0,
+                -1, 0, 0,
+                0, 0, 0, 0,
+                0, 0, 0, 0);
+    }
+
     @Test
     public void stateLineContainsIdentityGenerationAndFps() {
         String line = LatencyStatsFormatter.stateLine(SEQ, stateInfo());
@@ -164,11 +182,39 @@ public class LatencyStatsFormatterTest {
     }
 
     @Test
+    public void preT0LineShowsReadGapPtsDeltaBurstAndStalls() {
+        String line = LatencyStatsFormatter.preT0Line(SEQ, validPreT0());
+        assertTrue(line, line.startsWith("seq=123 PRET0"));
+        assertTrue(line, line.contains(" readMs=39.800/44.200/80.100"));
+        assertTrue(line, line.contains(" videoGapMs=40.000/41.500/80.000"));
+        assertTrue(line, line.contains(" ptsDeltaMs=40.000"));
+        assertTrue(line, line.contains(" fast=12"));
+        assertTrue(line, line.contains(" maxBurst=4"));
+        assertTrue(line, line.contains(" stall=2/1/0/0"));
+        assertTrue(line, line.contains(" eagain=0"));
+        assertTrue(line, line.contains(" timeout=1"));
+        assertTrue(line, line.contains(" eof=0"));
+        assertTrue(line, line.contains(" error=0"));
+    }
+
+    @Test
+    public void preT0LineShowsNotReadyAsDash() {
+        String line = LatencyStatsFormatter.preT0Line(SEQ, notReadyPreT0());
+        assertTrue(line, line.startsWith("seq=123 PRET0"));
+        assertTrue(line, line.contains(" readMs=--/--/--"));
+        assertTrue(line, line.contains(" videoGapMs=--/--/--"));
+        assertTrue(line, line.contains(" ptsDeltaMs=--"));
+        assertFalse(line, line.contains("readMs=0"));
+        assertFalse(line, line.contains("videoGapMs=0"));
+    }
+
+    @Test
     public void allLinesShareSameSequenceAndStayShortAndSingleLine() {
         String[] lines = new String[]{
                 LatencyStatsFormatter.stateLine(SEQ, stateInfo()),
                 LatencyStatsFormatter.mediaLine(SEQ, validMedia()),
                 LatencyStatsFormatter.stageLine(SEQ, validStage()),
+                LatencyStatsFormatter.preT0Line(SEQ, validPreT0()),
                 LatencyStatsFormatter.healthLine(SEQ, healthInfo())
         };
         int maxLength = 0;
@@ -180,6 +226,6 @@ public class LatencyStatsFormatterTest {
             maxLength = Math.max(maxLength, line.length());
         }
         System.out.println("MAX_COMPACT_LOG_LENGTH=" + maxLength);
-        assertEquals(4, lines.length);
+        assertEquals(5, lines.length);
     }
 }

@@ -994,6 +994,28 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stats.optLong("packetReadyToRenderSubmitP99Us", -1),
                 stats.optLong("packetReadyToRenderSubmitDistCount", 0));
 
+        final boolean ptsDeltaReady = stats.optLong("videoPacketPtsDeltaSampleCount", 0) > 0;
+        final LatencyStatsFormatter.PreT0Info preT0Info = new LatencyStatsFormatter.PreT0Info(
+                stats.optLong("avReadFrameDurationP50Us", -1),
+                stats.optLong("avReadFrameDurationP95Us", -1),
+                stats.optLong("avReadFrameDurationP99Us", -1),
+                stats.optLong("avReadFrameDurationDistCount", 0),
+                stats.optLong("videoPacketReturnGapP50Us", -1),
+                stats.optLong("videoPacketReturnGapP95Us", -1),
+                stats.optLong("videoPacketReturnGapP99Us", -1),
+                stats.optLong("videoPacketReturnGapDistCount", 0),
+                ptsDeltaReady ? stats.optLong("avgVideoPacketPtsDeltaUs", -1) : -1,
+                stats.optLong("fastReturnPacketCount", 0),
+                stats.optLong("maxFastReturnBurstLength", 0),
+                stats.optLong("readStallGt100MsCount", 0),
+                stats.optLong("readStallGt250MsCount", 0),
+                stats.optLong("readStallGt500MsCount", 0),
+                stats.optLong("readStallGt1000MsCount", 0),
+                stats.optLong("readEagainCount", 0),
+                stats.optLong("readTimeoutCount", 0),
+                stats.optLong("readEofCount", 0),
+                stats.optLong("readErrorCount", 0));
+
         final LatencyStatsFormatter.HealthInfo healthInfo = new LatencyStatsFormatter.HealthInfo(
                 stats.optLong("stageTimingSampleCount", 0),
                 stats.optLong("packetReadyToRenderSubmitDistCount", 0),
@@ -1011,6 +1033,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stageLine(seq, stageInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.preT0Line(seq, preT0Info));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.healthLine(seq, healthInfo));
     }
 

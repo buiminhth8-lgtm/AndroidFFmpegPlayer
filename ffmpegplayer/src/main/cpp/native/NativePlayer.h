@@ -8,6 +8,8 @@
 #include "NativeNv12GlRenderer.h"
 #include "ThermalConfig.h"
 #include "VideoRenderer.h"
+#include "LatencyDistribution.h"
+#include "PreT0TimingTracker.h"
 
 #include <jni.h>
 
@@ -92,35 +94,6 @@ enum class PlayerState {
     Stopped,
     Error,
     Released
-};
-
-// LAT3 bounded rolling-window latency distribution. Fixed-size ring (no unbounded
-// growth); percentiles are nearest-rank over the most recent samples. The mutex
-// critical sections are tiny (one slot write on add, one copy on snapshot).
-constexpr size_t kLatencyDistributionWindow = 1024;
-
-class LatencyDistribution {
-public:
-    struct Snapshot {
-        int64_t count = 0;
-        int64_t avg = 0;
-        int64_t p50 = 0;
-        int64_t p95 = 0;
-        int64_t p99 = 0;
-        int64_t max = 0;
-    };
-
-    void addSample(int64_t us);
-    void reset();
-    Snapshot snapshot() const;
-
-private:
-    static int64_t percentileIndex(int pct, int n);
-
-    mutable std::mutex mutex_;
-    std::array<int64_t, kLatencyDistributionWindow> samples_{};
-    int count_ = 0;
-    int head_ = 0;
 };
 
 class NativePlayer {
@@ -513,6 +486,11 @@ private:
     std::atomic<int64_t> totalReadFrameCostUs_{0};
     std::atomic<int64_t> readFrameCostSampleCount_{0};
     std::atomic<int64_t> maxReadFrameCostUs_{0};
+    // LAT5: RTSP / RTP Pre-T0 isolation diagnostics (read call duration,
+    // video packet return cadence, PTS delta, burst, stall, error classes).
+    PreT0TimingTracker preT0Timing_;
+    // LAT5: effective AVFormatContext::max_delay read back after open (us).
+    std::atomic<int64_t> effectiveFmtCtxMaxDelayUs_{0};
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};

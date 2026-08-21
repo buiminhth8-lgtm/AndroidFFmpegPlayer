@@ -396,6 +396,26 @@ void recordCost(std::atomic<int64_t> &last,
     updateMax(maxValue, costUs);
 }
 
+// LAT5: classify an av_read_frame() result for the pre-T0 diagnostics tracker.
+// Semantics: OK = packet returned; EAGAIN = would-block; TIMEOUT = protocol
+// read timeout; EOF = end of stream; ERROR = other failure. Classification only
+// feeds diagnostics; reconnect/error handling below is unchanged.
+PreT0TimingTracker::ReadResultClass classifyReadResult(int result) {
+    if (result >= 0) {
+        return PreT0TimingTracker::ReadResultClass::ReadOk;
+    }
+    if (result == AVERROR(EAGAIN)) {
+        return PreT0TimingTracker::ReadResultClass::ReadEagain;
+    }
+    if (result == AVERROR(ETIMEDOUT)) {
+        return PreT0TimingTracker::ReadResultClass::ReadTimeout;
+    }
+    if (result == AVERROR_EOF) {
+        return PreT0TimingTracker::ReadResultClass::ReadEof;
+    }
+    return PreT0TimingTracker::ReadResultClass::ReadError;
+}
+
 bool shouldPreferUdpTransport(const PlayerOptions &options) {
     if (options.rtspTransport == RtspTransport::UDP || options.rtspTransport == RtspTransport::UDP_MULTICAST) {
         return true;
@@ -542,68 +562,6 @@ bool containsInsensitive(const std::string &value, const char *needle) {
 }
 
 } // namespace
-
-void LatencyDistribution::addSample(int64_t us) {
-    if (us < 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    samples_[static_cast<size_t>(head_)] = us;
-    head_ = (head_ + 1) % static_cast<int>(kLatencyDistributionWindow);
-    if (count_ < static_cast<int>(kLatencyDistributionWindow)) {
-        ++count_;
-    }
-}
-
-void LatencyDistribution::reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    count_ = 0;
-    head_ = 0;
-}
-
-int64_t LatencyDistribution::percentileIndex(int pct, int n) {
-    if (n <= 0) {
-        return 0;
-    }
-    int64_t rank = (static_cast<int64_t>(pct) * n + 99) / 100;
-    if (rank < 1) {
-        rank = 1;
-    }
-    if (rank > n) {
-        rank = n;
-    }
-    return rank - 1;
-}
-
-LatencyDistribution::Snapshot LatencyDistribution::snapshot() const {
-    Snapshot snap;
-    std::vector<int64_t> sorted;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (count_ <= 0) {
-            return snap;
-        }
-        sorted.reserve(static_cast<size_t>(count_));
-        for (int i = 0; i < count_; ++i) {
-            const int idx = (head_ - count_ + i + static_cast<int>(kLatencyDistributionWindow))
-                            % static_cast<int>(kLatencyDistributionWindow);
-            sorted.push_back(samples_[static_cast<size_t>(idx)]);
-        }
-    }
-    std::sort(sorted.begin(), sorted.end());
-    const int n = static_cast<int>(sorted.size());
-    int64_t sum = 0;
-    for (int64_t v : sorted) {
-        sum += v;
-    }
-    snap.count = n;
-    snap.avg = n > 0 ? sum / n : 0;
-    snap.p50 = sorted[static_cast<size_t>(percentileIndex(50, n))];
-    snap.p95 = sorted[static_cast<size_t>(percentileIndex(95, n))];
-    snap.p99 = sorted[static_cast<size_t>(percentileIndex(99, n))];
-    snap.max = sorted.back();
-    return snap;
-}
 
 void NativePlayer::setJavaVm(JavaVM *javaVm) {
     g_native_player_java_vm = javaVm;
@@ -814,6 +772,14 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         LOGI("unused FFmpeg open option %s=%s", unusedOption->key, unusedOption->value);
     }
     av_dict_free(&options);
+    if (result >= 0 && isRtspSource(sourceType)) {
+        // LAT5: read back the effective demuxer buffering value after open.
+        // configuredMaxDelayUs comes from PlayerOptions; this is the value the
+        // RTSP demuxer actually carries (us).
+        effectiveFmtCtxMaxDelayUs_.store(formatContext_->max_delay);
+        LOGI("RTSP effective max_delay=%d max_probe_packets=%d",
+             formatContext_->max_delay, formatContext_->max_probe_packets);
+    }
     if (result < 0) {
         errorMessage = ffmpegErrorToString(result);
         LOGE("RTSP open failed url=%s error=%s", url.c_str(), errorMessage.c_str());
@@ -1803,6 +1769,8 @@ std::string NativePlayer::getStats() {
     const LatencyDistribution::Snapshot decodeRenderDist = decodeRenderDist_.snapshot();
     const LatencyDistribution::Snapshot renderSubmitDist = renderSubmitDist_.snapshot();
     const LatencyDistribution::Snapshot packetRenderDist = packetRenderDist_.snapshot();
+    // LAT5: pre-T0 read/demux return diagnostics (same stats tick).
+    const PreT0TimingTracker::Snapshot preT0Timing = preT0Timing_.snapshot();
     const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
     const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
             ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
@@ -2221,6 +2189,43 @@ std::string NativePlayer::getStats() {
         << "\"lastReadFrameCostUs\":" << lastReadFrameCostUs_.load() << ","
         << "\"avgReadFrameCostUs\":" << avgReadFrameCostUs << ","
         << "\"maxReadFrameCostUs\":" << maxReadFrameCostUs_.load() << ","
+        // LAT5: pre-T0 RTSP/RTP isolation diagnostics. read duration is
+        // readWaitAndDemux (R1-R0), NOT network latency. All us, monotonic
+        // clock for durations/gaps; PTS delta is media-timeline.
+        << "\"readCallCount\":" << preT0Timing.readCallCount << ","
+        << "\"videoReadCallCount\":" << preT0Timing.videoReadCallCount << ","
+        << "\"lastAvReadFrameDurationUs\":" << preT0Timing.lastReadDurationUs << ","
+        << "\"avgAvReadFrameDurationUs\":" << preT0Timing.avgReadDurationUs << ","
+        << "\"maxAvReadFrameDurationUs\":" << preT0Timing.maxReadDurationUs << ","
+        << "\"avReadFrameDurationP50Us\":" << preT0Timing.readDurationP50Us << ","
+        << "\"avReadFrameDurationP95Us\":" << preT0Timing.readDurationP95Us << ","
+        << "\"avReadFrameDurationP99Us\":" << preT0Timing.readDurationP99Us << ","
+        << "\"avReadFrameDurationDistCount\":" << preT0Timing.readDurationDistCount << ","
+        << "\"lastVideoPacketReturnGapUs\":" << preT0Timing.lastVideoReturnGapUs << ","
+        << "\"avgVideoPacketReturnGapUs\":" << preT0Timing.avgVideoReturnGapUs << ","
+        << "\"maxVideoPacketReturnGapUs\":" << preT0Timing.maxVideoReturnGapUs << ","
+        << "\"videoPacketReturnGapP50Us\":" << preT0Timing.videoReturnGapP50Us << ","
+        << "\"videoPacketReturnGapP95Us\":" << preT0Timing.videoReturnGapP95Us << ","
+        << "\"videoPacketReturnGapP99Us\":" << preT0Timing.videoReturnGapP99Us << ","
+        << "\"videoPacketReturnGapDistCount\":" << preT0Timing.videoReturnGapDistCount << ","
+        << "\"lastVideoPacketPtsDeltaUs\":" << preT0Timing.lastVideoPtsDeltaUs << ","
+        << "\"avgVideoPacketPtsDeltaUs\":" << preT0Timing.avgVideoPtsDeltaUs << ","
+        << "\"maxVideoPacketPtsDeltaUs\":" << preT0Timing.maxVideoPtsDeltaUs << ","
+        << "\"videoPacketPtsDeltaSampleCount\":" << preT0Timing.videoPtsDeltaSampleCount << ","
+        << "\"fastVideoReturnThresholdUs\":" << static_cast<long long>(PreT0TimingTracker::kFastVideoReturnThresholdUs) << ","
+        << "\"fastReturnPacketCount\":" << preT0Timing.fastReturnPacketCount << ","
+        << "\"currentFastReturnBurstLength\":" << preT0Timing.currentFastReturnBurstLength << ","
+        << "\"maxFastReturnBurstLength\":" << preT0Timing.maxFastReturnBurstLength << ","
+        << "\"readStallGt100MsCount\":" << preT0Timing.readStallGt100MsCount << ","
+        << "\"readStallGt250MsCount\":" << preT0Timing.readStallGt250MsCount << ","
+        << "\"readStallGt500MsCount\":" << preT0Timing.readStallGt500MsCount << ","
+        << "\"readStallGt1000MsCount\":" << preT0Timing.readStallGt1000MsCount << ","
+        << "\"maxReadStallUs\":" << preT0Timing.maxReadStallUs << ","
+        << "\"readEagainCount\":" << preT0Timing.readEagainCount << ","
+        << "\"readTimeoutCount\":" << preT0Timing.readTimeoutCount << ","
+        << "\"readEofCount\":" << preT0Timing.readEofCount << ","
+        << "\"readErrorCount\":" << preT0Timing.readErrorCount << ","
+        << "\"effectiveFmtCtxMaxDelayUs\":" << effectiveFmtCtxMaxDelayUs_.load() << ","
         << "\"lastSendPacketCostUs\":" << lastSendPacketCostUs_.load() << ","
         << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
         << "\"avgDecodeCostUs\":" << avgDecodeCostUs << ","
@@ -3194,6 +3199,10 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     renderedPtsBackwardCount_.store(0);
     // LAT2: clear timing correlation records so old/new sessions never cross.
     resetStageTimingCorrelation();
+    // LAT5: clear pre-T0 read/gap/burst/stall diagnostics and invalidate the
+    // previous video return timestamp so no fake gap spans a new session.
+    preT0Timing_.reset();
+    effectiveFmtCtxMaxDelayUs_.store(0);
 }
 
 void NativePlayer::resetStageTimingCorrelation() {
@@ -4761,6 +4770,10 @@ void NativePlayer::playbackLoop() {
         const int64_t readCostUs = steadyNowUs() - readStartUs;
         recordCost(lastReadFrameCostUs_, totalReadFrameCostUs_, readFrameCostSampleCount_, maxReadFrameCostUs_,
                    readCostUs);
+        // LAT5: pre-T0 av_read_frame() call duration (R1 - R0 on the same
+        // steady monotonic clock as LAT2). Aggregated only; never per-packet
+        // logging. This is readWaitAndDemux, NOT network latency.
+        preT0Timing_.recordReadCall(readCostUs, classifyReadResult(readResult));
         if (readCostUs >= 1000000) {
             LOGE("read stall detected costUs=%lld result=%d",
                  static_cast<long long>(readCostUs), readResult);
@@ -4813,6 +4826,7 @@ void NativePlayer::playbackLoop() {
             videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
             const int64_t packetReadyMonoUs = steadyNowUs();
+            int64_t packetPtsUsForPreT0 = -1;
             // LAT1 P0: video packet demuxed and identified (media timeline us).
             if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
                 bool packetPtsValid = false;
@@ -4821,6 +4835,7 @@ void NativePlayer::playbackLoop() {
                     if (isValidPts(packetPtsUs)) {
                         latestVideoPacketPtsUs_.store(packetPtsUs);
                         packetPtsValid = true;
+                        packetPtsUsForPreT0 = packetPtsUs;
                         updateMax(maxVideoPacketPtsUs_, packetPtsUs);
                         if (packetPtsUs < maxVideoPacketPtsUs_.load()) {
                             videoPtsBackwardCount_.fetch_add(1);
@@ -4835,6 +4850,9 @@ void NativePlayer::playbackLoop() {
                     latestVideoPacketPtsUs_.store(-1);
                 }
             }
+            // LAT5: video packet return gap / PTS delta / burst detection.
+            // monoUs is T0 (R1); invalid PTS never fabricates a delta.
+            preT0Timing_.recordVideoReturn(packetReadyMonoUs, packetPtsUsForPreT0);
         } else if (packet_->stream_index == audioStreamIndex_) {
             audioPacketCount_.fetch_add(1);
             audioPacketBytes_.fetch_add(packetSize);

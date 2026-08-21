@@ -13,6 +13,7 @@ import java.util.Locale;
  *   FFmpegLatencyStats D seq=123 STATE  ...
  *   FFmpegLatencyStats D seq=123 MEDIA  ...
  *   FFmpegLatencyStats D seq=123 STAGE  ...
+ *   FFmpegLatencyStats D seq=123 PRET0  ...
  *   FFmpegLatencyStats D seq=123 HEALTH ...
  * </pre>
  *
@@ -203,6 +204,55 @@ final class LatencyStatsFormatter {
         }
     }
 
+    /** LAT5 pre-T0 av_read_frame / video packet return diagnostics (ms). */
+    static final class PreT0Info {
+        final long readP50Us;
+        final long readP95Us;
+        final long readP99Us;
+        final long readCount;
+        final long gapP50Us;
+        final long gapP95Us;
+        final long gapP99Us;
+        final long gapCount;
+        final long ptsDeltaAvgUs;
+        final long fastReturnCount;
+        final long maxFastBurst;
+        final long stall100;
+        final long stall250;
+        final long stall500;
+        final long stall1000;
+        final long eagain;
+        final long timeout;
+        final long eof;
+        final long error;
+
+        PreT0Info(long readP50Us, long readP95Us, long readP99Us, long readCount,
+                  long gapP50Us, long gapP95Us, long gapP99Us, long gapCount,
+                  long ptsDeltaAvgUs, long fastReturnCount, long maxFastBurst,
+                  long stall100, long stall250, long stall500, long stall1000,
+                  long eagain, long timeout, long eof, long error) {
+            this.readP50Us = readP50Us;
+            this.readP95Us = readP95Us;
+            this.readP99Us = readP99Us;
+            this.readCount = readCount;
+            this.gapP50Us = gapP50Us;
+            this.gapP95Us = gapP95Us;
+            this.gapP99Us = gapP99Us;
+            this.gapCount = gapCount;
+            this.ptsDeltaAvgUs = ptsDeltaAvgUs;
+            this.fastReturnCount = fastReturnCount;
+            this.maxFastBurst = maxFastBurst;
+            this.stall100 = stall100;
+            this.stall250 = stall250;
+            this.stall500 = stall500;
+            this.stall1000 = stall1000;
+            this.eagain = eagain;
+            this.timeout = timeout;
+            this.eof = eof;
+            this.error = error;
+        }
+    }
+
     static String stateLine(long seq, StateInfo info) {
         return "seq=" + seq
                 + " STATE"
@@ -258,6 +308,21 @@ final class LatencyStatsFormatter {
                 + " clockAnomaly=" + info.clockAnomaly
                 + " ptsBackward=" + info.videoPtsBackward + "/" + info.decoderPtsBackward
                 + "/" + info.decodedPtsBackward + "/" + info.renderedPtsBackward;
+    }
+
+    static String preT0Line(long seq, PreT0Info info) {
+        return "seq=" + seq
+                + " PRET0"
+                + " readMs=" + tripleMs(info.readP50Us, info.readP95Us, info.readP99Us, info.readCount)
+                + " videoGapMs=" + tripleMs(info.gapP50Us, info.gapP95Us, info.gapP99Us, info.gapCount)
+                + " ptsDeltaMs=" + ms3(info.ptsDeltaAvgUs)
+                + " fast=" + info.fastReturnCount
+                + " maxBurst=" + info.maxFastBurst
+                + " stall=" + info.stall100 + "/" + info.stall250 + "/" + info.stall500 + "/" + info.stall1000
+                + " eagain=" + info.eagain
+                + " timeout=" + info.timeout
+                + " eof=" + info.eof
+                + " error=" + info.error;
     }
 
     /** us -> ms with two decimals; negative/invalid renders as "--". */

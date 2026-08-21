@@ -262,15 +262,32 @@ final class LatencyStatsFormatter {
         final long t0WallNs;
         final long generation;
         final long resets;
+        final boolean srValid;
+        final long srCount;
+        final long sendToT0P50Us;
+        final long sendToT0P95Us;
+        final long sendToT0P99Us;
+        final long sendToT0Count;
+        final long anomalyCount;
 
         E2EInfo(String mode, String rxSync, long rtpClockRate,
-                long t0WallNs, long generation, long resets) {
+                long t0WallNs, long generation, long resets,
+                boolean srValid, long srCount,
+                long sendToT0P50Us, long sendToT0P95Us, long sendToT0P99Us,
+                long sendToT0Count, long anomalyCount) {
             this.mode = mode;
             this.rxSync = rxSync;
             this.rtpClockRate = rtpClockRate;
             this.t0WallNs = t0WallNs;
             this.generation = generation;
             this.resets = resets;
+            this.srValid = srValid;
+            this.srCount = srCount;
+            this.sendToT0P50Us = sendToT0P50Us;
+            this.sendToT0P95Us = sendToT0P95Us;
+            this.sendToT0P99Us = sendToT0P99Us;
+            this.sendToT0Count = sendToT0Count;
+            this.anomalyCount = anomalyCount;
         }
     }
 
@@ -347,24 +364,31 @@ final class LatencyStatsFormatter {
     }
 
     /**
-     * LAT6 E2E timebase line. No sender timestamps and no RTCP SR access exist
-     * in this build, so mode is "none", sendToT0Ms is "--" and valid=0: the
-     * cross-device segment is NOT measured (never fabricated as 0 ms).
-     * t0WallNs is the receiver wall timestamp at T0, comparable only with an
-     * independently synchronized sender/server wall clock.
+     * LAT6 E2E timebase line. mode=rtcp_sr (real RTCP Sender Reports received
+     * and mapped) or "none" (no SR seen yet). sendToT0Ms is the cross-device
+     * segment SR-generation-wall -> receiver-T0-wall (server + network +
+     * receiver pre-T0; NOT capture/encoder latency, NOT networkLatency),
+     * measured between synchronized wall clocks. syncErrMs stays "--" because
+     * the sync error is UNKNOWN (never 0). valid=1 only with a valid mapping
+     * and at least one distribution sample.
      */
     static String e2eLine(long seq, E2EInfo info) {
+        final boolean valid = info.srValid && info.sendToT0Count > 0;
         return "seq=" + seq
                 + " E2E"
                 + " mode=" + sanitize(info.mode)
                 + " sync=" + sanitize(info.rxSync)
                 + " syncErrMs=--"
                 + " rtpClock=" + (info.rtpClockRate > 0 ? String.valueOf(info.rtpClockRate) : "--")
-                + " sendToT0Ms=--/--/--"
+                + " srCount=" + info.srCount
+                + " srValid=" + bool(info.srValid)
+                + " sendToT0Ms="
+                + tripleMs(info.sendToT0P50Us, info.sendToT0P95Us, info.sendToT0P99Us, info.sendToT0Count)
+                + " anomaly=" + info.anomalyCount
                 + " t0WallNs=" + (info.t0WallNs >= 0 ? String.valueOf(info.t0WallNs) : "--")
                 + " gen=" + info.generation
                 + " resets=" + info.resets
-                + " valid=0";
+                + " valid=" + bool(valid);
     }
 
     /** us -> ms with two decimals; negative/invalid renders as "--". */

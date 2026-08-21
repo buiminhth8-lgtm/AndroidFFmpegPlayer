@@ -274,4 +274,139 @@ private:
     int64_t invalidCount_ = 0;
 };
 
+// LAT6-FINAL: RTCP Sender Report tracker fed from the public FFmpeg API
+// (AV_PKT_DATA_RTCP_SR packet side data, AVRTCPSenderReport). Establishes the
+// sender media clock -> sender wall clock mapping and measures the cross-device
+// segment SR-send-wall -> receiver-T0-wall.
+//
+// Semantics (frozen): srSendToT0Us is measured between two synchronized WALL
+// clocks (sender NTP vs receiver wall). It covers the control-plane path
+// SR generation -> receiver T0 observation (server + network + receiver
+// pre-T0) and is NOT capture/encoder latency and NOT named networkLatency.
+class RtcpSrTracker {
+public:
+    void setClockRate(int64_t rtpClockRateHz) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rtpClockRateHz_ = rtpClockRateHz;
+    }
+
+    // Feed one RTCP SR. Returns true only when this is a NEW report; the same
+    // SR is attached to many consecutive packets ("last received" semantics)
+    // and must be counted once.
+    bool recordSenderReport(uint32_t ssrc, uint64_t ntpTimestampRaw,
+                            uint32_t rtpTimestamp) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ntpTimestampRaw == lastSrNtpRaw_ && rtpTimestamp == lastSrRtpRaw_
+                && ssrc == lastSsrcRaw_ && hasAnySr_) {
+            ++duplicateCount_;
+            return false;
+        }
+        if (hasExpectedSsrc_ && ssrc != expectedSsrc_) {
+            ++ssrcMismatchCount_;
+            srMappingValid_ = false;
+            lastSrNtpRaw_ = ntpTimestampRaw;
+            lastSrRtpRaw_ = rtpTimestamp;
+            lastSsrcRaw_ = ssrc;
+            hasAnySr_ = true;
+            return true;
+        }
+        if (!hasExpectedSsrc_) {
+            expectedSsrc_ = ssrc;
+            hasExpectedSsrc_ = true;
+        }
+        const int64_t ntpNs = ntpToUnixNs(
+                static_cast<uint32_t>(ntpTimestampRaw >> 32),
+                static_cast<uint32_t>(ntpTimestampRaw & 0xffffffffULL));
+        const uint64_t extRtp = hasAnchor_
+                ? extendRtpTimestamp(lastExtRtp_, rtpTimestamp)
+                : static_cast<uint64_t>(rtpTimestamp);
+        if (hasAnchor_ && rtpClockRateHz_ > 0) {
+            const uint64_t rtpDeltaTicks = extRtp - lastExtRtp_;
+            const int64_t ntpDeltaNs = ntpNs - lastSrNtpNs_;
+            if (rtpDeltaTicks > 0 && ntpDeltaNs > 0) {
+                // Drift audit: NTP elapsed vs RTP elapsed at the nominal rate.
+                const int64_t expectedNs =
+                        static_cast<int64_t>((rtpDeltaTicks * 1000000000ULL)
+                                             / static_cast<uint64_t>(rtpClockRateHz_));
+                driftPpm_ = ((ntpDeltaNs - expectedNs) * 1000000) / expectedNs;
+            }
+        }
+        lastExtRtp_ = extRtp;
+        lastSrNtpNs_ = ntpNs;
+        hasAnchor_ = true;
+        srMappingValid_ = rtpClockRateHz_ > 0;
+        ++srReceivedCount_;
+        lastSrNtpRaw_ = ntpTimestampRaw;
+        lastSrRtpRaw_ = rtpTimestamp;
+        lastSsrcRaw_ = ssrc;
+        hasAnySr_ = true;
+        return true;
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hasAnchor_ = false;
+        srMappingValid_ = false;
+        srReceivedCount_ = 0;
+        duplicateCount_ = 0;
+        ssrcMismatchCount_ = 0;
+        driftPpm_ = 0;
+        lastExtRtp_ = 0;
+        lastSrNtpNs_ = 0;
+        lastSrNtpRaw_ = 0;
+        lastSrRtpRaw_ = 0;
+        lastSsrcRaw_ = 0;
+        hasAnySr_ = false;
+        // expectedSsrc_ intentionally kept: a reconnect to the same source
+        // keeps the SSRC check; a real SSRC change re-arms via mismatch path.
+    }
+
+    struct Snapshot {
+        bool hasAnchor = false;
+        bool srMappingValid = false;
+        int64_t srReceivedCount = 0;
+        int64_t duplicateCount = 0;
+        int64_t ssrcMismatchCount = 0;
+        int64_t driftPpm = 0;
+        uint32_t ssrc = 0;
+        uint64_t lastExtRtp = 0;
+        uint32_t lastSrRtpTimestamp = 0;
+        int64_t lastSrNtpNs = 0;
+    };
+
+    Snapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Snapshot snap;
+        snap.hasAnchor = hasAnchor_;
+        snap.srMappingValid = srMappingValid_;
+        snap.srReceivedCount = srReceivedCount_;
+        snap.duplicateCount = duplicateCount_;
+        snap.ssrcMismatchCount = ssrcMismatchCount_;
+        snap.driftPpm = driftPpm_;
+        snap.ssrc = expectedSsrc_;
+        snap.lastExtRtp = lastExtRtp_;
+        snap.lastSrRtpTimestamp = lastSrRtpRaw_;
+        snap.lastSrNtpNs = lastSrNtpNs_;
+        return snap;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    int64_t rtpClockRateHz_ = 0;
+    bool hasExpectedSsrc_ = false;
+    uint32_t expectedSsrc_ = 0;
+    bool hasAnchor_ = false;
+    bool srMappingValid_ = false;
+    bool hasAnySr_ = false;
+    int64_t srReceivedCount_ = 0;
+    int64_t duplicateCount_ = 0;
+    int64_t ssrcMismatchCount_ = 0;
+    int64_t driftPpm_ = 0;
+    uint64_t lastExtRtp_ = 0;
+    int64_t lastSrNtpNs_ = 0;
+    uint64_t lastSrNtpRaw_ = 0;
+    uint32_t lastSrRtpRaw_ = 0;
+    uint32_t lastSsrcRaw_ = 0;
+};
+
 #endif  // MOTRO_E2E_TIMEBASE_H

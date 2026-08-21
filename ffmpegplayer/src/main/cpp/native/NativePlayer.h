@@ -10,6 +10,7 @@
 #include "VideoRenderer.h"
 #include "LatencyDistribution.h"
 #include "PreT0TimingTracker.h"
+#include "E2ETimebase.h"
 
 #include <jni.h>
 
@@ -194,6 +195,7 @@ private:
                                            int yStride, int colorRange);
     void resetRealtimeClockForFormatDiscontinuity();
     void resetVideoPtsDiagnostics();
+    void processRtcpSenderReport(int64_t t0WallNs);
     void recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs);
     void recordStageTimingRenderSubmit(int64_t ptsUs);
     void resetStageTimingCorrelation();
@@ -502,6 +504,11 @@ private:
     std::atomic<int64_t> e2eResetCount_{0};
     std::atomic<int64_t> videoStreamTimeBaseNum_{0};
     std::atomic<int64_t> videoStreamTimeBaseDen_{0};
+    // LAT6-FINAL: RTCP Sender Report mapping (public AV_PKT_DATA_RTCP_SR side
+    // data). The tracker owns the sender media->wall anchor; the distribution
+    // holds bounded srSendToT0 percentiles (SR NTP wall -> receiver T0 wall).
+    RtcpSrTracker rtcpSrTracker_;
+    SendToT0Distribution e2eSrSendToT0Dist_;
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};

@@ -168,6 +168,60 @@ int main() {
         CHECK(mapper.snapshot().driftPpm == 50000);
     }
 
+    // 10. RTCP SR tracker: new SRs recorded once, duplicates suppressed, NTP
+    //     raw 64-bit conversion correct, srSendToT0 measured on wall clocks.
+    {
+        RtcpSrTracker tracker;
+        tracker.setClockRate(90000);
+        const uint64_t ntpRaw = (static_cast<uint64_t>(1755000000LL + 2208988800LL) << 32)
+                                | 0x80000000ULL;
+        CHECK(tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
+        // Same SR attached to many consecutive packets: counted once.
+        CHECK(!tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
+        CHECK(!tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
+        const RtcpSrTracker::Snapshot snap = tracker.snapshot();
+        CHECK(snap.srReceivedCount == 1);
+        CHECK(snap.duplicateCount == 2);
+        CHECK(snap.srMappingValid);
+        CHECK(snap.ssrc == 0x0a0b0c0d);
+        CHECK(snap.lastSrNtpNs == 1755000000LL * 1000000000LL + 500000000LL);
+        CHECK(snap.lastSrRtpTimestamp == 1000000);
+        // Cross-device segment: SR send wall -> receiver T0 wall (120 ms).
+        const E2ESampleResult seg =
+                measureSenderSendToReceiverT0Us(snap.lastSrNtpNs,
+                                                snap.lastSrNtpNs + 120000000LL);
+        CHECK(seg.valid);
+        CHECK(seg.latencyUs == 120000);
+    }
+
+    // 11. RTCP SR tracker: SSRC mismatch invalidates the mapping and is
+    //     counted; drift audit runs across two genuine reports.
+    {
+        RtcpSrTracker tracker;
+        tracker.setClockRate(90000);
+        const uint32_t baseSecs = static_cast<uint32_t>(1755000000LL + 2208988800LL);
+        CHECK(tracker.recordSenderReport(1, static_cast<uint64_t>(baseSecs) << 32, 0));
+        // Foreign SSRC: rejected mapping, still a "new" report.
+        CHECK(tracker.recordSenderReport(2, (static_cast<uint64_t>(baseSecs) << 32) + 0x80000000ULL, 90000));
+        const RtcpSrTracker::Snapshot bad = tracker.snapshot();
+        CHECK(bad.ssrcMismatchCount == 1);
+        CHECK(!bad.srMappingValid);
+        // Back to the expected SSRC, exactly 10 s of RTP and NTP later.
+        CHECK(tracker.recordSenderReport(1, static_cast<uint64_t>(baseSecs + 10) << 32, 900000));
+        const RtcpSrTracker::Snapshot good = tracker.snapshot();
+        CHECK(good.driftPpm == 0);
+        CHECK(good.srMappingValid);
+        // Next SR: exactly 0.5 s late over another 10 s of RTP -> 50000 ppm.
+        CHECK(tracker.recordSenderReport(
+                1, (static_cast<uint64_t>(baseSecs + 20) << 32) | 0x80000000ULL, 1800000));
+        CHECK(tracker.snapshot().driftPpm == 50000);
+        tracker.reset();
+        const RtcpSrTracker::Snapshot cleared = tracker.snapshot();
+        CHECK(cleared.srReceivedCount == 0);
+        CHECK(!cleared.hasAnchor);
+        CHECK(!cleared.srMappingValid);
+    }
+
     if (g_failures == 0) {
         std::printf("ALL_E2E_TIMEBASE_TESTS_PASSED\n");
         return 0;

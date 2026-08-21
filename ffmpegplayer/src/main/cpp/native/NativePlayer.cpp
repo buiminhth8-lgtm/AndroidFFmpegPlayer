@@ -1783,6 +1783,9 @@ std::string NativePlayer::getStats() {
     const LatencyDistribution::Snapshot packetRenderDist = packetRenderDist_.snapshot();
     // LAT5: pre-T0 read/demux return diagnostics (same stats tick).
     const PreT0TimingTracker::Snapshot preT0Timing = preT0Timing_.snapshot();
+    // LAT6-FINAL: RTCP SR mapping + srSendToT0 distribution (same stats tick).
+    const RtcpSrTracker::Snapshot e2eSr = rtcpSrTracker_.snapshot();
+    const SendToT0Distribution::Snapshot e2eDist = e2eSrSendToT0Dist_.snapshot();
     const int lastDecodedAudioSampleFormat = lastDecodedAudioSampleFormat_.load();
     const char *decodedAudioSampleFormatName = lastDecodedAudioSampleFormat >= 0
             ? av_get_sample_fmt_name(static_cast<AVSampleFormat>(lastDecodedAudioSampleFormat))
@@ -2237,14 +2240,16 @@ std::string NativePlayer::getStats() {
         << "\"readTimeoutCount\":" << preT0Timing.readTimeoutCount << ","
         << "\"readEofCount\":" << preT0Timing.readEofCount << ","
         << "\"readErrorCount\":" << preT0Timing.readErrorCount << ","
-        // LAT6: end-to-end timebase bridge (diagnostics only). No sender
-        // timestamps and no RTCP SR access exist in this build, so the E2E
-        // mode is honestly "none" and cross-device latency is NOT measured.
-        // lastPacketReadyWallNs is the receiver wall timestamp at T0; it is
-        // only comparable with an independently synchronized sender wall
-        // clock. clockSyncEstimatedErrorUs=-1 means UNKNOWN (never 0).
-        << "\"e2eMeasurementMode\":\"none\","
-        << "\"rtcpSrAccess\":\"unavailable\","
+        // LAT6/LAT6-FINAL: end-to-end timebase diagnostics. rtcpSrAccess is
+        // available via the public AV_PKT_DATA_RTCP_SR side data API; the
+        // measurement mode reflects what actually works at runtime (rtcp_sr
+        // only after real Sender Reports were received and mapped). The
+        // srSendToT0 segment is measured between synchronized WALL clocks
+        // (SR NTP -> receiver T0 wall) and covers SR generation -> receiver
+        // pre-T0 (server + network + demux); it is NOT capture/encoder latency
+        // and NOT networkLatency. clockSyncEstimatedErrorUs=-1 means UNKNOWN.
+        << "\"e2eMeasurementMode\":\"" << (e2eSr.srReceivedCount > 0 ? "rtcp_sr" : "none") << "\","
+        << "\"rtcpSrAccess\":\"available\","
         << "\"senderTimestampMode\":\"none\","
         << "\"senderClockSyncMethod\":\"not_available\","
         << "\"receiverClockSyncMethod\":\"system_auto_time_unverified\","
@@ -2258,6 +2263,20 @@ std::string NativePlayer::getStats() {
         << "\"lastPacketReadyWallNs\":" << lastPacketReadyWallNs_.load() << ","
         << "\"e2eGeneration\":" << e2eGeneration_.load() << ","
         << "\"e2eResetCount\":" << e2eResetCount_.load() << ","
+        // LAT6-FINAL RTCP SR mapping evidence + srSendToT0 distribution.
+        << "\"rtcpSrReceivedCount\":" << e2eSr.srReceivedCount << ","
+        << "\"rtcpSrDuplicateCount\":" << e2eSr.duplicateCount << ","
+        << "\"videoSsrc\":\"" << std::hex << e2eSr.ssrc << std::dec << "\","
+        << "\"lastSrNtpNs\":" << e2eSr.lastSrNtpNs << ","
+        << "\"lastSrRtpTimestamp\":" << static_cast<uint32_t>(e2eSr.lastSrRtpTimestamp) << ","
+        << "\"srMappingValid\":" << (e2eSr.srMappingValid && e2eSr.hasAnchor ? "true" : "false") << ","
+        << "\"srDriftPpm\":" << e2eSr.driftPpm << ","
+        << "\"srSsrcMismatchCount\":" << e2eSr.ssrcMismatchCount << ","
+        << "\"clockMappingAnomalyCount\":" << e2eDist.anomalyCount << ","
+        << "\"srSendToReceiverT0P50Us\":" << e2eDist.p50Us << ","
+        << "\"srSendToReceiverT0P95Us\":" << e2eDist.p95Us << ","
+        << "\"srSendToReceiverT0P99Us\":" << e2eDist.p99Us << ","
+        << "\"srSendToReceiverT0ValidCount\":" << e2eDist.validCount << ","
         << "\"effectiveFmtCtxMaxDelayUs\":" << effectiveFmtCtxMaxDelayUs_.load() << ","
         << "\"lastSendPacketCostUs\":" << lastSendPacketCostUs_.load() << ","
         << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
@@ -3244,6 +3263,37 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     videoStreamTimeBaseDen_.store(0);
     e2eGeneration_.fetch_add(1);
     e2eResetCount_.fetch_add(1);
+    // LAT6-FINAL: drop the SR anchor and srSendToT0 distribution with the old
+    // session so no stale sender wall sample can map into a new one.
+    rtcpSrTracker_.reset();
+    e2eSrSendToT0Dist_.reset();
+}
+
+void NativePlayer::processRtcpSenderReport(int64_t t0WallNs) {
+    const int64_t tbNum = videoStreamTimeBaseNum_.load();
+    const int64_t tbDen = videoStreamTimeBaseDen_.load();
+    if (tbNum > 0 && tbDen > 0) {
+        rtcpSrTracker_.setClockRate(tbDen / tbNum);
+    }
+    size_t srSize = 0;
+    const uint8_t *srData = av_packet_get_side_data(packet_, AV_PKT_DATA_RTCP_SR, &srSize);
+    if (srData == nullptr || srSize < sizeof(AVRTCPSenderReport)) {
+        return;
+    }
+    AVRTCPSenderReport sr;
+    std::memcpy(&sr, srData, sizeof(sr));
+    if (!rtcpSrTracker_.recordSenderReport(sr.ssrc, sr.ntp_timestamp, sr.rtp_timestamp)) {
+        return;  // duplicate of the last received report; counted only
+    }
+    const RtcpSrTracker::Snapshot srSnap = rtcpSrTracker_.snapshot();
+    // Cross-device segment: SR generation (sender NTP wall) -> receiver T0
+    // (receiver wall). Negative results are anomalies and invalidate the
+    // sample (never clamped to 0). Bounded distribution; startup excluded.
+    const E2ESampleResult sample =
+            measureSenderSendToReceiverT0Us(srSnap.lastSrNtpNs, t0WallNs);
+    if (steadyStateValid_.load()) {
+        e2eSrSendToT0Dist_.addSample(sample);
+    }
 }
 
 void NativePlayer::resetStageTimingCorrelation() {
@@ -4871,7 +4921,12 @@ void NativePlayer::playbackLoop() {
             // the T0 monotonic timestamp. Comparable only with an
             // independently synchronized sender/server wall clock; never used
             // for local stage durations (those stay monotonic).
-            lastPacketReadyWallNs_.store(wallClockNs());
+            const int64_t packetReadyWallNs = wallClockNs();
+            lastPacketReadyWallNs_.store(packetReadyWallNs);
+            // LAT6-FINAL: RTCP Sender Report (public AV_PKT_DATA_RTCP_SR side
+            // data). New reports update the sender media->wall anchor and add
+            // one bounded srSendToT0 sample; duplicates are counted only.
+            processRtcpSenderReport(packetReadyWallNs);
             int64_t packetPtsUsForPreT0 = -1;
             // LAT1 P0: video packet demuxed and identified (media timeline us).
             if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {

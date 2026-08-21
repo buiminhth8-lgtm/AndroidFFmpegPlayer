@@ -1036,7 +1036,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stats.optLong("videoRtpClockRate", 0),
                 stats.optLong("lastPacketReadyWallNs", -1),
                 stats.optLong("e2eGeneration", 0),
-                stats.optLong("e2eResetCount", 0));
+                stats.optLong("e2eResetCount", 0),
+                stats.optBoolean("srMappingValid", false),
+                stats.optLong("rtcpSrReceivedCount", 0),
+                stats.optLong("srSendToReceiverT0P50Us", -1),
+                stats.optLong("srSendToReceiverT0P95Us", -1),
+                stats.optLong("srSendToReceiverT0P99Us", -1),
+                stats.optLong("srSendToReceiverT0ValidCount", 0),
+                stats.optLong("clockMappingAnomalyCount", 0));
 
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));

@@ -491,6 +491,17 @@ private:
     PreT0TimingTracker preT0Timing_;
     // LAT5: effective AVFormatContext::max_delay read back after open (us).
     std::atomic<int64_t> effectiveFmtCtxMaxDelayUs_{0};
+    // LAT6: end-to-end timebase bridge (receiver side only; no sender
+    // timestamps and no RTCP SR access in this build). lastPacketReadyWallNs
+    // is the receiver WALL timestamp captured at the same event as the T0
+    // monotonic timestamp; it is only comparable with an independently
+    // synchronized sender/server wall clock. videoRtpClockRate is read from
+    // the video stream time_base (never hardcoded).
+    std::atomic<int64_t> lastPacketReadyWallNs_{-1};
+    std::atomic<int64_t> e2eGeneration_{0};
+    std::atomic<int64_t> e2eResetCount_{0};
+    std::atomic<int64_t> videoStreamTimeBaseNum_{0};
+    std::atomic<int64_t> videoStreamTimeBaseDen_{0};
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};

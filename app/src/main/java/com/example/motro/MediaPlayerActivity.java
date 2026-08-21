@@ -1030,11 +1030,40 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stats.optLong("decodedPtsBackwardCount", 0),
                 stats.optLong("renderedPtsBackwardCount", 0));
 
+        final LatencyStatsFormatter.E2EInfo e2eInfo = new LatencyStatsFormatter.E2EInfo(
+                stats.optString("e2eMeasurementMode", "none"),
+                receiverClockSyncMethod(),
+                stats.optLong("videoRtpClockRate", 0),
+                stats.optLong("lastPacketReadyWallNs", -1),
+                stats.optLong("e2eGeneration", 0),
+                stats.optLong("e2eResetCount", 0));
+
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stageLine(seq, stageInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.preT0Line(seq, preT0Info));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.e2eLine(seq, e2eInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.healthLine(seq, healthInfo));
+    }
+
+    /**
+     * LAT6: receiver clock sync evidence. Android keeps the system wall clock
+     * NTP-synced when auto-time is on; the sync ERROR is not observable here
+     * and stays UNKNOWN (never reported as 0 ms).
+     */
+    private String receiverClockSyncMethod() {
+        try {
+            final int autoTime = android.provider.Settings.Global.getInt(
+                    getContentResolver(), android.provider.Settings.Global.AUTO_TIME, -1);
+            if (autoTime == 1) {
+                return "auto_time";
+            }
+            if (autoTime == 0) {
+                return "manual";
+            }
+        } catch (Exception ignored) {
+        }
+        return "unknown";
     }
 
     private void resetPlaybackInfoCounters() {

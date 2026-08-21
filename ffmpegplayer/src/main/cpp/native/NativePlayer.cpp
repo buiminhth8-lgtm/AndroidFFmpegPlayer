@@ -1,5 +1,6 @@
 #include "NativePlayer.h"
 
+#include "E2ETimebase.h"
 #include "SnapshotManager.h"
 
 #include <android/log.h>
@@ -813,6 +814,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     std::string selectedAudioSampleFormatName;
     int64_t selectedVideoBitRate = 0;
     int64_t selectedAudioBitRate = 0;
+    // LAT6: selected video stream time_base (RTP media clock evidence).
+    int64_t selectedVideoTimeBaseNum = 0;
+    int64_t selectedVideoTimeBaseDen = 0;
     for (unsigned int i = 0; i < formatContext_->nb_streams; ++i) {
         AVStream *stream = formatContext_->streams[i];
         if (stream == nullptr || stream->codecpar == nullptr) {
@@ -825,6 +829,11 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
             selectedVideoHeight = params->height;
             selectedVideoCodec = codecName(params->codec_id);
             selectedVideoBitRate = std::max<int64_t>(0, params->bit_rate);
+            // LAT6: RTP media clock rate from the real SDP/stream-derived
+            // time_base (RTSP/RTP video streams carry 1/clock_rate here).
+            // Never hardcoded; 0/0 until a video stream is selected.
+            selectedVideoTimeBaseNum = stream->time_base.num;
+            selectedVideoTimeBaseDen = stream->time_base.den;
             selectedFps = rationalToDouble(stream->avg_frame_rate.num != 0
                                            ? stream->avg_frame_rate
                                            : stream->r_frame_rate);
@@ -857,6 +866,9 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         audioSampleFormat_ = selectedAudioSampleFormat;
         audioSampleFormatName_ = selectedAudioSampleFormatName;
     }
+    // LAT6: publish the selected video stream time_base (RTP clock evidence).
+    videoStreamTimeBaseNum_.store(selectedVideoTimeBaseNum);
+    videoStreamTimeBaseDen_.store(selectedVideoTimeBaseDen);
     videoBitRate_.store(selectedVideoBitRate);
     audioBitRate_.store(selectedAudioBitRate);
     sourceHasVideo_.store(selectedVideoStreamIndex >= 0);
@@ -2225,6 +2237,27 @@ std::string NativePlayer::getStats() {
         << "\"readTimeoutCount\":" << preT0Timing.readTimeoutCount << ","
         << "\"readEofCount\":" << preT0Timing.readEofCount << ","
         << "\"readErrorCount\":" << preT0Timing.readErrorCount << ","
+        // LAT6: end-to-end timebase bridge (diagnostics only). No sender
+        // timestamps and no RTCP SR access exist in this build, so the E2E
+        // mode is honestly "none" and cross-device latency is NOT measured.
+        // lastPacketReadyWallNs is the receiver wall timestamp at T0; it is
+        // only comparable with an independently synchronized sender wall
+        // clock. clockSyncEstimatedErrorUs=-1 means UNKNOWN (never 0).
+        << "\"e2eMeasurementMode\":\"none\","
+        << "\"rtcpSrAccess\":\"unavailable\","
+        << "\"senderTimestampMode\":\"none\","
+        << "\"senderClockSyncMethod\":\"not_available\","
+        << "\"receiverClockSyncMethod\":\"system_auto_time_unverified\","
+        << "\"clockSyncEstimatedErrorUs\":-1,"
+        << "\"videoStreamTimeBase\":\"" << videoStreamTimeBaseNum_.load() << "/"
+        << videoStreamTimeBaseDen_.load() << "\","
+        << "\"videoRtpClockRate\":" << (videoStreamTimeBaseNum_.load() > 0
+                                                && videoStreamTimeBaseDen_.load() >= videoStreamTimeBaseNum_.load()
+                                        ? videoStreamTimeBaseDen_.load() / videoStreamTimeBaseNum_.load()
+                                        : 0) << ","
+        << "\"lastPacketReadyWallNs\":" << lastPacketReadyWallNs_.load() << ","
+        << "\"e2eGeneration\":" << e2eGeneration_.load() << ","
+        << "\"e2eResetCount\":" << e2eResetCount_.load() << ","
         << "\"effectiveFmtCtxMaxDelayUs\":" << effectiveFmtCtxMaxDelayUs_.load() << ","
         << "\"lastSendPacketCostUs\":" << lastSendPacketCostUs_.load() << ","
         << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
@@ -3203,6 +3236,14 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     // previous video return timestamp so no fake gap spans a new session.
     preT0Timing_.reset();
     effectiveFmtCtxMaxDelayUs_.store(0);
+    // LAT6: invalidate the wall-clock bridge and advance the E2E generation so
+    // stale sender/receiver wall samples can never span sessions. The stream
+    // time_base evidence is cleared with the input it belonged to.
+    lastPacketReadyWallNs_.store(-1);
+    videoStreamTimeBaseNum_.store(0);
+    videoStreamTimeBaseDen_.store(0);
+    e2eGeneration_.fetch_add(1);
+    e2eResetCount_.fetch_add(1);
 }
 
 void NativePlayer::resetStageTimingCorrelation() {
@@ -4826,6 +4867,11 @@ void NativePlayer::playbackLoop() {
             videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
             const int64_t packetReadyMonoUs = steadyNowUs();
+            // LAT6: receiver wall-clock bridge captured at the SAME event as
+            // the T0 monotonic timestamp. Comparable only with an
+            // independently synchronized sender/server wall clock; never used
+            // for local stage durations (those stay monotonic).
+            lastPacketReadyWallNs_.store(wallClockNs());
             int64_t packetPtsUsForPreT0 = -1;
             // LAT1 P0: video packet demuxed and identified (media timeline us).
             if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {

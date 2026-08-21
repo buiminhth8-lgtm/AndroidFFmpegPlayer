@@ -14,6 +14,7 @@ import java.util.Locale;
  *   FFmpegLatencyStats D seq=123 MEDIA  ...
  *   FFmpegLatencyStats D seq=123 STAGE  ...
  *   FFmpegLatencyStats D seq=123 PRET0  ...
+ *   FFmpegLatencyStats D seq=123 E2E    ...
  *   FFmpegLatencyStats D seq=123 HEALTH ...
  * </pre>
  *
@@ -253,6 +254,26 @@ final class LatencyStatsFormatter {
         }
     }
 
+    /** LAT6 end-to-end timebase bridge status (receiver side only). */
+    static final class E2EInfo {
+        final String mode;
+        final String rxSync;
+        final long rtpClockRate;
+        final long t0WallNs;
+        final long generation;
+        final long resets;
+
+        E2EInfo(String mode, String rxSync, long rtpClockRate,
+                long t0WallNs, long generation, long resets) {
+            this.mode = mode;
+            this.rxSync = rxSync;
+            this.rtpClockRate = rtpClockRate;
+            this.t0WallNs = t0WallNs;
+            this.generation = generation;
+            this.resets = resets;
+        }
+    }
+
     static String stateLine(long seq, StateInfo info) {
         return "seq=" + seq
                 + " STATE"
@@ -323,6 +344,27 @@ final class LatencyStatsFormatter {
                 + " timeout=" + info.timeout
                 + " eof=" + info.eof
                 + " error=" + info.error;
+    }
+
+    /**
+     * LAT6 E2E timebase line. No sender timestamps and no RTCP SR access exist
+     * in this build, so mode is "none", sendToT0Ms is "--" and valid=0: the
+     * cross-device segment is NOT measured (never fabricated as 0 ms).
+     * t0WallNs is the receiver wall timestamp at T0, comparable only with an
+     * independently synchronized sender/server wall clock.
+     */
+    static String e2eLine(long seq, E2EInfo info) {
+        return "seq=" + seq
+                + " E2E"
+                + " mode=" + sanitize(info.mode)
+                + " sync=" + sanitize(info.rxSync)
+                + " syncErrMs=--"
+                + " rtpClock=" + (info.rtpClockRate > 0 ? String.valueOf(info.rtpClockRate) : "--")
+                + " sendToT0Ms=--/--/--"
+                + " t0WallNs=" + (info.t0WallNs >= 0 ? String.valueOf(info.t0WallNs) : "--")
+                + " gen=" + info.generation
+                + " resets=" + info.resets
+                + " valid=0";
     }
 
     /** us -> ms with two decimals; negative/invalid renders as "--". */

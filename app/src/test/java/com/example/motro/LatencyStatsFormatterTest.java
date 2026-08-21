@@ -86,6 +86,17 @@ public class LatencyStatsFormatterTest {
                 0, 0, 0, 0);
     }
 
+    private static LatencyStatsFormatter.E2EInfo validE2E() {
+        return new LatencyStatsFormatter.E2EInfo(
+                "none", "auto_time", 90000,
+                1755000000123456789L, 3, 2);
+    }
+
+    private static LatencyStatsFormatter.E2EInfo notReadyE2E() {
+        return new LatencyStatsFormatter.E2EInfo(
+                "none", "unknown", 0, -1, 0, 0);
+    }
+
     @Test
     public void stateLineContainsIdentityGenerationAndFps() {
         String line = LatencyStatsFormatter.stateLine(SEQ, stateInfo());
@@ -209,12 +220,39 @@ public class LatencyStatsFormatterTest {
     }
 
     @Test
+    public void e2eLineShowsBridgeStateWithoutFabricatedLatency() {
+        String line = LatencyStatsFormatter.e2eLine(SEQ, validE2E());
+        assertTrue(line, line.startsWith("seq=123 E2E"));
+        assertTrue(line, line.contains(" mode=none"));
+        assertTrue(line, line.contains(" sync=auto_time"));
+        assertTrue(line, line.contains(" syncErrMs=--"));
+        assertTrue(line, line.contains(" rtpClock=90000"));
+        assertTrue(line, line.contains(" sendToT0Ms=--/--/--"));
+        assertTrue(line, line.contains(" t0WallNs=1755000000123456789"));
+        assertTrue(line, line.contains(" gen=3"));
+        assertTrue(line, line.contains(" resets=2"));
+        assertTrue(line, line.contains(" valid=0"));
+    }
+
+    @Test
+    public void e2eLineShowsUnavailableAsDashNotZero() {
+        String line = LatencyStatsFormatter.e2eLine(SEQ, notReadyE2E());
+        assertTrue(line, line.startsWith("seq=123 E2E"));
+        assertTrue(line, line.contains(" sync=unknown"));
+        assertTrue(line, line.contains(" rtpClock=--"));
+        assertTrue(line, line.contains(" t0WallNs=--"));
+        assertFalse(line, line.contains("rtpClock=0"));
+        assertFalse(line, line.contains("t0WallNs=0"));
+    }
+
+    @Test
     public void allLinesShareSameSequenceAndStayShortAndSingleLine() {
         String[] lines = new String[]{
                 LatencyStatsFormatter.stateLine(SEQ, stateInfo()),
                 LatencyStatsFormatter.mediaLine(SEQ, validMedia()),
                 LatencyStatsFormatter.stageLine(SEQ, validStage()),
                 LatencyStatsFormatter.preT0Line(SEQ, validPreT0()),
+                LatencyStatsFormatter.e2eLine(SEQ, validE2E()),
                 LatencyStatsFormatter.healthLine(SEQ, healthInfo())
         };
         int maxLength = 0;
@@ -226,6 +264,6 @@ public class LatencyStatsFormatterTest {
             maxLength = Math.max(maxLength, line.length());
         }
         System.out.println("MAX_COMPACT_LOG_LENGTH=" + maxLength);
-        assertEquals(5, lines.length);
+        assertEquals(6, lines.length);
     }
 }

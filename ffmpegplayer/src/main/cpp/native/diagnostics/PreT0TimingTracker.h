@@ -72,6 +72,15 @@ public:
         int64_t readErrorCount = 0;
     };
 
+    // BASIC mode uses this outcome-only path: it keeps online read health
+    // counters without maintaining latency distributions.
+    void recordReadOutcome(ReadResultClass resultClass) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++readCallCount_;
+        recordReadOutcomeLocked(resultClass);
+    }
+
+    // LATENCY mode records both basic outcome counters and detailed timing.
     void recordReadCall(int64_t durationUs, ReadResultClass resultClass) {
         std::lock_guard<std::mutex> lock(mutex_);
         ++readCallCount_;
@@ -99,6 +108,61 @@ public:
         if (durationUs > 100000 && durationUs > maxReadStallUs_) {
             maxReadStallUs_ = durationUs;
         }
+        recordReadOutcomeLocked(resultClass);
+    }
+
+    // includeLatencyDistributions=false avoids percentile copies/sorts for
+    // production BASIC stats while retaining the same public counter fields.
+    Snapshot snapshot(bool includeLatencyDistributions = true) const {
+        Snapshot snap;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snap.readCallCount = readCallCount_;
+            snap.videoReadCallCount = videoReadCallCount_;
+            snap.lastReadDurationUs = lastReadDurationUs_;
+            snap.avgReadDurationUs = readDurationSampleCount_ <= 0
+                                             ? 0 : totalReadDurationUs_ / readDurationSampleCount_;
+            snap.maxReadDurationUs = maxReadDurationUs_;
+            snap.lastVideoReturnGapUs = lastVideoReturnGapUs_;
+            snap.avgVideoReturnGapUs = videoReturnGapSampleCount_ <= 0
+                                               ? 0 : totalVideoReturnGapUs_ / videoReturnGapSampleCount_;
+            snap.maxVideoReturnGapUs = maxVideoReturnGapUs_;
+            snap.lastVideoPtsDeltaUs = lastVideoPtsDeltaUs_;
+            snap.avgVideoPtsDeltaUs = videoPtsDeltaSampleCount_ <= 0
+                                              ? 0 : totalVideoPtsDeltaUs_ / videoPtsDeltaSampleCount_;
+            snap.maxVideoPtsDeltaUs = maxVideoPtsDeltaUs_;
+            snap.videoPtsDeltaSampleCount = videoPtsDeltaSampleCount_;
+            snap.fastReturnPacketCount = fastReturnPacketCount_;
+            snap.currentFastReturnBurstLength = currentFastReturnBurstLength_;
+            snap.maxFastReturnBurstLength = maxFastReturnBurstLength_;
+            snap.readStallGt100MsCount = readStallGt100MsCount_;
+            snap.readStallGt250MsCount = readStallGt250MsCount_;
+            snap.readStallGt500MsCount = readStallGt500MsCount_;
+            snap.readStallGt1000MsCount = readStallGt1000MsCount_;
+            snap.maxReadStallUs = maxReadStallUs_;
+            snap.readEagainCount = readEagainCount_;
+            snap.readTimeoutCount = readTimeoutCount_;
+            snap.readEofCount = readEofCount_;
+            snap.readErrorCount = readErrorCount_;
+        }
+        if (!includeLatencyDistributions) {
+            return snap;
+        }
+        const LatencyDistribution::Snapshot readDist = readDurationDist_.snapshot();
+        snap.readDurationP50Us = readDist.p50;
+        snap.readDurationP95Us = readDist.p95;
+        snap.readDurationP99Us = readDist.p99;
+        snap.readDurationDistCount = readDist.count;
+        const LatencyDistribution::Snapshot gapDist = videoReturnGapDist_.snapshot();
+        snap.videoReturnGapP50Us = gapDist.p50;
+        snap.videoReturnGapP95Us = gapDist.p95;
+        snap.videoReturnGapP99Us = gapDist.p99;
+        snap.videoReturnGapDistCount = gapDist.count;
+        return snap;
+    }
+
+private:
+    void recordReadOutcomeLocked(ReadResultClass resultClass) {
         switch (resultClass) {
             case ReadResultClass::ReadOk:
                 break;
@@ -117,6 +181,7 @@ public:
         }
     }
 
+public:
     // Called only when av_read_frame actually returned a video packet.
     // monoUs is the packet-ready monotonic timestamp (T0 / R1); ptsUs is the
     // media-timeline PTS in us, or -1 when invalid. An error/EOF read never
@@ -199,51 +264,6 @@ public:
         readErrorCount_ = 0;
         readDurationDist_.reset();
         videoReturnGapDist_.reset();
-    }
-
-    Snapshot snapshot() const {
-        Snapshot snap;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            snap.readCallCount = readCallCount_;
-            snap.videoReadCallCount = videoReadCallCount_;
-            snap.lastReadDurationUs = lastReadDurationUs_;
-            snap.avgReadDurationUs = readDurationSampleCount_ <= 0
-                                             ? 0 : totalReadDurationUs_ / readDurationSampleCount_;
-            snap.maxReadDurationUs = maxReadDurationUs_;
-            snap.lastVideoReturnGapUs = lastVideoReturnGapUs_;
-            snap.avgVideoReturnGapUs = videoReturnGapSampleCount_ <= 0
-                                               ? 0 : totalVideoReturnGapUs_ / videoReturnGapSampleCount_;
-            snap.maxVideoReturnGapUs = maxVideoReturnGapUs_;
-            snap.lastVideoPtsDeltaUs = lastVideoPtsDeltaUs_;
-            snap.avgVideoPtsDeltaUs = videoPtsDeltaSampleCount_ <= 0
-                                              ? 0 : totalVideoPtsDeltaUs_ / videoPtsDeltaSampleCount_;
-            snap.maxVideoPtsDeltaUs = maxVideoPtsDeltaUs_;
-            snap.videoPtsDeltaSampleCount = videoPtsDeltaSampleCount_;
-            snap.fastReturnPacketCount = fastReturnPacketCount_;
-            snap.currentFastReturnBurstLength = currentFastReturnBurstLength_;
-            snap.maxFastReturnBurstLength = maxFastReturnBurstLength_;
-            snap.readStallGt100MsCount = readStallGt100MsCount_;
-            snap.readStallGt250MsCount = readStallGt250MsCount_;
-            snap.readStallGt500MsCount = readStallGt500MsCount_;
-            snap.readStallGt1000MsCount = readStallGt1000MsCount_;
-            snap.maxReadStallUs = maxReadStallUs_;
-            snap.readEagainCount = readEagainCount_;
-            snap.readTimeoutCount = readTimeoutCount_;
-            snap.readEofCount = readEofCount_;
-            snap.readErrorCount = readErrorCount_;
-        }
-        const LatencyDistribution::Snapshot readDist = readDurationDist_.snapshot();
-        snap.readDurationP50Us = readDist.p50;
-        snap.readDurationP95Us = readDist.p95;
-        snap.readDurationP99Us = readDist.p99;
-        snap.readDurationDistCount = readDist.count;
-        const LatencyDistribution::Snapshot gapDist = videoReturnGapDist_.snapshot();
-        snap.videoReturnGapP50Us = gapDist.p50;
-        snap.videoReturnGapP95Us = gapDist.p95;
-        snap.videoReturnGapP99Us = gapDist.p99;
-        snap.videoReturnGapDistCount = gapDist.count;
-        return snap;
     }
 
 private:

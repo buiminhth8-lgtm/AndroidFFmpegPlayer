@@ -1,6 +1,5 @@
 #include "NativePlayer.h"
 
-#include "E2ETimebase.h"
 #include "SnapshotManager.h"
 
 #include <android/log.h>
@@ -1659,6 +1658,10 @@ std::string NativePlayer::getStats() {
         return jsonError(-1, "player is released");
     }
 
+    const DiagnosticsMode diagnosticsMode = diagnostics_.mode();
+    const bool basicDiagnostics = diagnostics_.basicEnabled();
+    const bool latencyDiagnostics = diagnostics_.latencyEnabled();
+
     PlayerState state;
     std::string url;
     std::string lastError;
@@ -1753,11 +1756,11 @@ std::string NativePlayer::getStats() {
     // LAT1 media-timeline PTS backlog (all us on the same video media timeline).
     // Computed from max-seen watermarks (robust to B-frame reorder) within the
     // current generation. -1 means invalid (no PTS / reset / new generation).
-    const int64_t maxVideoPkt = maxVideoPacketPtsUs_.load();
-    const int64_t maxDecIn = maxDecoderInputPtsUs_.load();
-    const int64_t maxDecOut = maxDecodedFramePtsUs_.load();
-    const int64_t maxRend = maxRenderedFramePtsUs_.load();
-    if (maxVideoPkt >= 0 && maxDecIn >= 0 && maxDecOut >= 0 && maxRend >= 0) {
+    const int64_t maxVideoPkt = basicDiagnostics ? maxVideoPacketPtsUs_.load() : -1;
+    const int64_t maxDecIn = basicDiagnostics ? maxDecoderInputPtsUs_.load() : -1;
+    const int64_t maxDecOut = basicDiagnostics ? maxDecodedFramePtsUs_.load() : -1;
+    const int64_t maxRend = basicDiagnostics ? maxRenderedFramePtsUs_.load() : -1;
+    if (basicDiagnostics && maxVideoPkt >= 0 && maxDecIn >= 0 && maxDecOut >= 0 && maxRend >= 0) {
         demuxToDecoderBacklogUs_.store(maxVideoPkt - maxDecIn);
         decoderBacklogUs_.store(maxDecIn - maxDecOut);
         renderBacklogUs_.store(maxDecOut - maxRend);
@@ -1772,29 +1775,31 @@ std::string NativePlayer::getStats() {
     }
     // LAT3: sample LAT1 media backlog into steady-state distributions (polling
     // cadence; only after warm-up so startup transients don't skew percentiles).
-    if (clientMediaBacklogValid_.load() && steadyStateValid_.load()) {
-        demuxBacklogDist_.addSample(demuxToDecoderBacklogUs_.load());
-        decoderBacklogDist_.addSample(decoderBacklogUs_.load());
-        renderBacklogDist_.addSample(renderBacklogUs_.load());
-        clientMediaBacklogDist_.addSample(clientMediaBacklogUs_.load());
+    if (latencyDiagnostics && clientMediaBacklogValid_.load() && steadyStateValid_.load()) {
+        diagnostics_.onMediaBacklog(demuxToDecoderBacklogUs_.load(),
+                                    decoderBacklogUs_.load(),
+                                    renderBacklogUs_.load(),
+                                    clientMediaBacklogUs_.load());
     }
     // LAT3: distribution snapshots (bounded rolling window; steady-state only).
-    const LatencyDistribution::Snapshot demuxBacklogDist = demuxBacklogDist_.snapshot();
-    const LatencyDistribution::Snapshot decoderBacklogDist = decoderBacklogDist_.snapshot();
-    const LatencyDistribution::Snapshot renderBacklogDist = renderBacklogDist_.snapshot();
-    const LatencyDistribution::Snapshot clientMediaBacklogDist = clientMediaBacklogDist_.snapshot();
-    const LatencyDistribution::Snapshot demuxSubmitDist = demuxSubmitDist_.snapshot();
-    const LatencyDistribution::Snapshot decoderResidenceDist = decoderResidenceDist_.snapshot();
-    const LatencyDistribution::Snapshot decodeRenderDist = decodeRenderDist_.snapshot();
-    const LatencyDistribution::Snapshot renderSubmitDist = renderSubmitDist_.snapshot();
-    const LatencyDistribution::Snapshot packetRenderDist = packetRenderDist_.snapshot();
+    const PlaybackDiagnostics::LatencySnapshot latencySnapshot = diagnostics_.latencySnapshot();
+    const LatencyDistribution::Snapshot &demuxBacklogDist = latencySnapshot.demuxBacklog;
+    const LatencyDistribution::Snapshot &decoderBacklogDist = latencySnapshot.decoderBacklog;
+    const LatencyDistribution::Snapshot &renderBacklogDist = latencySnapshot.renderBacklog;
+    const LatencyDistribution::Snapshot &clientMediaBacklogDist = latencySnapshot.clientMediaBacklog;
+    const LatencyDistribution::Snapshot &demuxSubmitDist = latencySnapshot.demuxSubmit;
+    const LatencyDistribution::Snapshot &decoderResidenceDist = latencySnapshot.decoderResidence;
+    const LatencyDistribution::Snapshot &decodeRenderDist = latencySnapshot.decodeRender;
+    const LatencyDistribution::Snapshot &renderSubmitDist = latencySnapshot.renderSubmit;
+    const LatencyDistribution::Snapshot &packetRenderDist = latencySnapshot.packetRender;
     // LAT5: pre-T0 read/demux return diagnostics (same stats tick).
-    const PreT0TimingTracker::Snapshot preT0Timing = preT0Timing_.snapshot();
+    const PreT0TimingTracker::Snapshot preT0Timing = diagnostics_.preT0Snapshot();
     // LAT6-FINAL: RTCP SR mapping + srSendToT0 distribution (same stats tick).
-    const RtcpSrTracker::Snapshot e2eSr = rtcpSrTracker_.snapshot();
-    const SendToT0Distribution::Snapshot e2eDist = e2eSrSendToT0Dist_.snapshot();
-    const int64_t e2eSameFrameMappedCount = e2eSameFrameMappedCount_.load();
-    const int64_t e2eSameFrameUnmatchedCount = e2eSameFrameUnmatchedCount_.load();
+    const PlaybackDiagnostics::E2ESnapshot e2eSnapshot = diagnostics_.e2eSnapshot();
+    const RtcpSrTracker::Snapshot &e2eSr = e2eSnapshot.senderReport;
+    const SendToT0Distribution::Snapshot &e2eDist = e2eSnapshot.sendToT0;
+    const int64_t e2eSameFrameMappedCount = e2eSnapshot.sameFrameMappedCount;
+    const int64_t e2eSameFrameUnmatchedCount = e2eSnapshot.sameFrameUnmatchedCount;
     const bool e2eRtcpMappingAvailable = e2eSr.hasAnchor
                                          && e2eSr.srMappingValid
                                          && e2eSameFrameMappedCount > 0;
@@ -1914,6 +1919,7 @@ std::string NativePlayer::getStats() {
         << "\"handle\":" << static_cast<long long>(logicalHandle_) << ","
         << "\"state\":\"" << stateName(state) << "\","
         << "\"playerState\":\"" << playerStateName(state) << "\","
+        << "\"diagnosticsMode\":\"" << diagnosticsModeName(diagnosticsMode) << "\","
         << "\"url\":\"" << escapeJson(url) << "\","
         << "\"sourceHasVideo\":" << (sourceHasVideo_.load() ? "true" : "false") << ","
         << "\"sourceHasAudio\":" << (sourceHasAudio_.load() ? "true" : "false") << ","
@@ -2540,6 +2546,18 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
     }
     if (normalizedKey == "latency_mode") {
         return setLatencyMode(value);
+    }
+    if (normalizedKey == "diagnostics_mode" || normalizedKey == "diagnosticsmode") {
+        DiagnosticsMode parsedMode;
+        if (!parseDiagnosticsMode(value, parsedMode)) {
+            return jsonError(-1, "diagnostics_mode must be off, basic, or latency");
+        }
+        diagnostics_.setMode(parsedMode);
+        LOGI("setPlayerDiagnosticsMode mode=%s", diagnosticsModeName(parsedMode));
+        std::ostringstream out;
+        out << "{\"success\":true,\"message\":\"diagnostics mode updated\","
+            << "\"diagnosticsMode\":\"" << diagnosticsModeName(parsedMode) << "\"}";
+        return out.str();
     }
     if (normalizedKey == "enable_hardware_decode") {
         bool enabled = false;
@@ -3280,7 +3298,7 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     resetStageTimingCorrelation();
     // LAT5: clear pre-T0 read/gap/burst/stall diagnostics and invalidate the
     // previous video return timestamp so no fake gap spans a new session.
-    preT0Timing_.reset();
+    diagnostics_.resetPreT0();
     effectiveFmtCtxMaxDelayUs_.store(0);
     // LAT6: invalidate the wall-clock bridge and advance the E2E generation so
     // stale sender/receiver wall samples can never span sessions. The stream
@@ -3292,17 +3310,14 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     e2eResetCount_.fetch_add(1);
     // LAT6-FINAL: drop the SR anchor and srSendToT0 distribution with the old
     // session so no stale sender wall sample can map into a new one.
-    rtcpSrTracker_.reset();
-    e2eSrSendToT0Dist_.reset();
-    e2eSameFrameMappedCount_.store(0);
-    e2eSameFrameUnmatchedCount_.store(0);
+    diagnostics_.resetE2E();
 }
 
 void NativePlayer::processRtcpTimebase(int64_t t0WallNs) {
     const int64_t tbNum = videoStreamTimeBaseNum_.load();
     const int64_t tbDen = videoStreamTimeBaseDen_.load();
     if (tbNum > 0 && tbDen > 0) {
-        rtcpSrTracker_.setClockRate(tbDen / tbNum);
+        diagnostics_.setRtpClockRate(tbDen / tbNum);
     }
     // FFmpeg 8 exports a received SR exactly once, on the next packet.
     size_t srSize = 0;
@@ -3310,10 +3325,10 @@ void NativePlayer::processRtcpTimebase(int64_t t0WallNs) {
     if (srData != nullptr && srSize >= sizeof(AVRTCPSenderReport)) {
         AVRTCPSenderReport sr;
         std::memcpy(&sr, srData, sizeof(sr));
-        rtcpSrTracker_.recordSenderReport(sr.ssrc, sr.ntp_timestamp, sr.rtp_timestamp);
+        diagnostics_.onSenderReport(sr.ssrc, sr.ntp_timestamp, sr.rtp_timestamp);
     }
 
-    const RtcpSrTracker::Snapshot srSnap = rtcpSrTracker_.snapshot();
+    const RtcpSrTracker::Snapshot srSnap = diagnostics_.senderReportSnapshot();
     if (!srSnap.hasAnchor || !srSnap.srMappingValid || srSnap.lastSrNtpNs <= 0) {
         return;
     }
@@ -3324,22 +3339,22 @@ void NativePlayer::processRtcpTimebase(int64_t t0WallNs) {
     size_t prftSize = 0;
     const uint8_t *prftData = av_packet_get_side_data(packet_, AV_PKT_DATA_PRFT, &prftSize);
     if (prftData == nullptr || prftSize < sizeof(AVProducerReferenceTime)) {
-        e2eSameFrameUnmatchedCount_.fetch_add(1);
+        diagnostics_.onE2ESameFrameUnmatched();
         return;
     }
     AVProducerReferenceTime prft;
     std::memcpy(&prft, prftData, sizeof(prft));
     if (prft.wallclock < 0
             || prft.wallclock > std::numeric_limits<int64_t>::max() / 1000LL) {
-        e2eSameFrameUnmatchedCount_.fetch_add(1);
+        diagnostics_.onE2ESameFrameUnmatched();
         return;
     }
-    e2eSameFrameMappedCount_.fetch_add(1);
+    diagnostics_.onE2ESameFrameMapped();
 
     const E2ESampleResult sample =
             measureSenderSendToReceiverT0Us(prft.wallclock * 1000LL, t0WallNs);
     if (steadyStateValid_.load()) {
-        e2eSrSendToT0Dist_.addSample(sample, kE2EClockSyncValid);
+        diagnostics_.onE2ESample(sample, kE2EClockSyncValid);
     }
 }
 
@@ -3372,15 +3387,7 @@ void NativePlayer::resetStageTimingCorrelation() {
     stageTimingClockAnomalyCount_.store(0);
     stageTimingResetCount_.fetch_add(1);
     // LAT3: clear steady-state distribution windows and warm-up gate.
-    demuxBacklogDist_.reset();
-    decoderBacklogDist_.reset();
-    renderBacklogDist_.reset();
-    clientMediaBacklogDist_.reset();
-    demuxSubmitDist_.reset();
-    decoderResidenceDist_.reset();
-    decodeRenderDist_.reset();
-    renderSubmitDist_.reset();
-    packetRenderDist_.reset();
+    diagnostics_.resetLatency();
     steadyStateValid_.store(false);
 }
 
@@ -3390,6 +3397,19 @@ bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
     const int64_t t2 = record.decodedOutputMonoUs;
     const int64_t t3 = record.renderBeginMonoUs;
     const int64_t t4 = record.renderSubmitMonoUs;
+    if (!diagnostics_.latencyEnabled()) {
+        // BASIC keeps only the useful packet-ready -> render-submit health
+        // value. Intermediate stage metrics and distributions stay disabled.
+        if (t0 < 0 || t4 < t0) {
+            if (t0 >= 0 && t4 >= 0) {
+                stageTimingClockAnomalyCount_.fetch_add(1);
+            }
+            return false;
+        }
+        recordCost(packetRenderTiming_.last, packetRenderTiming_.total,
+                   packetRenderTiming_.count, packetRenderTiming_.max, t4 - t0);
+        return true;
+    }
     if (t0 < 0 || t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0) {
         return false;
     }
@@ -3417,19 +3437,21 @@ bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
     // LAT3: exclude warm-up samples from the steady-state distribution window;
     // ALL_TIME last/avg/max above always keeps the full history.
     const int64_t newCount = stageTimingSampleCount_.fetch_add(1) + 1;
-    if (newCount > kStageTimingWarmupSamples) {
+    if (diagnostics_.latencyEnabled() && newCount > kStageTimingWarmupSamples) {
         steadyStateValid_.store(true);
-        demuxSubmitDist_.addSample(demuxSubmitUs);
-        decoderResidenceDist_.addSample(decoderResidenceUs);
-        decodeRenderDist_.addSample(decodeRenderUs);
-        renderSubmitDist_.addSample(renderUs);
-        packetRenderDist_.addSample(packetRenderUs);
+        diagnostics_.onStageSample(demuxSubmitUs, decoderResidenceUs,
+                                   decodeRenderUs, renderUs, packetRenderUs);
     }
     return true;
 }
 
 void NativePlayer::recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs) {
-    if (generation < 0 || ptsUs < 0 || monoUs < 0) {
+    if (!diagnostics_.basicEnabled() || generation < 0 || ptsUs < 0 || monoUs < 0) {
+        return;
+    }
+    if (!diagnostics_.latencyEnabled()
+            && stage != StageTimingPoint::PacketReady
+            && stage != StageTimingPoint::RenderSubmit) {
         return;
     }
 
@@ -3490,6 +3512,9 @@ void NativePlayer::recordVideoStageTiming(int64_t generation, int64_t ptsUs, Sta
 }
 
 void NativePlayer::recordStageTimingRenderSubmit(int64_t ptsUs) {
+    if (!diagnostics_.basicEnabled()) {
+        return;
+    }
     recordVideoStageTiming(videoPtsGeneration_.load(), ptsUs, StageTimingPoint::RenderSubmit, steadyNowUs());
 }
 
@@ -4908,14 +4933,10 @@ void NativePlayer::playbackLoop() {
         const int64_t readCostUs = steadyNowUs() - readStartUs;
         recordCost(lastReadFrameCostUs_, totalReadFrameCostUs_, readFrameCostSampleCount_, maxReadFrameCostUs_,
                    readCostUs);
-        // LAT5: pre-T0 av_read_frame() call duration (R1 - R0 on the same
-        // steady monotonic clock as LAT2). Aggregated only; never per-packet
-        // logging. This is readWaitAndDemux, NOT network latency.
-        preT0Timing_.recordReadCall(readCostUs, classifyReadResult(readResult));
-        if (readCostUs >= 1000000) {
-            LOGE("read stall detected costUs=%lld result=%d",
-                 static_cast<long long>(readCostUs), readResult);
-        }
+        const PreT0TimingTracker::ReadResultClass readClass = classifyReadResult(readResult);
+        // LATENCY aggregates duration; BASIC keeps outcome-only health; OFF
+        // is a no-op. The facade owns all PRET0 policy and bounded storage.
+        diagnostics_.onRead(readCostUs, readClass);
         lastReadPacketTimeMs_.store(nowMs());
         if (readResult < 0) {
             if (transportSwitchRequested_.exchange(false)) {
@@ -4963,19 +4984,19 @@ void NativePlayer::playbackLoop() {
         if (packet_->stream_index == videoStreamIndex_) {
             videoPacketCount_.fetch_add(1);
             videoPacketBytes_.fetch_add(packetSize);
-            const int64_t packetReadyMonoUs = steadyNowUs();
-            // LAT6: receiver wall-clock bridge captured at the SAME event as
-            // the T0 monotonic timestamp. Comparable only with an
-            // independently synchronized sender/server wall clock; never used
-            // for local stage durations (those stay monotonic).
-            const int64_t packetReadyWallNs = wallClockNs();
-            lastPacketReadyWallNs_.store(packetReadyWallNs);
-            // LAT6-FINAL: public RTCP-SR anchor + same-packet PRFT mapping.
-            // Diagnostics only; the cross-device sync gate cannot affect play.
-            processRtcpTimebase(packetReadyWallNs);
+            const bool basicDiagnostics = diagnostics_.basicEnabled();
+            const bool latencyDiagnostics = diagnostics_.latencyEnabled();
+            const int64_t packetReadyMonoUs = basicDiagnostics ? steadyNowUs() : -1;
+            if (latencyDiagnostics) {
+                // LAT6 bridge and RTCP-SR mapping are diagnostic-only and are
+                // deliberately absent from the production BASIC hot path.
+                const int64_t packetReadyWallNs = wallClockNs();
+                lastPacketReadyWallNs_.store(packetReadyWallNs);
+                processRtcpTimebase(packetReadyWallNs);
+            }
             int64_t packetPtsUsForPreT0 = -1;
             // LAT1 P0: video packet demuxed and identified (media timeline us).
-            if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
+            if (basicDiagnostics && formatContext_ != nullptr && videoStreamIndex_ >= 0) {
                 bool packetPtsValid = false;
                 if (packet_->pts != AV_NOPTS_VALUE) {
                     const int64_t packetPtsUs = rescaleToUs(packet_->pts, formatContext_->streams[videoStreamIndex_]->time_base);
@@ -4999,7 +5020,9 @@ void NativePlayer::playbackLoop() {
             }
             // LAT5: video packet return gap / PTS delta / burst detection.
             // monoUs is T0 (R1); invalid PTS never fabricates a delta.
-            preT0Timing_.recordVideoReturn(packetReadyMonoUs, packetPtsUsForPreT0);
+            if (latencyDiagnostics) {
+                diagnostics_.onVideoPacketReturn(packetReadyMonoUs, packetPtsUsForPreT0);
+            }
         } else if (packet_->stream_index == audioStreamIndex_) {
             audioPacketCount_.fetch_add(1);
             audioPacketBytes_.fetch_add(packetSize);
@@ -5070,7 +5093,7 @@ void NativePlayer::playbackLoop() {
                 continue;
             }
             // LAT1 P1: packet accepted by the decoder (same packet PTS, media timeline us).
-            if (videoPacketPtsValid_.load()) {
+            if (diagnostics_.basicEnabled() && videoPacketPtsValid_.load()) {
                 const int64_t inputPtsUs = latestVideoPacketPtsUs_.load();
                 latestDecoderInputPtsUs_.store(inputPtsUs);
                 decoderInputPtsValid_.store(true);
@@ -5079,9 +5102,11 @@ void NativePlayer::playbackLoop() {
                     decoderPtsBackwardCount_.fetch_add(1);
                 }
                 // LAT2 T1: packet submitted to decoder (monotonic, same packet PTS).
-                recordVideoStageTiming(videoPtsGeneration_.load(), inputPtsUs,
-                                       StageTimingPoint::DecoderSubmit, sendStartUs);
-            } else {
+                if (diagnostics_.latencyEnabled()) {
+                    recordVideoStageTiming(videoPtsGeneration_.load(), inputPtsUs,
+                                           StageTimingPoint::DecoderSubmit, sendStartUs);
+                }
+            } else if (diagnostics_.basicEnabled()) {
                 latestDecoderInputPtsUs_.store(-1);
                 decoderInputPtsValid_.store(false);
             }
@@ -5118,7 +5143,7 @@ void NativePlayer::playbackLoop() {
                 recordCost(lastReceiveFrameCostUs_, totalDecodeCostUs_, decodeCostSampleCount_, maxDecodeCostUs_, receiveCostUs);
 
                 // LAT1 P2: decoded frame output from the decoder (media timeline us).
-                if (formatContext_ != nullptr && videoStreamIndex_ >= 0) {
+                if (diagnostics_.basicEnabled() && formatContext_ != nullptr && videoStreamIndex_ >= 0) {
                     bool framePtsValid = false;
                     if (decodedFrame_->best_effort_timestamp != AV_NOPTS_VALUE) {
                         const int64_t framePtsUs = rescaleToUs(decodedFrame_->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base);
@@ -5130,8 +5155,10 @@ void NativePlayer::playbackLoop() {
                                 decodedPtsBackwardCount_.fetch_add(1);
                             }
                             // LAT2 T2: decoded frame output (monotonic).
-                            recordVideoStageTiming(videoPtsGeneration_.load(), framePtsUs,
-                                                   StageTimingPoint::DecodedOutput, steadyNowUs());
+                            if (diagnostics_.latencyEnabled()) {
+                                recordVideoStageTiming(videoPtsGeneration_.load(), framePtsUs,
+                                                       StageTimingPoint::DecodedOutput, steadyNowUs());
+                            }
                         }
                     }
                     decodedFramePtsValid_.store(framePtsValid);
@@ -5568,21 +5595,24 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
         ptsUs = av_rescale_q(frame->best_effort_timestamp, formatContext_->streams[videoStreamIndex_]->time_base, AV_TIME_BASE_Q);
     }
     if (isValidPts(ptsUs)) {
+        // Playback clock is correctness state and is never gated by diagnostics.
         videoClockUs_.store(ptsUs);
-        // LAT1 P3: frame committed to the render path (media timeline us).
-        latestRenderedFramePtsUs_.store(ptsUs);
-        renderedFramePtsValid_.store(true);
-        updateMax(maxRenderedFramePtsUs_, ptsUs);
-        if (ptsUs < maxRenderedFramePtsUs_.load()) {
-            renderedPtsBackwardCount_.fetch_add(1);
+        if (diagnostics_.basicEnabled()) {
+            // LAT1 P3: frame committed to the render path (media timeline us).
+            latestRenderedFramePtsUs_.store(ptsUs);
+            renderedFramePtsValid_.store(true);
+            updateMax(maxRenderedFramePtsUs_, ptsUs);
+            if (ptsUs < maxRenderedFramePtsUs_.load()) {
+                renderedPtsBackwardCount_.fetch_add(1);
+            }
         }
-    } else {
+    } else if (diagnostics_.basicEnabled()) {
         // LAT1 P3: no valid media PTS for this rendered frame.
         latestRenderedFramePtsUs_.store(-1);
         renderedFramePtsValid_.store(false);
     }
     // LAT2 T3: render begin (frame enters the render mainline, monotonic).
-    if (isValidPts(ptsUs)) {
+    if (diagnostics_.latencyEnabled() && isValidPts(ptsUs)) {
         recordVideoStageTiming(videoPtsGeneration_.load(), ptsUs,
                                StageTimingPoint::RenderBegin, steadyNowUs());
     }

@@ -7,7 +7,7 @@
 #include <mutex>
 #include <vector>
 
-// LAT3 bounded rolling-window latency distribution. Fixed-size ring (no
+// Bounded rolling-window latency distribution. Fixed-size ring (no
 // unbounded growth); percentiles are nearest-rank over the most recent
 // samples. The mutex critical sections are tiny (one slot write on add, one
 // copy on snapshot). Extracted from NativePlayer.h so the timing helpers are

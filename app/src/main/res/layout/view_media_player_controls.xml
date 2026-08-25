@@ -145,6 +145,43 @@
 
             <TextView
                 style="@style/ControlSectionHeader"
+                android:text="DIAGNOSTICS" />
+
+            <RadioGroup
+                android:id="@+id/diagnosticsModeRadioGroup"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <RadioButton
+                    android:id="@+id/diagnosticsOffRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Off" />
+
+                <RadioButton
+                    android:id="@+id/diagnosticsBasicRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:checked="true"
+                    android:text="Basic" />
+
+                <RadioButton
+                    android:id="@+id/diagnosticsLatencyRadio"
+                    style="@style/ControlRadioButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:text="Latency" />
+            </RadioGroup>
+
+            <TextView
+                style="@style/ControlSectionHeader"
                 android:text="PLAYER OPTIONS" />
 
             <Switch
@@ -353,11 +390,6 @@
                     android:id="@+id/infoButton"
                     style="@style/ControlButton"
                     android:text="Info" />
-
-                <Button
-                    android:id="@+id/probeButton"
-                    style="@style/ControlButton"
-                    android:text="Probe" />
 
                 <Button
                     android:id="@+id/stateButton"

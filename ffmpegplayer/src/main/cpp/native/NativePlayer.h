@@ -8,9 +8,7 @@
 #include "NativeNv12GlRenderer.h"
 #include "ThermalConfig.h"
 #include "VideoRenderer.h"
-#include "LatencyDistribution.h"
-#include "PreT0TimingTracker.h"
-#include "E2ETimebase.h"
+#include "diagnostics/PlaybackDiagnostics.h"
 
 #include <jni.h>
 
@@ -431,6 +429,9 @@ private:
     std::atomic<int64_t> prevStatsDecodeCount_{0};
     std::atomic<int64_t> prevStatsRenderCount_{0};
     std::atomic<int64_t> prevStatsTimeMs_{0};
+    // Production default is BASIC: compact health counters without the
+    // percentile/distribution and E2E correlation overhead of LATENCY mode.
+    PlaybackDiagnostics diagnostics_;
     // LAT1 PTS backlog diagnostics (media timeline us; diagnostics only).
     std::atomic<int64_t> videoPtsGeneration_{0};
     std::atomic<int64_t> latestVideoPacketPtsUs_{-1};
@@ -470,16 +471,6 @@ private:
     std::atomic<int64_t> stageTimingForcedEvictionCount_{0};
     std::atomic<int64_t> stageTimingResetCount_{0};
     std::atomic<int64_t> stageTimingClockAnomalyCount_{0};
-    // LAT3 distribution (bounded rolling window, steady-state percentiles).
-    LatencyDistribution demuxBacklogDist_;
-    LatencyDistribution decoderBacklogDist_;
-    LatencyDistribution renderBacklogDist_;
-    LatencyDistribution clientMediaBacklogDist_;
-    LatencyDistribution demuxSubmitDist_;
-    LatencyDistribution decoderResidenceDist_;
-    LatencyDistribution decodeRenderDist_;
-    LatencyDistribution renderSubmitDist_;
-    LatencyDistribution packetRenderDist_;
     std::atomic<bool> steadyStateValid_{false};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
@@ -488,9 +479,6 @@ private:
     std::atomic<int64_t> totalReadFrameCostUs_{0};
     std::atomic<int64_t> readFrameCostSampleCount_{0};
     std::atomic<int64_t> maxReadFrameCostUs_{0};
-    // LAT5: RTSP / RTP Pre-T0 isolation diagnostics (read call duration,
-    // video packet return cadence, PTS delta, burst, stall, error classes).
-    PreT0TimingTracker preT0Timing_;
     // LAT5: effective AVFormatContext::max_delay read back after open (us).
     std::atomic<int64_t> effectiveFmtCtxMaxDelayUs_{0};
     // LAT6: end-to-end timebase bridge. lastPacketReadyWallNs is the receiver
@@ -505,10 +493,6 @@ private:
     // LAT6-FINAL route B: public FFmpeg RTCP-SR + per-packet PRFT side data.
     // PRFT is correlated by construction to the same AVPacket/T0. The
     // distribution remains empty while cross-device clock error is unknown.
-    RtcpSrTracker rtcpSrTracker_;
-    SendToT0Distribution e2eSrSendToT0Dist_;
-    std::atomic<int64_t> e2eSameFrameMappedCount_{0};
-    std::atomic<int64_t> e2eSameFrameUnmatchedCount_{0};
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};

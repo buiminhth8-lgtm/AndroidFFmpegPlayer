@@ -2,7 +2,7 @@
 // Compile with a host C++17 compiler, e.g.:
 //   cl /nologo /std:c++17 /EHsc PreT0TimingTrackerTest.cpp /I ..\..\main\cpp\native
 // Exit code 0 = all passed.
-#include "PreT0TimingTracker.h"
+#include "../../main/cpp/native/diagnostics/PreT0TimingTracker.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -117,6 +117,21 @@ int main() {
         CHECK(s.readCallCount == 1);
         CHECK(s.lastReadDurationUs == -5);
         CHECK(s.readDurationDistCount == 0);
+    }
+
+    // BASIC mode: outcome health remains available without timing samples or
+    // percentile snapshot work.
+    {
+        PreT0TimingTracker t;
+        t.recordReadOutcome(PreT0TimingTracker::ReadResultClass::ReadTimeout);
+        t.recordReadOutcome(PreT0TimingTracker::ReadResultClass::ReadError);
+        const PreT0TimingTracker::Snapshot s = t.snapshot(false);
+        CHECK(s.readCallCount == 2);
+        CHECK(s.readTimeoutCount == 1);
+        CHECK(s.readErrorCount == 1);
+        CHECK(s.lastReadDurationUs == -1);
+        CHECK(s.readDurationDistCount == 0);
+        CHECK(s.videoReturnGapDistCount == 0);
     }
 
     // 6. bounded distributions: feeding far more than the window never grows

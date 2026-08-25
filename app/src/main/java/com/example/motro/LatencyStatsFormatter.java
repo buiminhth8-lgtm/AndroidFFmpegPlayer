@@ -3,13 +3,15 @@ package com.example.motro;
 import java.util.Locale;
 
 /**
- * Logcat-safe compact latency diagnostics (LAT3 output fix).
+ * Logcat-safe production health and opt-in latency diagnostics.
  *
  * Pure Java (no android.* dependency) so the formatter is directly unit-testable
- * on the JVM. Produces four short key=value lines that share one snapshot
- * sequence number ({@code seq}) and one Logcat tag:
+ * on the JVM. BASIC produces one health line. LATENCY produces six short
+ * key=value lines that share one snapshot sequence number ({@code seq}) and
+ * one Logcat tag:
  *
  * <pre>
+ *   FFmpegLatencyStats D seq=123 BASIC  ... (BASIC mode only)
  *   FFmpegLatencyStats D seq=123 STATE  ...
  *   FFmpegLatencyStats D seq=123 MEDIA  ...
  *   FFmpegLatencyStats D seq=123 STAGE  ...
@@ -29,6 +31,52 @@ final class LatencyStatsFormatter {
     static final int MAX_SAFE_LINE_LENGTH = 1500;
 
     private LatencyStatsFormatter() {
+    }
+
+    /** Production BASIC health snapshot: no percentile or E2E diagnostics. */
+    static final class BasicInfo {
+        final String state;
+        final double decodeFps;
+        final double renderFps;
+        final String decodeBackend;
+        final String frameOutputType;
+        final String renderer;
+        final long packets;
+        final long decoded;
+        final long rendered;
+        final long dropped;
+        final long readTimeouts;
+        final long readErrors;
+        final long reconnects;
+        final boolean backlogValid;
+        final long backlogUs;
+        final long packetReadyToRenderSubmitUs;
+        final String lastError;
+
+        BasicInfo(String state, double decodeFps, double renderFps,
+                  String decodeBackend, String frameOutputType, String renderer,
+                  long packets, long decoded, long rendered, long dropped,
+                  long readTimeouts, long readErrors, long reconnects,
+                  boolean backlogValid, long backlogUs,
+                  long packetReadyToRenderSubmitUs, String lastError) {
+            this.state = state;
+            this.decodeFps = decodeFps;
+            this.renderFps = renderFps;
+            this.decodeBackend = decodeBackend;
+            this.frameOutputType = frameOutputType;
+            this.renderer = renderer;
+            this.packets = packets;
+            this.decoded = decoded;
+            this.rendered = rendered;
+            this.dropped = dropped;
+            this.readTimeouts = readTimeouts;
+            this.readErrors = readErrors;
+            this.reconnects = reconnects;
+            this.backlogValid = backlogValid;
+            this.backlogUs = backlogUs;
+            this.packetReadyToRenderSubmitUs = packetReadyToRenderSubmitUs;
+            this.lastError = lastError;
+        }
     }
 
     /** Identity / state / generation / measured FPS. */
@@ -316,6 +364,27 @@ final class LatencyStatsFormatter {
                 + " packets=" + info.packets
                 + " frames=" + info.frames
                 + " rendered=" + info.rendered;
+    }
+
+    static String basicLine(long seq, BasicInfo info) {
+        return "seq=" + seq
+                + " BASIC"
+                + " state=" + sanitize(info.state)
+                + " decodeFps=" + fp1(info.decodeFps)
+                + " renderFps=" + fp1(info.renderFps)
+                + " backend=" + sanitize(info.decodeBackend)
+                + " output=" + sanitize(info.frameOutputType)
+                + " renderer=" + sanitize(info.renderer)
+                + " packets=" + info.packets
+                + " decoded=" + info.decoded
+                + " rendered=" + info.rendered
+                + " dropped=" + info.dropped
+                + " timeout=" + info.readTimeouts
+                + " error=" + info.readErrors
+                + " reconnect=" + info.reconnects
+                + " backlogMs=" + (info.backlogValid ? ms(info.backlogUs) : "--")
+                + " packetRenderMs=" + ms(info.packetReadyToRenderSubmitUs)
+                + " lastError=" + sanitize(info.lastError);
     }
 
     static String mediaLine(long seq, MediaInfo info) {

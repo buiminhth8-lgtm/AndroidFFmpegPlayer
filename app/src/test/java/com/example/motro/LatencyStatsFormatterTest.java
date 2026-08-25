@@ -23,6 +23,34 @@ public class LatencyStatsFormatterTest {
                 1234, 1233, 1230);
     }
 
+    private static LatencyStatsFormatter.BasicInfo basicInfo() {
+        return new LatencyStatsFormatter.BasicInfo(
+                "PLAYING", 24.94, 24.93,
+                "mediacodec", "nv12_cpu", "nv12_gl",
+                1234, 1233, 1230, 3,
+                1, 2, 4, true, 42019, 45123, "--");
+    }
+
+    @Test
+    public void basicLineContainsOnlyCompactProductionHealth() {
+        String line = LatencyStatsFormatter.basicLine(SEQ, basicInfo());
+        assertTrue(line, line.startsWith("seq=123 BASIC"));
+        assertTrue(line, line.contains(" state=PLAYING"));
+        assertTrue(line, line.contains(" decodeFps=24.9"));
+        assertTrue(line, line.contains(" renderFps=24.9"));
+        assertTrue(line, line.contains(" backend=mediacodec"));
+        assertTrue(line, line.contains(" output=nv12_cpu"));
+        assertTrue(line, line.contains(" renderer=nv12_gl"));
+        assertTrue(line, line.contains(" timeout=1"));
+        assertTrue(line, line.contains(" error=2"));
+        assertTrue(line, line.contains(" reconnect=4"));
+        assertTrue(line, line.contains(" backlogMs=42.02"));
+        assertTrue(line, line.contains(" packetRenderMs=45.12"));
+        assertFalse(line, line.contains("p50"));
+        assertFalse(line, line.contains("E2E"));
+        assertFalse(line, line.contains("\n"));
+    }
+
     private static LatencyStatsFormatter.MediaInfo validMedia() {
         return new LatencyStatsFormatter.MediaInfo(
                 true,
@@ -279,6 +307,7 @@ public class LatencyStatsFormatterTest {
     @Test
     public void allLinesShareSameSequenceAndStayShortAndSingleLine() {
         String[] lines = new String[]{
+                LatencyStatsFormatter.basicLine(SEQ, basicInfo()),
                 LatencyStatsFormatter.stateLine(SEQ, stateInfo()),
                 LatencyStatsFormatter.mediaLine(SEQ, validMedia()),
                 LatencyStatsFormatter.stageLine(SEQ, validStage()),
@@ -295,6 +324,6 @@ public class LatencyStatsFormatterTest {
             maxLength = Math.max(maxLength, line.length());
         }
         System.out.println("MAX_COMPACT_LOG_LENGTH=" + maxLength);
-        assertEquals(6, lines.length);
+        assertEquals(7, lines.length);
     }
 }

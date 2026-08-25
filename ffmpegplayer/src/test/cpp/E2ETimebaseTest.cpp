@@ -2,7 +2,7 @@
 // asserts). Compile with a host C++17 compiler, e.g.:
 //   cl /nologo /std:c++17 /EHsc E2ETimebaseTest.cpp /I ..\..\main\cpp\native
 // Exit code 0 = all passed.
-#include "E2ETimebase.h"
+#include "../../main/cpp/native/diagnostics/E2ETimebase.h"
 
 #include <cstdio>
 #include <cstdint>

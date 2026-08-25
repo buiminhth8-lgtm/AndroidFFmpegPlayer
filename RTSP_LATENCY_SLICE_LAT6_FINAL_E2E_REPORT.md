@@ -63,7 +63,7 @@ Both are corrected. Mode is not forced.
 | Sender source | NOT_AVAILABLE | No capture/encoder/sender project is present in this workspace. |
 | RTSP server source | NOT_AVAILABLE | The camera/server implementation is external. |
 | FFmpeg RTCP SR API | AVAILABLE | Public FFmpeg 8.0.1 packet side data; no private-struct access. |
-| RTCP SR in current runtime | UNAVAILABLE | The 2026-08-25 device run reached `avformat_open_input`, but the configured RTSP endpoint failed with `No route to host` before any RTP/RTCP packet was received. |
+| RTCP SR in current runtime | UNAVAILABLE | UDP: 5 min 46 s / 8,751 packets / zero SR. TCP-interleaved diagnostic: about 107 s / 2,682 packets / zero SR. |
 | RTP clock rate | AVAILABLE after open | Derived from video stream `time_base`; not hardcoded. |
 | Receiver T0 wall + monotonic | AVAILABLE | Existing LAT6/LAT3 bridge reused. |
 | Sender/receiver clock sync | UNKNOWN | Receiver auto-time is observable only as configuration; sender clock state and error bound are absent. |
@@ -159,29 +159,44 @@ Post-change runtime gate: BLOCKED. On 2026-08-25, target device `34aff35a` (`Ben
 The UI-driven `CREATE` and `PREPARE` path reached the real FFmpeg open call:
 
 ```text
-08-25 14:58:52.690 I FFmpegNative: prepare url=rtsp://192.168.1.101:556/main.mov timeoutMs=5000 realtimeInput=1
-08-25 14:58:52.690 I FFmpegNative: RTSP options sourceType=RTSP transport=udp latencyMode=balanced ...
-08-25 14:58:55.759 E FFmpegNative: RTSP open failed url=rtsp://192.168.1.101:556/main.mov error=No route to host
+08-25 15:07:01.617 I FFmpegNative: prepare url=rtsp://192.168.1.101:556/main.mov timeoutMs=5000 realtimeInput=1
+08-25 15:07:01.945 I FFmpegNative: open input success sourceType=RTSP url=rtsp://192.168.1.101:556/main.mov
+08-25 15:07:02.238 I FFmpegNative: avcodec_open2 hardware success decoder=hevc_mediacodec
+08-25 15:07:21.191 I FFmpegNative: first frame rendered startToFirstFrameMs=148
 ```
 
-An independent device-side TCP probe to `192.168.1.101:556` also timed out. Because the RTSP source was unreachable, no RTP video packet, RTCP SR, or same-packet PRFT could be observed. A 5–10 minute playback run and the >=100-valid-sample gate were therefore impossible and were not simulated by waiting on a failed connection.
-
-The low-frequency compact snapshot after the failure confirms the actual session counters:
+The source remained playable for approximately 5 min 46 s. The final low-frequency snapshot was:
 
 ```text
-seq=53 STATE handle=1 state=error ... packets=0 frames=0 rendered=0
-seq=53 E2E mode=none sync=auto_time syncErrMs=-- rtpClock=--
+seq=73 STATE handle=1 state=playing steady=1 decodeFps=25.0 renderFps=25.0
+       backend=mediacodec output=nv12_cpu renderer=nv12_gl
+       packets=8751 frames=8747 rendered=8747
+seq=73 E2E mode=none sync=auto_time syncErrMs=-- rtpClock=90000
        srCount=0 srValid=0 sendToT0Ms=--/--/-- samples=0
-       anomaly=0 unmatched=0 t0WallNs=-- gen=2 resets=2 valid=0
+       anomaly=0 unmatched=0 gen=2 resets=2 valid=0
+seq=73 HEALTH samples=8746 dist=1024 decoderUnmatched=1 renderUnmatched=1
+       forcedEvict=0 reset=1 clockAnomaly=0 ptsBackward=0/0/0/0
 ```
 
-No post-change runtime value is inferred from unit tests or build success.
+The run exceeded the requested duration and sample opportunity, with stable playback and no reconnect/generation growth. Nevertheless, zero SRs means there was no RTP/NTP anchor, no same-packet PRFT mapping, and no E2E sample. No E2E value is inferred from receiver-stage samples, unit tests, or build success.
+
+An additional TCP/interleaved diagnostic was run without changing the stored RTSP default. It played for about 107 s and ended with:
+
+```text
+seq=25 STATE state=playing steady=1 decodeFps=25.9 renderFps=24.9
+       backend=mediacodec output=nv12_cpu renderer=nv12_gl
+       packets=2682 frames=2680 rendered=2680
+seq=25 E2E mode=none rtpClock=90000 srCount=0 srValid=0
+       sendToT0Ms=--/--/-- samples=0 anomaly=0 unmatched=0 resets=2 valid=0
+```
+
+The same zero-SR result on UDP and TCP narrows the external dependency: this is not explained only by a missing UDP RTCP return path. Without sender/server access or a packet capture at the sender boundary, it is still not possible to distinguish “sender emits no video SR” from “the bundled FFmpeg session does not export the received SR side data.”
 
 # E2E Distribution
 
 Measurement mode: `none`
 
-RTCP SR count: `0` (current attempt received no RTP/RTCP packets before RTSP open failed)
+RTCP SR count: `0` (after 8,751 received video packets over approximately 5 min 46 s)
 
 SR mapping valid: `NO`
 
@@ -212,19 +227,19 @@ Physical glass-to-glass: `NOT_MEASURED`
 
 # Receiver T0-to-T4 Baseline
 
-Frozen LAT5/LAT3 evidence, not a new runtime run:
+Current real-device runtime evidence:
 
 ```text
 decodeBackend=mediacodec
 frameOutputType=nv12_cpu
 renderer=nv12_gl
 decode/render ~= 25 fps
-T0 -> T4 p50=45.049 ms
-T0 -> T4 p95=55.980 ms
-T0 -> T4 p99=64.084 ms
+T0 -> T4 p50=45.144 ms
+T0 -> T4 p95=53.132 ms
+T0 -> T4 p99=57.292 ms
 ```
 
-This remains ONE_FRAME_CLASS. The LAT6 code is diagnostic side-channel work at T0 and does not modify decode, render, sync, pacing, or frame-drop behavior. Runtime regression confirmation is blocked by the unreachable RTSP source.
+This remains ONE_FRAME_CLASS and confirms the receiver regression gate. The LAT6 code is diagnostic side-channel work at T0 and does not modify decode, render, sync, pacing, or frame-drop behavior.
 
 # Tests
 
@@ -269,11 +284,10 @@ The non-fatal Android SDK XML/deprecation warnings are unrelated to LAT6.
 # Remaining Unknowns
 
 - Whether the external RTSP sender emits video RTCP Sender Reports.
-- Whether negotiated UDP/TCP/interleaved transport delivers those reports.
+- Whether the sender emits video SR at all or the bundled FFmpeg path fails to export it; both UDP and TCP-interleaved receiver runs exposed zero SR.
 - Sender/server clock synchronization method and measured error bound.
-- Whether a reachable source yields stable SR/PRFT mapping over multiple SRs.
-- Network reachability from target device `34aff35a` to the configured RTSP endpoint `192.168.1.101:556`.
-- Successful-playback `sameFrameUnmatchedCount`, anomalies, resets, and sample distribution; the failed-open session measured `0 / 0 / 2` respectively.
+- Whether the sender/server can be configured to emit and deliver video RTCP SR on this session so multiple stable SR/PRFT mappings can be observed.
+- E2E same-frame mapping behavior after an SR anchor exists. In this no-SR playback, E2E `unmatched/anomaly/reset` measured `0 / 0 / 2` and remained stable.
 - Camera capture, encoder residence, exact RTP socket-send time, and physical display/glass-to-glass latency.
 
 # LAT6 Freeze
@@ -290,7 +304,7 @@ Clock sync error: `UNKNOWN`
 
 Sender send -> Receiver T0: `NOT_MEASURED / NOT_MEASURED / NOT_MEASURED`
 
-Receiver T0 -> T4: `45.049 / 55.980 / 64.084 ms`
+Receiver T0 -> T4: `45.144 / 53.132 / 57.292 ms`
 
 Capture -> T4: `NOT_MEASURED`
 
@@ -307,18 +321,18 @@ BLOCKED_BY_EXTERNAL_DEPENDENCY
 Blocking dependency:
 
 ```text
-Target device 34aff35a is connected, but its configured RTSP endpoint
-192.168.1.101:556 is unreachable (`No route to host`), so no RTP/RTCP data can
-be collected. The external sender/server cannot be audited or modified here,
-and no verified sender/receiver wall-clock synchronization error bound is
-available.
+Target device 34aff35a played the configured source continuously for about
+5 min 46 s and received 8,751 video packets, but the UDP session delivered zero
+video RTCP Sender Reports. A separate TCP-interleaved run also delivered zero
+SR over about 107 s and 2,682 packets. The external sender/server cannot be
+audited or modified here, and no verified sender/receiver wall-clock
+synchronization error bound is available.
 ```
 
 Required next action:
 
-1. Restore network reachability from target device `34aff35a` to `rtsp://192.168.1.101:556/main.mov`.
-2. Configure/verify video RTCP SR emission and capture multiple SR mappings.
-3. Provide sender/server and receiver NTP/PTP status with a bounded sync error.
-4. Run this installed build for 5–10 minutes, collect at least 100 valid samples, and verify anomalies/unmatched/resets do not grow abnormally.
+1. Configure/verify video RTCP SR emission and delivery, then capture multiple SR mappings.
+2. Provide sender/server and receiver NTP/PTP status with a bounded sync error.
+3. Rerun this installed build for 5–10 minutes, collect at least 100 valid E2E samples, and verify anomalies/unmatched/resets do not grow abnormally.
 
 Until all three timebase dependencies are present, E2E latency remains invalid and LAT7 must not start.

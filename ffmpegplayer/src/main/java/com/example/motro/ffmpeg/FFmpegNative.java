@@ -10,7 +10,7 @@ public final class FFmpegNative {
 
     static {
         loadRequired("avutil");
-        loadOptional("swresample");
+        loadRequired("swresample");
         loadRequired("swscale");
         loadRequired("avcodec");
         loadRequired("avformat");
@@ -56,17 +56,6 @@ public final class FFmpegNative {
     private static void loadRequired(String name) {
         System.loadLibrary(name);
         Log.i(TAG, "loaded " + name);
-    }
-
-    private static boolean loadOptional(String name) {
-        try {
-            System.loadLibrary(name);
-            Log.i(TAG, "loaded optional " + name);
-            return true;
-        } catch (UnsatisfiedLinkError error) {
-            Log.w(TAG, "optional library not loaded: " + name + ", " + error.getMessage());
-            return false;
-        }
     }
 
     public static native String getFFmpegVersion();

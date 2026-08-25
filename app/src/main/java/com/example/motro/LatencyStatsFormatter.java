@@ -262,32 +262,41 @@ final class LatencyStatsFormatter {
         final long t0WallNs;
         final long generation;
         final long resets;
+        final long syncErrorUs;
+        final boolean e2eValid;
         final boolean srValid;
         final long srCount;
+        final long sendToT0LastUs;
         final long sendToT0P50Us;
         final long sendToT0P95Us;
         final long sendToT0P99Us;
         final long sendToT0Count;
         final long anomalyCount;
+        final long sameFrameUnmatchedCount;
 
         E2EInfo(String mode, String rxSync, long rtpClockRate,
                 long t0WallNs, long generation, long resets,
-                boolean srValid, long srCount,
+                long syncErrorUs, boolean e2eValid,
+                boolean srValid, long srCount, long sendToT0LastUs,
                 long sendToT0P50Us, long sendToT0P95Us, long sendToT0P99Us,
-                long sendToT0Count, long anomalyCount) {
+                long sendToT0Count, long anomalyCount, long sameFrameUnmatchedCount) {
             this.mode = mode;
             this.rxSync = rxSync;
             this.rtpClockRate = rtpClockRate;
             this.t0WallNs = t0WallNs;
             this.generation = generation;
             this.resets = resets;
+            this.syncErrorUs = syncErrorUs;
+            this.e2eValid = e2eValid;
             this.srValid = srValid;
             this.srCount = srCount;
+            this.sendToT0LastUs = sendToT0LastUs;
             this.sendToT0P50Us = sendToT0P50Us;
             this.sendToT0P95Us = sendToT0P95Us;
             this.sendToT0P99Us = sendToT0P99Us;
             this.sendToT0Count = sendToT0Count;
             this.anomalyCount = anomalyCount;
+            this.sameFrameUnmatchedCount = sameFrameUnmatchedCount;
         }
     }
 
@@ -364,31 +373,29 @@ final class LatencyStatsFormatter {
     }
 
     /**
-     * LAT6 E2E timebase line. mode=rtcp_sr (real RTCP Sender Reports received
-     * and mapped) or "none" (no SR seen yet). sendToT0Ms is the cross-device
-     * segment SR-generation-wall -> receiver-T0-wall (server + network +
-     * receiver pre-T0; NOT capture/encoder latency, NOT networkLatency),
-     * measured between synchronized wall clocks. syncErrMs stays "--" because
-     * the sync error is UNKNOWN (never 0). valid=1 only with a valid mapping
-     * and at least one distribution sample.
+     * LAT6 E2E timebase line. mode=rtcp_sr means a real SR anchor and
+     * same-AVPacket PRFT mapping were observed. sendToT0Ms is emitted only
+     * after the independent cross-device clock-error gate passes. RTP-mapped
+     * media time is not capture time and is not proven socket-send time.
      */
     static String e2eLine(long seq, E2EInfo info) {
-        final boolean valid = info.srValid && info.sendToT0Count > 0;
         return "seq=" + seq
                 + " E2E"
                 + " mode=" + sanitize(info.mode)
                 + " sync=" + sanitize(info.rxSync)
-                + " syncErrMs=--"
+                + " syncErrMs=" + ms3(info.syncErrorUs)
                 + " rtpClock=" + (info.rtpClockRate > 0 ? String.valueOf(info.rtpClockRate) : "--")
                 + " srCount=" + info.srCount
                 + " srValid=" + bool(info.srValid)
                 + " sendToT0Ms="
                 + tripleMs(info.sendToT0P50Us, info.sendToT0P95Us, info.sendToT0P99Us, info.sendToT0Count)
+                + " samples=" + info.sendToT0Count
                 + " anomaly=" + info.anomalyCount
+                + " unmatched=" + info.sameFrameUnmatchedCount
                 + " t0WallNs=" + (info.t0WallNs >= 0 ? String.valueOf(info.t0WallNs) : "--")
                 + " gen=" + info.generation
                 + " resets=" + info.resets
-                + " valid=" + bool(valid);
+                + " valid=" + bool(info.e2eValid);
     }
 
     /** us -> ms with two decimals; negative/invalid renders as "--". */

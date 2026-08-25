@@ -195,7 +195,7 @@ private:
                                            int yStride, int colorRange);
     void resetRealtimeClockForFormatDiscontinuity();
     void resetVideoPtsDiagnostics();
-    void processRtcpSenderReport(int64_t t0WallNs);
+    void processRtcpTimebase(int64_t t0WallNs);
     void recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs);
     void recordStageTimingRenderSubmit(int64_t ptsUs);
     void resetStageTimingCorrelation();
@@ -493,22 +493,22 @@ private:
     PreT0TimingTracker preT0Timing_;
     // LAT5: effective AVFormatContext::max_delay read back after open (us).
     std::atomic<int64_t> effectiveFmtCtxMaxDelayUs_{0};
-    // LAT6: end-to-end timebase bridge (receiver side only; no sender
-    // timestamps and no RTCP SR access in this build). lastPacketReadyWallNs
-    // is the receiver WALL timestamp captured at the same event as the T0
-    // monotonic timestamp; it is only comparable with an independently
-    // synchronized sender/server wall clock. videoRtpClockRate is read from
-    // the video stream time_base (never hardcoded).
+    // LAT6: end-to-end timebase bridge. lastPacketReadyWallNs is the receiver
+    // WALL timestamp captured at the same event as monotonic T0; local stage
+    // durations remain monotonic. videoRtpClockRate is read from stream
+    // time_base (never hardcoded).
     std::atomic<int64_t> lastPacketReadyWallNs_{-1};
     std::atomic<int64_t> e2eGeneration_{0};
     std::atomic<int64_t> e2eResetCount_{0};
     std::atomic<int64_t> videoStreamTimeBaseNum_{0};
     std::atomic<int64_t> videoStreamTimeBaseDen_{0};
-    // LAT6-FINAL: RTCP Sender Report mapping (public AV_PKT_DATA_RTCP_SR side
-    // data). The tracker owns the sender media->wall anchor; the distribution
-    // holds bounded srSendToT0 percentiles (SR NTP wall -> receiver T0 wall).
+    // LAT6-FINAL route B: public FFmpeg RTCP-SR + per-packet PRFT side data.
+    // PRFT is correlated by construction to the same AVPacket/T0. The
+    // distribution remains empty while cross-device clock error is unknown.
     RtcpSrTracker rtcpSrTracker_;
     SendToT0Distribution e2eSrSendToT0Dist_;
+    std::atomic<int64_t> e2eSameFrameMappedCount_{0};
+    std::atomic<int64_t> e2eSameFrameUnmatchedCount_{0};
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};

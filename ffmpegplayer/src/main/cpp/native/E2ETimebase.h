@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 // NTP era offset: seconds between 1900-01-01 and 1970-01-01.
@@ -36,11 +37,25 @@ inline int64_t wallClockNs() {
 // NTP 64-bit timestamp (seconds + fraction of a second) -> Unix ns.
 // The fraction is scaled by 1e9 / 2^32 in integer math (no float, no overflow:
 // max intermediate = (2^32-1) * 1e9 < 2^63).
-inline int64_t ntpToUnixNs(uint32_t seconds, uint32_t fraction) {
+inline bool ntpToUnixNsChecked(uint32_t seconds, uint32_t fraction,
+                               int64_t &outUnixNs) {
+    if (seconds < kNtpUnixEpochOffsetSeconds) {
+        return false;
+    }
     const uint64_t unixSecs = static_cast<uint64_t>(seconds) - kNtpUnixEpochOffsetSeconds;
+    if (unixSecs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+                           / 1000000000ULL) {
+        return false;
+    }
     const int64_t fracNs = static_cast<int64_t>(
             (static_cast<uint64_t>(fraction) * 1000000000ULL) >> 32);
-    return static_cast<int64_t>(unixSecs * 1000000000ULL) + fracNs;
+    outUnixNs = static_cast<int64_t>(unixSecs * 1000000000ULL) + fracNs;
+    return true;
+}
+
+inline int64_t ntpToUnixNs(uint32_t seconds, uint32_t fraction) {
+    int64_t unixNs = -1;
+    return ntpToUnixNsChecked(seconds, fraction, unixNs) ? unixNs : -1;
 }
 
 // Extend a wrapping 32-bit RTP timestamp into a 64-bit continuous timeline,
@@ -88,6 +103,8 @@ public:
     // never map across a reconnect / SSRC change / new sender session.
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
+        hasExpectedSsrc_ = false;
+        expectedSsrc_ = 0;
         hasAnchor_ = false;
         srMappingValid_ = false;
         srReceivedCount_ = 0;
@@ -117,7 +134,11 @@ public:
             srMappingValid_ = false;
             return false;
         }
-        const int64_t ntpNs = ntpToUnixNs(ntpSeconds, ntpFraction);
+        int64_t ntpNs = -1;
+        if (!ntpToUnixNsChecked(ntpSeconds, ntpFraction, ntpNs)) {
+            srMappingValid_ = false;
+            return false;
+        }
         const uint64_t extRtp = hasAnchor_
                 ? extendRtpTimestamp(lastExtRtp_, rtpTimestamp)
                 : static_cast<uint64_t>(rtpTimestamp);
@@ -222,17 +243,21 @@ inline E2ESampleResult measureSenderSendToReceiverT0Us(int64_t senderSendWallNs,
 // window; real outliers are kept (no outlier deletion).
 class SendToT0Distribution {
 public:
-    void addSample(const E2ESampleResult &sample) {
+    // clockSyncValid is an explicit cross-device gate. A mathematically
+    // mappable RTP/NTP sample must not become a latency percentile while the
+    // sender/receiver wall-clock error is unknown.
+    void addSample(const E2ESampleResult &sample, bool clockSyncValid = true) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (sample.anomaly) {
             ++anomalyCount_;
             return;
         }
-        if (!sample.valid) {
+        if (!sample.valid || !clockSyncValid) {
             ++invalidCount_;
             return;
         }
         dist_.addSample(sample.latencyUs);
+        lastUs_ = sample.latencyUs;
         ++validCount_;
     }
 
@@ -242,15 +267,17 @@ public:
         validCount_ = 0;
         anomalyCount_ = 0;
         invalidCount_ = 0;
+        lastUs_ = -1;
     }
 
     struct Snapshot {
         int64_t validCount = 0;
         int64_t anomalyCount = 0;
         int64_t invalidCount = 0;
-        int64_t p50Us = 0;
-        int64_t p95Us = 0;
-        int64_t p99Us = 0;
+        int64_t lastUs = -1;
+        int64_t p50Us = -1;
+        int64_t p95Us = -1;
+        int64_t p99Us = -1;
     };
 
     Snapshot snapshot() const {
@@ -259,10 +286,13 @@ public:
         snap.validCount = validCount_;
         snap.anomalyCount = anomalyCount_;
         snap.invalidCount = invalidCount_;
-        const LatencyDistribution::Snapshot dist = dist_.snapshot();
-        snap.p50Us = dist.p50;
-        snap.p95Us = dist.p95;
-        snap.p99Us = dist.p99;
+        snap.lastUs = lastUs_;
+        if (validCount_ > 0) {
+            const LatencyDistribution::Snapshot dist = dist_.snapshot();
+            snap.p50Us = dist.p50;
+            snap.p95Us = dist.p95;
+            snap.p99Us = dist.p99;
+        }
         return snap;
     }
 
@@ -272,17 +302,15 @@ private:
     int64_t validCount_ = 0;
     int64_t anomalyCount_ = 0;
     int64_t invalidCount_ = 0;
+    int64_t lastUs_ = -1;
 };
 
 // LAT6-FINAL: RTCP Sender Report tracker fed from the public FFmpeg API
 // (AV_PKT_DATA_RTCP_SR packet side data, AVRTCPSenderReport). Establishes the
-// sender media clock -> sender wall clock mapping and measures the cross-device
-// segment SR-send-wall -> receiver-T0-wall.
-//
-// Semantics (frozen): srSendToT0Us is measured between two synchronized WALL
-// clocks (sender NTP vs receiver wall). It covers the control-plane path
-// SR generation -> receiver T0 observation (server + network + receiver
-// pre-T0) and is NOT capture/encoder latency and NOT named networkLatency.
+// sender media clock -> sender wall clock anchor. FFmpeg attaches one SR side
+// data item to the next AVPacket after receiving that SR; it is not repeated on
+// every packet. Per-frame mapping is obtained separately from AV_PKT_DATA_PRFT
+// on that same AVPacket, never by pairing a latest SR time with a latest T0.
 class RtcpSrTracker {
 public:
     void setClockRate(int64_t rtpClockRateHz) {
@@ -290,9 +318,8 @@ public:
         rtpClockRateHz_ = rtpClockRateHz;
     }
 
-    // Feed one RTCP SR. Returns true only when this is a NEW report; the same
-    // SR is attached to many consecutive packets ("last received" semantics)
-    // and must be counted once.
+    // Feed one RTCP SR. Returns true only when this is a NEW report. Duplicate
+    // suppression is defensive; FFmpeg 8 normally exports each SR once.
     bool recordSenderReport(uint32_t ssrc, uint64_t ntpTimestampRaw,
                             uint32_t rtpTimestamp) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -301,25 +328,51 @@ public:
             ++duplicateCount_;
             return false;
         }
-        if (hasExpectedSsrc_ && ssrc != expectedSsrc_) {
-            ++ssrcMismatchCount_;
+        ++srReceivedCount_;
+        lastSrNtpRaw_ = ntpTimestampRaw;
+        lastSrRtpRaw_ = rtpTimestamp;
+        lastSsrcRaw_ = ssrc;
+        hasAnySr_ = true;
+
+        int64_t ntpNs = -1;
+        if (rtpClockRateHz_ <= 0
+                || !ntpToUnixNsChecked(
+                        static_cast<uint32_t>(ntpTimestampRaw >> 32),
+                        static_cast<uint32_t>(ntpTimestampRaw & 0xffffffffULL),
+                        ntpNs)) {
+            ++invalidReportCount_;
+            hasAnchor_ = false;
             srMappingValid_ = false;
-            lastSrNtpRaw_ = ntpTimestampRaw;
-            lastSrRtpRaw_ = rtpTimestamp;
-            lastSsrcRaw_ = ssrc;
-            hasAnySr_ = true;
             return true;
+        }
+        if (hasExpectedSsrc_ && ssrc != expectedSsrc_) {
+            // SSRC change == sender/server session change (spec: an old SR
+            // must never map into a new session). Reset the anchor entirely
+            // and re-arm on the new SSRC; this report becomes the new anchor.
+            ++ssrcMismatchCount_;
+            hasAnchor_ = false;
+            srMappingValid_ = false;
+            lastExtRtp_ = 0;
+            lastSrNtpNs_ = 0;
+            expectedSsrc_ = ssrc;
+            ++mappingResetCount_;
         }
         if (!hasExpectedSsrc_) {
             expectedSsrc_ = ssrc;
             hasExpectedSsrc_ = true;
         }
-        const int64_t ntpNs = ntpToUnixNs(
-                static_cast<uint32_t>(ntpTimestampRaw >> 32),
-                static_cast<uint32_t>(ntpTimestampRaw & 0xffffffffULL));
-        const uint64_t extRtp = hasAnchor_
+        uint64_t extRtp = hasAnchor_
                 ? extendRtpTimestamp(lastExtRtp_, rtpTimestamp)
                 : static_cast<uint64_t>(rtpTimestamp);
+        if (hasAnchor_ && (extRtp < lastExtRtp_ || ntpNs <= lastSrNtpNs_)) {
+            // Same-SSRC sender restart/discontinuity. Re-anchor on this report
+            // and ensure the old RTP epoch cannot leak into the new segment.
+            ++mappingResetCount_;
+            hasAnchor_ = false;
+            srMappingValid_ = false;
+            driftPpm_ = 0;
+            extRtp = static_cast<uint64_t>(rtpTimestamp);
+        }
         if (hasAnchor_ && rtpClockRateHz_ > 0) {
             const uint64_t rtpDeltaTicks = extRtp - lastExtRtp_;
             const int64_t ntpDeltaNs = ntpNs - lastSrNtpNs_;
@@ -335,21 +388,20 @@ public:
         lastSrNtpNs_ = ntpNs;
         hasAnchor_ = true;
         srMappingValid_ = rtpClockRateHz_ > 0;
-        ++srReceivedCount_;
-        lastSrNtpRaw_ = ntpTimestampRaw;
-        lastSrRtpRaw_ = rtpTimestamp;
-        lastSsrcRaw_ = ssrc;
-        hasAnySr_ = true;
         return true;
     }
 
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
+        hasExpectedSsrc_ = false;
+        expectedSsrc_ = 0;
         hasAnchor_ = false;
         srMappingValid_ = false;
         srReceivedCount_ = 0;
         duplicateCount_ = 0;
         ssrcMismatchCount_ = 0;
+        invalidReportCount_ = 0;
+        mappingResetCount_ = 0;
         driftPpm_ = 0;
         lastExtRtp_ = 0;
         lastSrNtpNs_ = 0;
@@ -357,8 +409,6 @@ public:
         lastSrRtpRaw_ = 0;
         lastSsrcRaw_ = 0;
         hasAnySr_ = false;
-        // expectedSsrc_ intentionally kept: a reconnect to the same source
-        // keeps the SSRC check; a real SSRC change re-arms via mismatch path.
     }
 
     struct Snapshot {
@@ -367,6 +417,8 @@ public:
         int64_t srReceivedCount = 0;
         int64_t duplicateCount = 0;
         int64_t ssrcMismatchCount = 0;
+        int64_t invalidReportCount = 0;
+        int64_t mappingResetCount = 0;
         int64_t driftPpm = 0;
         uint32_t ssrc = 0;
         uint64_t lastExtRtp = 0;
@@ -382,6 +434,8 @@ public:
         snap.srReceivedCount = srReceivedCount_;
         snap.duplicateCount = duplicateCount_;
         snap.ssrcMismatchCount = ssrcMismatchCount_;
+        snap.invalidReportCount = invalidReportCount_;
+        snap.mappingResetCount = mappingResetCount_;
         snap.driftPpm = driftPpm_;
         snap.ssrc = expectedSsrc_;
         snap.lastExtRtp = lastExtRtp_;
@@ -401,6 +455,8 @@ private:
     int64_t srReceivedCount_ = 0;
     int64_t duplicateCount_ = 0;
     int64_t ssrcMismatchCount_ = 0;
+    int64_t invalidReportCount_ = 0;
+    int64_t mappingResetCount_ = 0;
     int64_t driftPpm_ = 0;
     uint64_t lastExtRtp_ = 0;
     int64_t lastSrNtpNs_ = 0;

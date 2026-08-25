@@ -30,6 +30,10 @@ int main() {
         // fraction 0x40000000 == exactly one quarter second.
         CHECK(ntpToUnixNs(ntpSecs, 0x40000000u)
               == 1755000000LL * 1000000000LL + 250000000LL);
+        int64_t invalidNs = 123;
+        CHECK(!ntpToUnixNsChecked(1, 0, invalidNs));
+        CHECK(invalidNs == 123);
+        CHECK(ntpToUnixNs(1, 0) == -1);
     }
 
     // 2. RTP clock conversion via SR mapping: 90000 ticks == 1 s at 90 kHz.
@@ -131,6 +135,10 @@ int main() {
             sample.latencyUs = 100000;
             dist.addSample(sample);
         }
+        E2ESampleResult clockSyncUnknown;
+        clockSyncUnknown.valid = true;
+        clockSyncUnknown.latencyUs = 120000;
+        dist.addSample(clockSyncUnknown, false);
         E2ESampleResult anomaly;
         anomaly.anomaly = true;
         dist.addSample(anomaly);
@@ -139,7 +147,8 @@ int main() {
         const SendToT0Distribution::Snapshot snap = dist.snapshot();
         CHECK(snap.validCount == 3000);
         CHECK(snap.anomalyCount == 1);
-        CHECK(snap.invalidCount == 1);
+        CHECK(snap.invalidCount == 2);
+        CHECK(snap.lastUs == 100000);
         CHECK(snap.p50Us == 100000);
         CHECK(snap.p95Us == 100000);
         CHECK(snap.p99Us == 100000);
@@ -148,7 +157,8 @@ int main() {
         CHECK(cleared.validCount == 0);
         CHECK(cleared.anomalyCount == 0);
         CHECK(cleared.invalidCount == 0);
-        CHECK(cleared.p50Us == 0);
+        CHECK(cleared.lastUs == -1);
+        CHECK(cleared.p50Us == -1);
     }
 
     // 9. SR drift audit: NTP elapsed matching the RTP elapsed at nominal rate
@@ -176,7 +186,7 @@ int main() {
         const uint64_t ntpRaw = (static_cast<uint64_t>(1755000000LL + 2208988800LL) << 32)
                                 | 0x80000000ULL;
         CHECK(tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
-        // Same SR attached to many consecutive packets: counted once.
+        // Duplicate suppression is defensive (FFmpeg normally exports once).
         CHECK(!tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
         CHECK(!tracker.recordSenderReport(0x0a0b0c0d, ntpRaw, 1000000));
         const RtcpSrTracker::Snapshot snap = tracker.snapshot();
@@ -194,32 +204,60 @@ int main() {
         CHECK(seg.latencyUs == 120000);
     }
 
-    // 11. RTCP SR tracker: SSRC mismatch invalidates the mapping and is
-    //     counted; drift audit runs across two genuine reports.
+    // Invalid clock mapping: a received SR is counted, but a missing RTP clock
+    // rate or an invalid pre-Unix NTP value can never create an anchor.
+    {
+        RtcpSrTracker tracker;
+        CHECK(tracker.recordSenderReport(1, 1, 100));
+        CHECK(tracker.snapshot().srReceivedCount == 1);
+        CHECK(tracker.snapshot().invalidReportCount == 1);
+        CHECK(!tracker.snapshot().hasAnchor);
+        CHECK(!tracker.snapshot().srMappingValid);
+    }
+
+    // 11. RTCP SR tracker: an SSRC change is a session change — the old anchor
+    //     is dropped and the new SSRC's SR becomes the fresh anchor (an old SR
+    //     can never map into a new session); drift audit runs across two
+    //     genuine same-session reports.
     {
         RtcpSrTracker tracker;
         tracker.setClockRate(90000);
         const uint32_t baseSecs = static_cast<uint32_t>(1755000000LL + 2208988800LL);
         CHECK(tracker.recordSenderReport(1, static_cast<uint64_t>(baseSecs) << 32, 0));
-        // Foreign SSRC: rejected mapping, still a "new" report.
+        // Foreign SSRC: session change -> re-anchor on the new SSRC.
         CHECK(tracker.recordSenderReport(2, (static_cast<uint64_t>(baseSecs) << 32) + 0x80000000ULL, 90000));
-        const RtcpSrTracker::Snapshot bad = tracker.snapshot();
-        CHECK(bad.ssrcMismatchCount == 1);
-        CHECK(!bad.srMappingValid);
-        // Back to the expected SSRC, exactly 10 s of RTP and NTP later.
-        CHECK(tracker.recordSenderReport(1, static_cast<uint64_t>(baseSecs + 10) << 32, 900000));
-        const RtcpSrTracker::Snapshot good = tracker.snapshot();
-        CHECK(good.driftPpm == 0);
-        CHECK(good.srMappingValid);
+        const RtcpSrTracker::Snapshot changed = tracker.snapshot();
+        CHECK(changed.ssrcMismatchCount == 1);
+        CHECK(changed.ssrc == 2);
+        CHECK(changed.hasAnchor);
+        CHECK(changed.lastSrNtpNs == 1755000000LL * 1000000000LL + 500000000LL);
+        // Same SSRC again, exactly 10 s of RTP and NTP later -> drift 0 ppm.
+        CHECK(tracker.recordSenderReport(
+                2, (static_cast<uint64_t>(baseSecs + 10) << 32) | 0x80000000ULL,
+                90000 + 900000));
+        CHECK(tracker.snapshot().driftPpm == 0);
+        CHECK(tracker.snapshot().srMappingValid);
         // Next SR: exactly 0.5 s late over another 10 s of RTP -> 50000 ppm.
         CHECK(tracker.recordSenderReport(
-                1, (static_cast<uint64_t>(baseSecs + 20) << 32) | 0x80000000ULL, 1800000));
+                2, static_cast<uint64_t>(baseSecs + 21) << 32,
+                90000 + 1800000));
         CHECK(tracker.snapshot().driftPpm == 50000);
+        // Same SSRC but RTP timeline restart: old epoch is dropped and this SR
+        // is the fresh anchor for the restarted sender.
+        CHECK(tracker.recordSenderReport(
+                2, static_cast<uint64_t>(baseSecs + 22) << 32, 10));
+        CHECK(tracker.snapshot().mappingResetCount == 2); // SSRC + restart
+        CHECK(tracker.snapshot().lastExtRtp == 10);
+        CHECK(tracker.snapshot().hasAnchor);
         tracker.reset();
         const RtcpSrTracker::Snapshot cleared = tracker.snapshot();
         CHECK(cleared.srReceivedCount == 0);
         CHECK(!cleared.hasAnchor);
         CHECK(!cleared.srMappingValid);
+        CHECK(tracker.recordSenderReport(
+                3, static_cast<uint64_t>(baseSecs + 30) << 32, 100));
+        CHECK(tracker.snapshot().ssrcMismatchCount == 0);
+        CHECK(tracker.snapshot().ssrc == 3);
     }
 
     if (g_failures == 0) {

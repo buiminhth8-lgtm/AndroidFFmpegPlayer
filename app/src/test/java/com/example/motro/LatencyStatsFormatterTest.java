@@ -90,14 +90,15 @@ public class LatencyStatsFormatterTest {
         return new LatencyStatsFormatter.E2EInfo(
                 "rtcp_sr", "auto_time", 90000,
                 1755000000123456789L, 3, 2,
-                true, 24,
-                110200, 124500, 139700, 21, 0);
+                3000, true, true, 24, 120000,
+                110200, 124500, 139700, 21, 0, 0);
     }
 
     private static LatencyStatsFormatter.E2EInfo notReadyE2E() {
         return new LatencyStatsFormatter.E2EInfo(
                 "none", "unknown", 0, -1, 0, 0,
-                false, 0, -1, -1, -1, 0, 0);
+                -1, false, false, 0, -1,
+                -1, -1, -1, 0, 0, 0);
     }
 
     @Test
@@ -228,11 +229,12 @@ public class LatencyStatsFormatterTest {
         assertTrue(line, line.startsWith("seq=123 E2E"));
         assertTrue(line, line.contains(" mode=rtcp_sr"));
         assertTrue(line, line.contains(" sync=auto_time"));
-        assertTrue(line, line.contains(" syncErrMs=--"));
+        assertTrue(line, line.contains(" syncErrMs=3.000"));
         assertTrue(line, line.contains(" rtpClock=90000"));
         assertTrue(line, line.contains(" srCount=24"));
         assertTrue(line, line.contains(" srValid=1"));
         assertTrue(line, line.contains(" sendToT0Ms=110.200/124.500/139.700"));
+        assertTrue(line, line.contains(" samples=21"));
         assertTrue(line, line.contains(" anomaly=0"));
         assertTrue(line, line.contains(" t0WallNs=1755000000123456789"));
         assertTrue(line, line.contains(" gen=3"));
@@ -250,10 +252,28 @@ public class LatencyStatsFormatterTest {
         assertTrue(line, line.contains(" srCount=0"));
         assertTrue(line, line.contains(" srValid=0"));
         assertTrue(line, line.contains(" sendToT0Ms=--/--/--"));
+        assertTrue(line, line.contains(" syncErrMs=--"));
         assertTrue(line, line.contains(" t0WallNs=--"));
         assertTrue(line, line.contains(" valid=0"));
         assertFalse(line, line.contains("rtpClock=0"));
         assertFalse(line, line.contains("t0WallNs=0"));
+    }
+
+    @Test
+    public void e2eLineDoesNotPromoteRtcpMappingWithoutClockSync() {
+        LatencyStatsFormatter.E2EInfo mappedButUnsynced =
+                new LatencyStatsFormatter.E2EInfo(
+                        "rtcp_sr", "auto_time_unverified", 90000,
+                        1755000000123456789L, 3, 2,
+                        -1, false, true, 8, -1,
+                        -1, -1, -1, 0, 0, 0);
+        String line = LatencyStatsFormatter.e2eLine(SEQ, mappedButUnsynced);
+        assertTrue(line, line.contains(" mode=rtcp_sr"));
+        assertTrue(line, line.contains(" syncErrMs=--"));
+        assertTrue(line, line.contains(" srCount=8"));
+        assertTrue(line, line.contains(" srValid=1"));
+        assertTrue(line, line.contains(" sendToT0Ms=--/--/--"));
+        assertTrue(line, line.contains(" valid=0"));
     }
 
     @Test

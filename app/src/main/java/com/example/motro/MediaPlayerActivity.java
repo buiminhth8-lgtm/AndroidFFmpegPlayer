@@ -1037,13 +1037,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stats.optLong("lastPacketReadyWallNs", -1),
                 stats.optLong("e2eGeneration", 0),
                 stats.optLong("e2eResetCount", 0),
+                stats.optLong("clockSyncEstimatedErrorUs", -1),
+                stats.optBoolean("e2eValid", false),
                 stats.optBoolean("srMappingValid", false),
                 stats.optLong("rtcpSrReceivedCount", 0),
-                stats.optLong("srSendToReceiverT0P50Us", -1),
-                stats.optLong("srSendToReceiverT0P95Us", -1),
-                stats.optLong("srSendToReceiverT0P99Us", -1),
-                stats.optLong("srSendToReceiverT0ValidCount", 0),
-                stats.optLong("clockMappingAnomalyCount", 0));
+                stats.optLong("senderSendToReceiverT0UsLast", -1),
+                stats.optLong("senderSendToReceiverT0UsP50", -1),
+                stats.optLong("senderSendToReceiverT0UsP95", -1),
+                stats.optLong("senderSendToReceiverT0UsP99", -1),
+                stats.optLong("senderSendToReceiverT0UsValidCount", 0),
+                stats.optLong("clockMappingAnomalyCount", 0),
+                stats.optLong("sameFrameUnmatchedCount", 0));
 
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));

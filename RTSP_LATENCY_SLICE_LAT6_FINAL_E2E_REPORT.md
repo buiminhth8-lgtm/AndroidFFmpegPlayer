@@ -63,7 +63,7 @@ Both are corrected. Mode is not forced.
 | Sender source | NOT_AVAILABLE | No capture/encoder/sender project is present in this workspace. |
 | RTSP server source | NOT_AVAILABLE | The camera/server implementation is external. |
 | FFmpeg RTCP SR API | AVAILABLE | Public FFmpeg 8.0.1 packet side data; no private-struct access. |
-| RTCP SR in current runtime | UNAVAILABLE | Supplied runtime evidence is `srCount=0`; no post-change device run was possible. |
+| RTCP SR in current runtime | UNAVAILABLE | The 2026-08-25 device run reached `avformat_open_input`, but the configured RTSP endpoint failed with `No route to host` before any RTP/RTCP packet was received. |
 | RTP clock rate | AVAILABLE after open | Derived from video stream `time_base`; not hardcoded. |
 | Receiver T0 wall + monotonic | AVAILABLE | Existing LAT6/LAT3 bridge reused. |
 | Sender/receiver clock sync | UNKNOWN | Receiver auto-time is observable only as configuration; sender clock state and error bound are absent. |
@@ -154,7 +154,26 @@ sendToT0Ms=--
 valid=0
 ```
 
-Post-change runtime gate: NOT_EXECUTED. `adb devices -l` returned an empty device list on 2026-08-25. There was therefore no authorized way to install the APK, reach the RTSP source, run for 5–10 minutes, or capture at least 100 valid samples.
+Post-change runtime gate: BLOCKED. On 2026-08-25, target device `34aff35a` (`Bengal_for_arm64`) was online, the current debug APK installed successfully, and the activity was launched with the frozen UDP / balanced / MediaCodec NV12 GL configuration. Android automatic time was enabled (`auto_time=1`), but that does not establish the sender's clock state or a cross-device error bound.
+
+The UI-driven `CREATE` and `PREPARE` path reached the real FFmpeg open call:
+
+```text
+08-25 14:58:52.690 I FFmpegNative: prepare url=rtsp://192.168.1.101:556/main.mov timeoutMs=5000 realtimeInput=1
+08-25 14:58:52.690 I FFmpegNative: RTSP options sourceType=RTSP transport=udp latencyMode=balanced ...
+08-25 14:58:55.759 E FFmpegNative: RTSP open failed url=rtsp://192.168.1.101:556/main.mov error=No route to host
+```
+
+An independent device-side TCP probe to `192.168.1.101:556` also timed out. Because the RTSP source was unreachable, no RTP video packet, RTCP SR, or same-packet PRFT could be observed. A 5–10 minute playback run and the >=100-valid-sample gate were therefore impossible and were not simulated by waiting on a failed connection.
+
+The low-frequency compact snapshot after the failure confirms the actual session counters:
+
+```text
+seq=53 STATE handle=1 state=error ... packets=0 frames=0 rendered=0
+seq=53 E2E mode=none sync=auto_time syncErrMs=-- rtpClock=--
+       srCount=0 srValid=0 sendToT0Ms=--/--/-- samples=0
+       anomaly=0 unmatched=0 t0WallNs=-- gen=2 resets=2 valid=0
+```
 
 No post-change runtime value is inferred from unit tests or build success.
 
@@ -162,7 +181,7 @@ No post-change runtime value is inferred from unit tests or build success.
 
 Measurement mode: `none`
 
-RTCP SR count: `0` (supplied pre-change runtime evidence)
+RTCP SR count: `0` (current attempt received no RTP/RTCP packets before RTSP open failed)
 
 SR mapping valid: `NO`
 
@@ -178,6 +197,9 @@ p50=NOT_MEASURED
 p95=NOT_MEASURED
 p99=NOT_MEASURED
 samples=0
+clockMappingAnomalyCount=0
+sameFrameUnmatchedCount=0
+e2eResetCount=2
 ```
 
 Candidate values with unknown clock error are counted invalid and never enter the bounded percentile distribution. Empty distributions expose `-1` to the demo and render as `--`, not `0`.
@@ -202,7 +224,7 @@ T0 -> T4 p95=55.980 ms
 T0 -> T4 p99=64.084 ms
 ```
 
-This remains ONE_FRAME_CLASS. The LAT6 code is diagnostic side-channel work at T0 and does not modify decode, render, sync, pacing, or frame-drop behavior. Runtime regression confirmation is blocked by the missing device.
+This remains ONE_FRAME_CLASS. The LAT6 code is diagnostic side-channel work at T0 and does not modify decode, render, sync, pacing, or frame-drop behavior. Runtime regression confirmation is blocked by the unreachable RTSP source.
 
 # Tests
 
@@ -250,7 +272,8 @@ The non-fatal Android SDK XML/deprecation warnings are unrelated to LAT6.
 - Whether negotiated UDP/TCP/interleaved transport delivers those reports.
 - Sender/server clock synchronization method and measured error bound.
 - Whether a reachable source yields stable SR/PRFT mapping over multiple SRs.
-- Real `sameFrameUnmatchedCount`, anomalies, resets, and sample distribution.
+- Network reachability from target device `34aff35a` to the configured RTSP endpoint `192.168.1.101:556`.
+- Successful-playback `sameFrameUnmatchedCount`, anomalies, resets, and sample distribution; the failed-open session measured `0 / 0 / 2` respectively.
 - Camera capture, encoder residence, exact RTP socket-send time, and physical display/glass-to-glass latency.
 
 # LAT6 Freeze
@@ -284,16 +307,18 @@ BLOCKED_BY_EXTERNAL_DEPENDENCY
 Blocking dependency:
 
 ```text
-No ADB device is connected, the external RTSP sender/server cannot be audited
-or modified here, the current runtime provides no RTCP SR, and no verified
-sender/receiver wall-clock synchronization error bound is available.
+Target device 34aff35a is connected, but its configured RTSP endpoint
+192.168.1.101:556 is unreachable (`No route to host`), so no RTP/RTCP data can
+be collected. The external sender/server cannot be audited or modified here,
+and no verified sender/receiver wall-clock synchronization error bound is
+available.
 ```
 
 Required next action:
 
-1. Connect the target Android device and make the RTSP source reachable.
+1. Restore network reachability from target device `34aff35a` to `rtsp://192.168.1.101:556/main.mov`.
 2. Configure/verify video RTCP SR emission and capture multiple SR mappings.
 3. Provide sender/server and receiver NTP/PTP status with a bounded sync error.
-4. Install this build, run 5–10 minutes, collect at least 100 valid samples, and verify anomalies/unmatched/resets do not grow abnormally.
+4. Run this installed build for 5–10 minutes, collect at least 100 valid samples, and verify anomalies/unmatched/resets do not grow abnormally.
 
 Until all three timebase dependencies are present, E2E latency remains invalid and LAT7 must not start.

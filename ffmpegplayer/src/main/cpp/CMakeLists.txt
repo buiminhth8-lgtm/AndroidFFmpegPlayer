@@ -43,15 +43,6 @@ add_library(avformat SHARED IMPORTED)
 set_target_properties(avformat PROPERTIES
         IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libavformat.so)
 
-# Present in jniLibs, but not linked in this player phase.
-add_library(avfilter SHARED IMPORTED)
-set_target_properties(avfilter PROPERTIES
-        IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libavfilter.so)
-
-add_library(avdevice SHARED IMPORTED)
-set_target_properties(avdevice PROPERTIES
-        IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libavdevice.so)
-
 find_library(log-lib log)
 find_library(android-lib android)
 find_library(egl-lib EGL)

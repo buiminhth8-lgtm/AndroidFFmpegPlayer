@@ -50,7 +50,7 @@
             <EditText
                 android:id="@+id/urlEditText"
                 style="@style/ControlEditText"
-                android:hint="rtsp:// or http(s):// test url"
+                android:hint="rtsp:// or http(s):// url"
                 android:inputType="textUri"
                 android:singleLine="true" />
 

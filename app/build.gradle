@@ -1,32 +1,16 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
-    id 'kotlin-android'
-    id 'kotlin-kapt'
-    id 'com.google.devtools.ksp'
 }
 
-ksp {
-    arg("AROUTER_MODULE_NAME", project.getName())
-}
-
-android.sourceSets.configureEach { it.java.srcDir("build/generated/ksp/${it.name}/kotlin/") }
 android {
     namespace 'com.example.motro'
     compileSdk 36
     defaultConfig {
         applicationId "com.example.motro"
         minSdk 24
-        targetSdk 31
+        targetSdk 35
         versionCode 6
         versionName "1.0.0.6"
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        multiDexEnabled true
-        javaCompileOptions {
-            annotationProcessorOptions {
-                arguments = [AROUTER_MODULE_NAME: project.getName()]
-            }
-        }
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a"
         }
@@ -39,7 +23,7 @@ android {
 
     buildTypes {
         release {
-            debuggable true
+            debuggable false
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
 
@@ -57,17 +41,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = '17'
-    }
-
-    kotlin {
-        jvmToolchain(17)
-    }
-
     buildFeatures {
         viewBinding true
-        dataBinding true
     }
 
     applicationVariants.all { variant ->
@@ -85,21 +60,8 @@ android {
 
 
 dependencies {
-    implementation fileTree(include: ['*.jar'], dir: 'libs')
-    implementation("androidx.multidex:multidex:2.0.1")
-    implementation 'androidx.media:media:1.4.0'
     implementation 'androidx.appcompat:appcompat:1.4.1'
-    implementation 'com.google.android.material:material:1.10.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.3'
-    implementation 'androidx.navigation:navigation-fragment-ktx:2.4.1'
-    implementation 'androidx.recyclerview:recyclerview:1.3.2'
-    implementation "androidx.viewpager2:viewpager2:1.0.0"
-    implementation "androidx.core:core-ktx:$rootProject.kotlin_version"
-    //Android coroutines
-    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"
-    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2"  // 濡傛灉浣犲湪 Android 涓婁娇鐢?
-    //Android Utils
     implementation project(':ffmpegplayer')
-    implementation 'com.blankj:utilcodex:1.31.1'
     testImplementation 'junit:junit:4.13.2'
 }

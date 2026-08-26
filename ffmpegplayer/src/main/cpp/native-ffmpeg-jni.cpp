@@ -19,6 +19,7 @@
 #include "native/NativePlayer.h"
 #include "native/NativeOesRenderer.h"
 #include "native/PlayerOptions.h"
+#include "native/TestHookPolicy.h"
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -338,7 +339,9 @@ PlayerOperationGuard acquirePlayer(jlong handle, std::string &errorMessage) {
     return PlayerOperationGuard(std::move(entry));
 }
 
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
 std::string runPlayerLifetimeStressTest();
+#endif
 
 jstring nativeGetFFmpegVersion(JNIEnv *env, jclass) {
     return toJString(env, av_version_info());
@@ -387,6 +390,10 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     }
 
     const std::string &first = command[0];
+    if (ffmpegplayer::testHookCommandPolicy(first)
+            == ffmpegplayer::TestHookCommandPolicy::UnsupportedInRelease) {
+        return toJString(env, std::string(ffmpegplayer::kTestHookUnsupportedJson));
+    }
     if (first == "-version") {
         return toJString(env, std::string("{\"success\":true,\"version\":\"")
                               + escapeJson(av_version_info()) + "\"}");
@@ -420,6 +427,7 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
     if (first == "-hardware-decode-help") {
         return toJString(env, hardwareDecodeHelpJson());
     }
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
     if (first == "-player-lifetime-stress") {
         return toJString(env, runPlayerLifetimeStressTest());
     }
@@ -431,6 +439,7 @@ jstring nativeRunDebugCommand(JNIEnv *env, jclass, jobjectArray args) {
         return toJString(env, std::string("{\"success\":true,\"audioWorkerTestDelayMs\":")
                               + std::to_string(delayMs) + "}");
     }
+#endif
     if (first == "-probe") {
         if (command.size() < 2 || command[1].empty()) {
             return toJString(env, jsonError(-1, "-probe requires url"));
@@ -973,6 +982,7 @@ jstring nativeReleasePlayer(JNIEnv *env, jclass, jlong handle) {
     return toJString(env, releasePlayerEntry(handle));
 }
 
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
 std::string runPlayerLifetimeStressTest() {
     constexpr int kCreateReleaseCycles = 100;
     constexpr int kConcurrentReleaseCycles = 20;
@@ -1171,6 +1181,7 @@ std::string runPlayerLifetimeStressTest() {
     LOGI("player lifetime stress result=%s", out.str().c_str());
     return out.str();
 }
+#endif
 
 bool registerNativeMethods(JNIEnv *env) {
     jclass clazz = env->FindClass("com/example/motro/ffmpeg/FFmpegNative");

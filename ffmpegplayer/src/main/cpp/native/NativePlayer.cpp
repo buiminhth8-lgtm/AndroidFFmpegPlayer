@@ -60,8 +60,10 @@ constexpr int64_t kStageTimingWarmupSamples = 120;
 constexpr int64_t kE2EClockSyncEstimatedErrorUs = -1;
 constexpr bool kE2EClockSyncValid = false;
 
-// A3 test-only hook (default 0 = production behavior unchanged).
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
+// A3 debug-only hook (default 0 = normal playback behavior unchanged).
 std::atomic<int> g_audio_worker_test_delay_ms{0};
+#endif
 
 // A2 frozen PCM output contract: S16 / 48000 Hz / stereo / interleaved.
 constexpr int kAudioPcmOutputSampleRate = 48000;
@@ -3868,9 +3870,11 @@ void NativePlayer::logRateLimitedAudioResampleError(const char *message) {
     }
 }
 
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
 void setAudioWorkerBackpressureTestDelayMs(int delayMs) {
     g_audio_worker_test_delay_ms.store(delayMs < 0 ? 0 : delayMs);
 }
+#endif
 
 int64_t AudioPcmQueue::blockDurationUs(const Block &block) {
     if (block.sampleCount <= 0) {
@@ -4006,12 +4010,14 @@ void NativePlayer::audioOutputWorkerLoop() {
         if (!got) {
             break;
         }
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
         const int testDelayMs = g_audio_worker_test_delay_ms.load();
         if (testDelayMs > 0) {
             // Test-only backpressure hook: simulate a slow consumer to prove the
             // playback thread never blocks. Never enabled in production.
             std::this_thread::sleep_for(std::chrono::milliseconds(testDelayMs));
         }
+#endif
         if (!audioEnabled_.load()
             || pauseRequested_.load()
             || stopRequested_.load()

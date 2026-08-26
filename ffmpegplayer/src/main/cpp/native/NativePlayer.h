@@ -74,10 +74,11 @@ private:
     int64_t highWatermarkUs_ = 0;
 };
 
-// Test-only hook: makes the audio output worker's null sink sleep before each
-// consumed block, to validate that a slow consumer never blocks the playback
-// thread. Default 0 = no delay (production behavior unchanged).
+#if FFMPEGPLAYER_ENABLE_TEST_HOOKS
+// Debug-only hook: makes the audio output worker's null sink sleep before each
+// consumed block, to validate that a slow consumer never blocks playback.
 void setAudioWorkerBackpressureTestDelayMs(int delayMs);
+#endif
 
 enum class PlayerState {
     Idle,

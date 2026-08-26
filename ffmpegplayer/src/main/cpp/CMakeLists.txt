@@ -23,6 +23,18 @@ add_library(native-ffmpeg SHARED
         native/ThermalConfig.cpp
         native/ThermalPaletteLut.cpp)
 
+# Test-only native commands and their implementations are compiled exclusively
+# for the Debug variant. Every other build type fails closed as production.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(FFMPEGPLAYER_TEST_HOOKS_VALUE 1)
+else()
+    set(FFMPEGPLAYER_TEST_HOOKS_VALUE 0)
+endif()
+target_compile_definitions(native-ffmpeg PRIVATE
+        FFMPEGPLAYER_ENABLE_TEST_HOOKS=${FFMPEGPLAYER_TEST_HOOKS_VALUE})
+message(STATUS
+        "FFMPEGPLAYER_ENABLE_TEST_HOOKS=${FFMPEGPLAYER_TEST_HOOKS_VALUE} (CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE})")
+
 add_library(avutil SHARED IMPORTED)
 set_target_properties(avutil PROPERTIES
         IMPORTED_LOCATION ${FFMPEG_LIB_DIR}/libavutil.so)

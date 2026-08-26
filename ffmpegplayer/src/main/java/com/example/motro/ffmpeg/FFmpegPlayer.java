@@ -5,7 +5,7 @@ import android.view.Surface;
 /**
  * Public facade for the Motro live player. Owns the native handle,
  * {@link LiveAudioPcmSink} and the native event bridge. Consumer code
- * (e.g. {@code MediaPlayerActivity}) interacts only with this class.
+ * uses this class for normal playback operations.
  *
  * <p>Lifecycle (mirrors {@code FFmpegNative}):</p>
  * <pre>
@@ -19,10 +19,20 @@ import android.view.Surface;
  *   player.stop();
  *   player.release(); // or try-with-resources
  * </pre>
- * <p>{@code release()} is idempotent; after release every instance method
- * returns a JSON error string and never touches a stale native handle.</p>
+ * <p>{@code release()} is idempotent. After release, String-returning player
+ * operations return a JSON error without touching a stale native handle,
+ * {@code setListener} is ignored, and {@code isReleased()} returns true.</p>
  */
 public final class FFmpegPlayer implements AutoCloseable {
+
+    /** Original/unmodified thermal palette. */
+    public static final int THERMAL_PALETTE_ORIGINAL = FFmpegNative.THERMAL_PALETTE_ORIGINAL;
+
+    /** Grayscale white-hot thermal palette. */
+    public static final int THERMAL_PALETTE_WHITE_HOT = FFmpegNative.THERMAL_PALETTE_WHITE_HOT;
+
+    /** Ironbow false-color thermal palette. */
+    public static final int THERMAL_PALETTE_IRONBOW = FFmpegNative.THERMAL_PALETTE_IRONBOW;
 
     public interface Listener {
         void onPlayerEvent(String event, String eventJson);

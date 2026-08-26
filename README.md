@@ -10,8 +10,8 @@ app（Demo）
         ↓  implementation project(':ffmpegplayer')
 ffmpegplayer（public library）
 ├── FFmpegPlayer        # primary public API（AutoCloseable）
-├── FFmpegNative        # legacy JNI bridge（internal）
-├── LiveAudioPcmSink    # AudioTrack 持有者（internal）
+├── FFmpegNative        # public legacy JNI bridge（普通 Consumer 无需直接调用）
+├── LiveAudioPcmSink    # public JNI callback implementation（普通 Consumer 无需实例化）
 ├── JNI / C++（NativePlayer、Renderers、Thermal、Recorder、Snapshot）
 ├── FFmpeg headers / runtime .so
 └── CMake
@@ -86,27 +86,27 @@ app/                                    # Demo module
     └── res/                            # Demo layout / drawable / strings / themes / launcher
 
 ffmpegplayer/                           # Public library module
-├── build.gradle                        # com.android.library + externalNativeBuild + maven-publish
+├── build.gradle                        # com.android.library + externalNativeBuild + consumer rules
 ├── consumer-rules.pro                  # JNI/R8 consumer keep rules
 └── src/main/
     ├── AndroidManifest.xml             # 仅 INTERNET 权限
     ├── java/com/example/motro/ffmpeg/
     │   ├── FFmpegPlayer.java           # primary public API（facade）
-    │   ├── FFmpegNative.java           # legacy JNI bridge（internal，PUBLIC_LEGACY_BRIDGE）
-    │   └── LiveAudioPcmSink.java       # AudioTrack 持有者（internal）
+    │   ├── FFmpegNative.java           # public legacy JNI bridge（PUBLIC_LEGACY_BRIDGE）
+    │   └── LiveAudioPcmSink.java       # public JNI callback implementation
     ├── cpp/
     │   ├── CMakeLists.txt
     │   ├── native-ffmpeg-jni.cpp
     │   ├── ffmpeg/include/             # FFmpeg headers（7 lib）
     │   └── native/                     # 播放器 Native 实现（20 文件）
-    └── jniLibs/{arm64-v8a,armeabi-v7a} # FFmpeg runtime .so（7/ABI）
+    └── jniLibs/{arm64-v8a,armeabi-v7a} # FFmpeg runtime .so（5/ABI）
 ```
 
 ### ffmpegplayer Native 模块职责
 
 | 文件 | 职责 |
 | --- | --- |
-| `native-ffmpeg-jni.cpp` | JNI 注册、opaque handle 管理（Fix 4）、FFmpeg 基础能力入口、调试命令（`-player-lifetime-stress`、`-audio-backpressure-test`）。 |
+| `native-ffmpeg-jni.cpp` | JNI 注册、opaque handle 管理（Fix 4）、FFmpeg 基础诊断入口；两个 test-only 命令仅 Debug 可执行，Release 稳定拒绝。 |
 | `NativePlayer.*` | 输入/解码/渲染线程、状态机、Thermal 调度、Audio 全链路（decode→SWR→queue→worker→sink→clock→A/V sync）、统计、重连、录制集成。 |
 | `NativeNv12GlRenderer.*` | 硬解 NV12 → OpenGL ES（Original / White Hot / Ironbow / Gamma / Window），EGL 生命周期。 |
 | `NativeYuvGlRenderer.*` | 软件 YUV420P → OpenGL ES（Phase 1 Thermal）。 |
@@ -125,9 +125,9 @@ ffmpegplayer/                           # Public library module
 - native player handle（`FFmpegNative.createPlayer()` 唯一 Java owner）
 - `LiveAudioPcmSink`（AudioTrack 生命周期内部化）
 - native event callback bridge（`FFmpegPlayer.Listener`）
-- player lifecycle（`release()` 幂等，release 后所有方法返回 `{"success":false,...}`，不触 stale handle）
+- player lifecycle（`release()` 幂等；release 后 String 播放操作返回 JSON error，不触 stale handle）
 
-Consumer 不再直接接触 `long nativeHandle` / `FFmpegNative` / `LiveAudioPcmSink`。
+普通 Consumer 不需要直接接触 `long nativeHandle`、`FFmpegNative` 或 `LiveAudioPcmSink`；后两者因 JNI/兼容契约保持 public。
 
 ```java
 FFmpegPlayer player = new FFmpegPlayer();
@@ -150,15 +150,24 @@ player.release();                     // 或 try-with-resources
 | `release()` / `close()` | 幂等 release（join worker → sink release → 删除 JNI GlobalRef）。 |
 | `setAudioEnabled(boolean)` | Live Audio 监听开关（不 reopen RTSP、不重建 MediaCodec、不影响 Recorder）。 |
 | `setHardwareDecodeEnabled` / `setHardwareRenderMode` | 硬解开关与渲染模式。 |
-| `setRtspTransport` / `setLatencyMode` / `setPlayerOption` | RTSP transport / 低延迟 profile / 单项参数。 |
+| `setRtspTransport` / `setLatencyMode` | RTSP transport 与播放延迟 profile；profile 为 `low_latency/ultra_low_latency/balanced/stable`。 |
+| `setPlayerOption` | 单项参数入口；也用于设置 `diagnostics_mode=off/basic/latency`。 |
 | `setReconnectOptions` | 重连策略。 |
-| `setThermalEnabled/Palette/AgcEnabled/Gamma/Window` | Thermal 控制。 |
+| `setThermalEnabled(boolean)` / `setThermalPalette(int)` / `setThermalAgcEnabled(boolean)` / `setThermalGamma(float)` / `setThermalWindow(float,float)` | Thermal 控制。 |
 | `startRecord` / `startSegmentRecord` / `startRecordWithConfig` / `stopRecord` / `getRecordState` | remux 录制（与 Live Audio 独立）。 |
 | `takeSnapshot(path)` | 截图（Fixes 能力路由）。 |
 | `getState` / `getStats` / `getReconnectState` / `getLatencyConfig` | 状态 / 统计 / 重连 / 延迟 JSON。 |
 | `isReleased()` | release 状态查询。 |
 
-`FFmpegNative` / `LiveAudioPcmSink` 保持 `public`（`PUBLIC_LEGACY_BRIDGE`，供 JNI `FindClass`/静态工具/兼容）；Demo 主线不直接使用。
+### 生命周期与线程
+
+- `FFmpegPlayer` 以实例锁串行化 facade 调用并拥有唯一 native handle；一个实例不要并发执行互相冲突的生命周期操作。
+- `prepare/start/pause/stop/release` 可能等待 native 工作完成，不应在主线程执行耗时流程；Demo 使用后台 executor 调用。
+- `FFmpegPlayer.Listener` 在 native 事件回调线程触发，不保证是 Android 主线程；更新 UI 前必须自行切换到主线程。
+- `release()` 可重复调用；第一次释放资源，后续返回成功的 `player already released` JSON。`close()` 等价于调用 `release()`。
+- release 后 `isReleased()` 为 `true`、`setListener()` 被忽略，其他 String 播放操作返回 `success=false` JSON。
+
+`FFmpegNative` / `LiveAudioPcmSink` 保持 `public`（`PUBLIC_LEGACY_BRIDGE`，供 JNI `FindClass`、静态诊断工具和二进制兼容）；它们不是普通 Consumer 的首选入口。
 
 ---
 
@@ -210,7 +219,7 @@ NV12 Y（或 YUV420P Y）
 - AGC ON 时使用 AGC Effective Window（manual 不被覆盖）；AGC OFF 立即恢复 manual Window。
 - `software_yuv_gl` 与 `mediacodec_nv12_gl` 共用同一 `ThermalConfig` 与 `computeAgcWindow` 算法。
 
-常量：`FFmpegNative.THERMAL_PALETTE_ORIGINAL / WHITE_HOT / IRONBOW`（`FFmpegPlayer` 亦可转发）。
+普通 Consumer 使用 `FFmpegPlayer.THERMAL_PALETTE_ORIGINAL`、`FFmpegPlayer.THERMAL_PALETTE_WHITE_HOT`、`FFmpegPlayer.THERMAL_PALETTE_IRONBOW`。它们分别转发 `FFmpegNative` 中数值为 `0/1/2` 的兼容常量；legacy 常量没有删除。
 
 ---
 
@@ -284,23 +293,50 @@ RTSP AAC packet
 
 ## 8. 构建
 
+### 8.1 Consumer 引用
+
+仓库内 Demo 使用模块依赖：
+
+```groovy
+dependencies {
+    implementation project(':ffmpegplayer')
+}
+```
+
+独立工程可复制 Release AAR 到例如 `app/libs/ffmpegplayer-release.aar`，然后仅依赖该文件：
+
+```groovy
+dependencies {
+    implementation files('libs/ffmpegplayer-release.aar')
+}
+```
+
+AAR 已嵌入 `proguard.txt`（来自 `consumer-rules.pro`）；Consumer 开启 R8 时规则会随 AAR 合并，用于保护 `FFmpegNative` 注册、事件回调、OES listener 和 Audio JNI callback 的精确类名/方法签名。无需在 Consumer 添加 package-wide keep。支持 ABI 仅为 `armeabi-v7a` 与 `arm64-v8a`。
+
+### 8.2 构建与测试命令
+
 ```powershell
 # Demo APK（自动构建依赖的 ffmpegplayer，含 CMake native）
 .\gradlew.bat :app:assembleDebug
+.\gradlew.bat :app:assembleRelease
 
 # Library AAR（debug / release）
 .\gradlew.bat :ffmpegplayer:assembleDebug
 .\gradlew.bat :ffmpegplayer:assembleRelease
 
-# 发布到 Maven Local
-.\gradlew.bat :ffmpegplayer:publishReleasePublicationToMavenLocal
+# 当前 JVM unit tests
+.\gradlew.bat :app:testDebugUnitTest :app:testReleaseUnitTest
 ```
 
 - Native 由 `ffmpegplayer/src/main/cpp/CMakeLists.txt` 生成 `libnative-ffmpeg.so`（链接 FFmpeg runtime），ABI：`armeabi-v7a, arm64-v8a`。
-- AAR 产物：`ffmpegplayer/build/outputs/aar/ffmpegplayer-release.aar`，包含 `classes.jar`（FFmpegPlayer/FFmpegNative/LiveAudioPcmSink）、`jni/{arm64-v8a,armeabi-v7a}/`（`libnative-ffmpeg.so` + 7 FFmpeg .so）、`proguard.txt`（consumer rules）、`AndroidManifest.xml`。
-- Maven coordinates：`com.example.motro:ffmpegplayer:1.0.0.6`（packaging `aar`，无外部依赖，非 Fat AAR）。
+- AAR 产物：`ffmpegplayer/build/outputs/aar/ffmpegplayer-release.aar`，包含 `classes.jar`（3 个 public 顶层类型及 nested/anonymous class）、`jni/{arm64-v8a,armeabi-v7a}/`（每 ABI 为 `libnative-ffmpeg.so` + 5 个必需 FFmpeg `.so`）、`proguard.txt`、`AndroidManifest.xml` 与 AAR metadata。
+- `ffmpegplayer` 的 Release runtime classpath 无外部 Maven 依赖；FFmpeg native runtime 直接打包在 AAR 中。
 - 构建需要 JDK 17。
-- 已知：`:app:testDebugUnitTest` / `:app:connectedDebugAndroidTest` 在 KAPT 阶段因模板测试桩 `@error.NonExistentClass` 失败（历史遗留，与播放器代码无关）；生产 debug 构建通过。
+- 当前 app Debug/Release JVM unit tests 可执行；`ffmpegplayer` 没有配置 Java/Kotlin unit-test source，相关 Gradle test task 为 `NO-SOURCE`。Native diagnostics/test-hook helpers 使用独立 C++ host tests。
+
+### 8.3 Maven publishing
+
+**NOT_CONFIGURED**。当前 `ffmpegplayer/build.gradle` 没有应用 `maven-publish`、没有 `publishing/publication` 配置，也没有可承诺的 `groupId/artifactId/version` 或 `publishReleasePublicationToMavenLocal` 任务。当前正式交付物是上面的本地 Release AAR；Maven Central、私有仓库或 Maven Local 发布属于后续独立工作。
 
 ---
 
@@ -310,7 +346,7 @@ RTSP AAC packet
 
 ```java
 avutil
-swresample   // optional
+swresample   // required：Audio SWR 与 ELF DT_NEEDED 均依赖
 swscale
 avcodec
 avformat
@@ -326,16 +362,16 @@ native-ffmpeg
 | FFmpegPlayer API | 说明 |
 | --- | --- |
 | `new FFmpegPlayer()` | 内部 `createPlayer()` + 创建 `LiveAudioPcmSink` + 注册 listener/audio callback。 |
-| `setListener(Listener)` | 播放事件（`reconnect_disconnected/reconnecting/waiting_source/reconnect_success/reconnect_exhausted`），内部桥接 `FFmpegNative.PlayerEventListener`。 |
+| `setListener(Listener)` | 播放事件；回调签名为 `Listener.onPlayerEvent(String event, String eventJson)`，内部桥接 `FFmpegNative.PlayerEventListener`。事件含 `reconnect_disconnected/reconnecting/waiting_source/reconnect_success/reconnect_exhausted`。 |
 | `setSurface(Surface)` / `clearSurface()` | 渲染 Surface 绑定 / 清理（Surface 销毁 ≠ player release）。 |
 | `prepare(url, timeoutMs)` | 打开输入、选 decoder、配置 renderer、打开 audio decoder（如有）。 |
 | `start()` / `pause()` / `stop()` | 播放控制（Pause 冻结画面+音频）。 |
 | `release()` / `close()` | 幂等 release：置 released → handle 清零 → 清理 listener/audio callback → `releasePlayer`。 |
 | `setAudioEnabled(boolean)` | Live Audio 监听开关（不 reopen RTSP、不影响 Recorder）。 |
 | `setHardwareDecodeEnabled(boolean)` / `setHardwareRenderMode(String)` | 硬解开关与渲染模式。 |
-| `setRtspTransport(String)` / `setLatencyMode(String)` / `setPlayerOption(k,v)` | RTSP transport（tcp/udp/udp_multicast/auto）、低延迟 profile（low_latency/balanced/stable）、单项参数。 |
+| `setRtspTransport(String)` / `setLatencyMode(String)` / `setPlayerOption(k,v)` | RTSP transport（tcp/udp/udp_multicast/auto）、播放延迟 profile（low_latency/ultra_low_latency/balanced/stable）、单项参数。 |
 | `setReconnectOptions(enabled, maxRetry, retryDelayMs)` | 重连策略（maxRetry=-1 无限）。 |
-| `setThermalEnabled/Palette/AgcEnabled/Gamma/Window` | Thermal 控制。 |
+| `setThermalEnabled(boolean)` / `setThermalPalette(int)` / `setThermalAgcEnabled(boolean)` / `setThermalGamma(float)` / `setThermalWindow(float,float)` | Thermal 控制。 |
 | `startRecord(path)` / `startSegmentRecord(pattern, sec)` / `startRecordWithConfig(pathOrPattern, format, sec)` / `stopRecord()` / `getRecordState()` | remux 录制（mp4/mkv/ts/mov/webm/flv；`segmentSec>0` 分片）。 |
 | `takeSnapshot(path)` | 截图（native RGBA / Demo PixelCopy）。 |
 | `getState()` / `getStats()` / `getReconnectState()` / `getLatencyConfig()` | 状态 / 统计 / 重连 / 延迟 JSON。 |
@@ -345,11 +381,44 @@ native-ffmpeg
 
 ### Legacy bridge（PUBLIC_LEGACY_BRIDGE）
 
-`FFmpegNative` / `LiveAudioPcmSink` 保持 public（JNI `FindClass`、静态工具、兼容），Demo 主线不使用。
+`FFmpegNative` / `LiveAudioPcmSink` 保持 public（JNI `FindClass`、静态工具、兼容），因此仍属于 AAR 的 public binary surface，但不是推荐的普通 Consumer API。Demo 的播放生命周期和功能控制使用 `FFmpegPlayer`；直接 legacy bridge 使用仅限 FFmpeg 能力信息、PH4 Debug stress 入口和兼容常量，不持有 raw native handle，也不直接创建 `LiveAudioPcmSink`。
+
+`PlayerOptions`、`DiagnosticsMode` 与 `ThermalConfig` 是 native C++ 内部类型，不在 `classes.jar` 中，也不是 Java Consumer API。Java 侧分别通过 `setLatencyMode/setPlayerOption`、`setPlayerOption("diagnostics_mode", value)` 和 Thermal facade 方法配置。
+
+### DiagnosticsMode（生产诊断）
+
+生产默认模式是 **BASIC**：
+
+```java
+player.setPlayerOption("diagnostics_mode", "off");
+player.setPlayerOption("diagnostics_mode", "basic");   // production default
+player.setPlayerOption("diagnostics_mode", "latency");
+```
+
+| 值 | 语义 |
+| --- | --- |
+| `off` | 关闭可选诊断日志与高级 latency 分布/PRET0/E2E 计算；不关闭播放。 |
+| `basic` | 生产健康诊断：保留低开销状态、帧/包/错误/重连和 compact health 信息。 |
+| `latency` | 详细延迟诊断：启用 LAT1/LAT2/LAT3、PRET0、RTCP/PRFT/E2E 与完整 latency 日志。 |
+
+Diagnostics 是正式生产 contract。Test Hook 不是 Diagnostics：`-player-lifetime-stress` 和 `-audio-backpressure-test` 只在 Debug native build 中可执行；Release 会在 dispatch 前返回：
+
+```json
+{"success":false,"errorCode":"unsupported_in_release","message":"test hook is unsupported in release builds"}
+```
+
+`FFmpegNative.runDebugCommand` 的 read-only version/build/decoder/source/probe/help 诊断仍在所有变体可用；普通 Consumer 应优先使用 `FFmpegPlayer`，且不应把 stress command 当作生产诊断 API。
+
+### Result / JSON 语义
+
+- `FFmpegPlayer` 的 String-returning 播放操作返回 JSON。成功至少含 `"success":true`；失败含 `"success":false` 以及当前实现提供的 `errorCode/errorMessage` 或稳定的错误说明字段。
+- `getStats()` 返回兼容的统计快照，`diagnosticsMode` 为 `off/basic/latency`。BASIC/OFF 下高级分布和 E2E 字段可能为空或无效，而不是伪造采样。
+- 时间/计数字段不可用时可使用 `-1`、`0` 或配套 `Valid=false`；字符串枚举在无法确定时可为 `"unknown"`。Consumer 应优先检查 `success`、相关 validity/sample-count 字段，再解释 p50/p95/p99 或时钟值。
+- PH6 保持现有 String/JSON API，不引入 typed result，也不改变既有字段或返回语义。
 
 ---
 
-## 11. getPlayerStats 常用字段
+## 11. `FFmpegPlayer.getStats()` 常用字段
 
 ### 视频 / 渲染 / Thermal
 
@@ -364,7 +433,8 @@ native-ffmpeg
 | `renderedFrameCount` / `droppedVideoFrameCount` / `frameDropBeforeRenderCount` | 总渲染帧 / 丢帧 / 渲染前显式丢弃。 |
 | `swsScaleEnabled` / `swsScaleInvocationCount` / `lastSwsScaleCostUs` | sws 是否实际启用（NV12 GL 正常为 false / 0 / -1）。 |
 | `lastNv12GlRenderCostUs` / `avgNv12GlRenderCostUs` / `maxNv12GlRenderCostUs` | NV12 GL 渲染耗时。 |
-| `thermalEnabled/Palette/Gamma/BlackPoint/WhitePoint` / `thermalAgcEnabled/Valid/BlackPoint/WhitePoint` | Thermal 配置与 AGC 状态。 |
+| `thermalEnabled` / `thermalPalette` / `thermalGamma` / `thermalBlackPoint` / `thermalWhitePoint` | Thermal 配置。 |
+| `thermalAgcEnabled` / `thermalAgcValid` / `thermalAgcBlackPoint` / `thermalAgcWhitePoint` | AGC 配置与有效窗口。 |
 | `thermalRenderMode` / `thermalInputType` / `thermalWindowApplied` | 实际 Thermal 模式与输入类型。 |
 | `nv12AgcUpdateCount` / `nv12AgcInvalidCount` | NV12 AGC 更新/无效计数。 |
 
@@ -378,24 +448,24 @@ native-ffmpeg
 | `audioPacketCount` / `audioPacketBytes` | demux 到的压缩音频包。 |
 | `audioDecodedFrameCount`（别名 `audioFrameCount`）/ `audioDecodedSampleCount` / `audioDecodeErrorCount` | 解码帧 / 样本 / 错误。 |
 | `audioPcmBlockCount` / `audioPcmSampleCount` / `audioPcmByteCount` | SWR 输出块 / 样本 / 字节。 |
-| `audioOutputSampleRate/Channels/SampleFormat/Interleaved` | 固定输出契约（48000 / 2 / s16 / true）。 |
+| `audioOutputSampleRate` / `audioOutputChannels` / `audioOutputSampleFormat` / `audioOutputInterleaved` | 固定输出契约（48000 / 2 / s16 / true）。 |
 | `audioSwrReconfigureCount` / `audioResampleErrorCount` | SWR 重建 / 重采样错误。 |
-| `audioQueueDurationUs/BlockCount/Bytes/HighWatermarkUs` | PCM 队列深度 / 峰值。 |
-| `audioQueueDropCount/DroppedSampleCount/FlushCount/Generation` | 队列溢出丢块 / 丢样本 / flush / generation。 |
-| `audioWorkerRunning/StartCount/JoinCount/StaleBlockCount` | worker 运行态 / 启动 / join / 陈旧块。 |
-| `audioWorkerConsumedBlockCount/SampleCount/ByteCount` | worker 消费统计。 |
-| `audioSinkWriteCount/WrittenByteCount/WriteErrorCount/LastErrorCode` | AudioTrack 写入成功 / 字节 / 错误 / 最后错误码。 |
+| `audioQueueDurationUs` / `audioQueueBlockCount` / `audioQueueBytes` / `audioQueueHighWatermarkUs` | PCM 队列深度 / 峰值。 |
+| `audioQueueDropCount` / `audioQueueDroppedSampleCount` / `audioQueueFlushCount` / `audioQueueGeneration` | 队列溢出丢块 / 丢样本 / flush / generation。 |
+| `audioWorkerRunning` / `audioWorkerStartCount` / `audioWorkerJoinCount` / `audioWorkerStaleBlockCount` | worker 运行态 / 启动 / join / 陈旧块。 |
+| `audioWorkerConsumedBlockCount` / `audioWorkerConsumedSampleCount` / `audioWorkerConsumedByteCount` | worker 消费统计。 |
+| `audioSinkWriteCount` / `audioSinkWrittenByteCount` / `audioSinkWriteErrorCount` / `audioSinkLastErrorCode` | AudioTrack 写入成功 / 字节 / 错误 / 最后错误码。 |
 | `audioSinkControlledCancelCount` / `audioSinkRestartCount` | 受控取消 / sink 重启次数。 |
 | `audioClockUs` | **LEGACY**：最后压缩音频包 PTS 镜像，非播放时钟。 |
 | `audioPlaybackClockUs` / `audioPlaybackClockValid` / `audioPlaybackHeadFrames` | 真实 AudioTrack playback-head 时钟。 |
-| `audioClockGeneration/ResetCount/StaleCount/PtsDiscontinuityCount` | 时钟代 / 重锚 / 陈旧 / 同代 PTS 不连续重锚。 |
+| `audioClockGeneration` / `audioClockResetCount` / `audioClockStaleCount` / `audioClockPtsDiscontinuityCount` | 时钟代 / 重锚 / 陈旧 / 同代 PTS 不连续重锚。 |
 | `audioVideoDiffUs` | videoPts - audioPlaybackClockUs。 |
 | `audioGeneration` / `audioLifecycleState` / `audioReconnectRecoveryCount` | 生命周期代 / 状态 / 音频重连恢复。 |
-| `audioRecordingIndependentOfPlayback` | 恒为 true：录音与监听完全独立。 |
 | `recordAudioPacketCount` | Recorder 成功 mux 的压缩 AAC 包数。 |
 | `syncMaster` / `effectiveSyncMaster` | 请求同步主 / 实际同步主。 |
 
 各层计数相互独立、单调；Audio OFF 时 demux/record 计数继续增长而 decode/PCM/sink 不变。
+`audioRecordingIndependentOfPlayback=true` 由 Audio option/recording result JSON 返回，不是 `getStats()` 字段；`getStats()` 使用 `recordAudioPacketCount` 反映实际录音包进度。
 
 ---
 
@@ -416,7 +486,7 @@ native-ffmpeg
 8. 测试结束 Stop → Release。
 ```
 
-Demo 仅通过 `FFmpegPlayer` 操作播放器（不再直接持有 native handle / LiveAudioPcmSink）。
+Demo 通过 `FFmpegPlayer` 完成播放、Surface、Thermal、录制、音频、重连和 Stats 操作，不持有 native handle，也不直接创建 `LiveAudioPcmSink`。`FFmpegNative` 的直接引用仅用于 FFmpeg Info、Debug-only lifetime stress 入口和兼容 palette 常量；Release stress 调用按 PH4 policy 被拒绝。
 
 Intent 参数（可选）：`EXTRA_URL`、`EXTRA_HARDWARE_DECODE`、`EXTRA_RTSP_TRANSPORT`、`EXTRA_LATENCY_MODE`、`EXTRA_RENDER_MODE`（如 `"mediacodec_nv12_gl"`）。
 

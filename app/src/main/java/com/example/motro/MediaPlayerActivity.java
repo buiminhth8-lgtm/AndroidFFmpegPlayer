@@ -26,6 +26,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.example.motro.databinding.ActivityMediaPlayerBinding;
 import com.example.motro.databinding.ViewMediaPlayerControlsBinding;
 import com.example.motro.ffmpeg.FFmpegNative;
+import com.example.motro.ffmpeg.FFmpegPlayer;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -44,6 +45,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private static final String TAG = "FFmpegPlayer";
     private static final String TAG_STATS = "FFmpegPlayerStats";
+    private static final String TAG_AUDIO_LIFECYCLE = "FFmpegAudioLifecycle";
     private static final String TAG_EVENT = "FFmpegPlayerEvent";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int DEFAULT_SEGMENT_SECONDS = 300;
@@ -79,8 +81,10 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private Switch hardwareDecodeSwitch;
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
+    private RadioGroup diagnosticsModeRadioGroup;
     private TextView playbackInfoTextView;
     private int statsLogCounter;
+    private long latencyStatsSeq;
 
     private ExecutorService worker;
     private volatile Surface currentSurface;
@@ -88,8 +92,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private volatile int surfaceWidth;
     private volatile int surfaceHeight;
     private volatile boolean destroyed;
-    private long playerHandle;
-    private long lastPlaybackInfoHandle;
+    private FFmpegPlayer player;
+    private FFmpegPlayer lastPlaybackInfoPlayer;
     private long lastPlaybackInfoTimeMs;
     private long lastPlaybackInfoRenderedFrames;
     private long lastPlaybackInfoDecodedFrames;
@@ -105,13 +109,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private volatile String currentRenderMode = "";
     private String intentRenderMode = "";
 
-    private final FFmpegNative.PlayerEventListener playerEventListener = (handle, event, eventJson) -> {
+    private final FFmpegPlayer.Listener playerEventListener = (event, eventJson) -> {
         mainHandler.post(() -> {
-            if (destroyed || handle != getPlayerHandle()) {
+            FFmpegPlayer current;
+            synchronized (handleLock) {
+                current = player;
+            }
+            if (destroyed || current == null) {
                 return;
             }
             lastPlayerEventText = event;
-            Log.d(TAG_EVENT, "handle=" + handle + " event=" + event + "\n" + eventJson);
+            Log.d(TAG_EVENT, "event=" + event + "\n" + eventJson);
         });
     };
 
@@ -141,18 +149,20 @@ public class MediaPlayerActivity extends AppCompatActivity {
         hardwareDecodeSwitch = findViewById(R.id.hardwareDecodeSwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
+        diagnosticsModeRadioGroup = findViewById(R.id.diagnosticsModeRadioGroup);
         playbackInfoTextView = findViewById(R.id.playbackInfoTextView);
     }
 
     private void initDefaults() {
         String initialUrl = getIntent().getStringExtra(EXTRA_URL);
-        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:554/main.mov" : initialUrl);
+        controlsBinding.urlEditText.setText(TextUtils.isEmpty(initialUrl) ? "rtsp://192.168.1.101:556/main.mov" : initialUrl);
         controlsBinding.timeoutEditText.setText(String.valueOf(DEFAULT_TIMEOUT_MS));
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
+        diagnosticsModeRadioGroup.check(R.id.diagnosticsBasicRadio);
         applyIntentPlaybackDefaults();
         controlsBinding.recordPathEditText.setText(defaultFilePath("record_av_test.mp4"));
         controlsBinding.segmentPatternEditText.setText(defaultFilePath("record_segment_%03d.mp4"));
@@ -218,9 +228,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 surfaceWidth = 0;
                 surfaceHeight = 0;
                 currentSurface = null;
-                long handle = getPlayerHandle();
-                if (handle != 0) {
-                    runNative("Clear Surface", () -> FFmpegNative.clearPlayerSurface(handle));
+                FFmpegPlayer p = getPlayer();
+                if (p != null && !p.isReleased()) {
+                    runNative("Clear Surface", () -> p.clearSurface());
                 }
             }
         });
@@ -237,23 +247,29 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private void bindActions() {
         findViewById(R.id.createButton).setOnClickListener(v -> runNative("Create Player", () -> {
-            boolean newlyCreated = getPlayerHandle() == 0;
-            long handle = ensurePlayer();
-            String surfaceResult = bindSurfaceIfReady(handle);
-            String transportResult = applyRtspTransport(handle);
-            String latencyResult = applyLatencyMode(handle);
-            String reconnectResult = applyReconnectOptions(handle);
-            String audioResult = applyAudioOption(handle);
+            FFmpegPlayer existing = getPlayer();
+            boolean newlyCreated = existing == null || existing.isReleased();
+            FFmpegPlayer p = ensurePlayer();
+            if (p == null) {
+                return jsonError("player is not ready");
+            }
+            String surfaceResult = bindSurfaceIfReady(p);
+            String transportResult = applyRtspTransport(p);
+            String latencyResult = applyLatencyMode(p);
+            String diagnosticsResult = applyDiagnosticsMode(p);
+            String reconnectResult = applyReconnectOptions(p);
+            String audioResult = applyAudioOption(p);
             String decodeResult = newlyCreated
-                    ? applyDecodeModeOption(handle)
+                    ? applyDecodeModeOption(p)
                     : "{\"success\":true,\"message\":\"player already exists, decode mode unchanged until next prepare\"}";
             String thermalResult = newlyCreated
-                    ? applyThermalOptionsToPlayer(handle)
+                    ? applyThermalOptionsToPlayer(p)
                     : "{\"success\":true,\"message\":\"player already exists, thermal config unchanged\"}";
-            return "{\"success\":true,\"handle\":" + handle + "}"
+            return "{\"success\":true}"
                     + "\nsurface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
+                    + "\ndiagnostics=" + diagnosticsResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
@@ -271,22 +287,24 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return true;
         });
 
-        findViewById(R.id.probeButton).setOnClickListener(v -> runNative("Probe", () ->
-                FFmpegNative.probe(requireUrl(), readTimeoutMs())));
-
         findViewById(R.id.prepareButton).setOnClickListener(v -> runNative("Prepare", () -> {
-            long handle = ensurePlayer();
-            String surfaceResult = bindSurfaceIfReady(handle);
-            String transportResult = applyRtspTransport(handle);
-            String latencyResult = applyLatencyMode(handle);
-            String reconnectResult = applyReconnectOptions(handle);
-            String audioResult = applyAudioOption(handle);
-            String decodeResult = applyDecodeModeOption(handle);
-            String thermalResult = applyThermalOptionsToPlayer(handle);
-            String prepareResult = FFmpegNative.preparePlayer(handle, requireUrl(), readTimeoutMs());
+            FFmpegPlayer p = ensurePlayer();
+            if (p == null) {
+                return jsonError("player is not ready");
+            }
+            String surfaceResult = bindSurfaceIfReady(p);
+            String transportResult = applyRtspTransport(p);
+            String latencyResult = applyLatencyMode(p);
+            String diagnosticsResult = applyDiagnosticsMode(p);
+            String reconnectResult = applyReconnectOptions(p);
+            String audioResult = applyAudioOption(p);
+            String decodeResult = applyDecodeModeOption(p);
+            String thermalResult = applyThermalOptionsToPlayer(p);
+            String prepareResult = p.prepare(requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
                     + "\ntransport=" + transportResult
                     + "\nlatency=" + latencyResult
+                    + "\ndiagnostics=" + diagnosticsResult
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
@@ -295,71 +313,74 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }));
 
         findViewById(R.id.startButton).setOnClickListener(v -> runNative("Start", () -> {
-            long handle = ensurePlayer();
-            String surfaceResult = bindSurfaceIfReady(handle);
-            String audioResult = applyAudioOption(handle);
+            FFmpegPlayer p = ensurePlayer();
+            if (p == null) {
+                return jsonError("player is not ready");
+            }
+            String surfaceResult = bindSurfaceIfReady(p);
+            String audioResult = applyAudioOption(p);
             return "surface=" + surfaceResult
                     + "\naudio=" + audioResult
-                    + "\nstart=" + FFmpegNative.startPlayer(handle);
+                    + "\nstart=" + p.start();
         }));
 
         findViewById(R.id.pauseButton).setOnClickListener(v -> runNative("Pause", () ->
-                FFmpegNative.pausePlayer(requireHandle())));
+                requirePlayer().pause()));
 
         findViewById(R.id.stopButton).setOnClickListener(v -> runNative("Stop", () ->
-                FFmpegNative.stopPlayer(requireHandle())));
+                requirePlayer().stop()));
 
         findViewById(R.id.releaseButton).setOnClickListener(v -> runNative("Release", () -> {
-            long handle = takePlayerHandle();
-            if (handle == 0) {
-                return jsonError("player handle is 0");
+            FFmpegPlayer p = takePlayer();
+            if (p == null) {
+                return jsonError("player is not ready");
             }
             resetPlaybackInfoCounters();
             currentRenderMode = "";
-            return FFmpegNative.releasePlayer(handle);
+            return p.release();
         }));
 
         findViewById(R.id.snapshotButton).setOnClickListener(v -> runNative("Snapshot", () ->
-                takePlayerSnapshotCompat(requireHandle(), requireSnapshotPath())));
+                takePlayerSnapshotCompat(requirePlayer(), requireSnapshotPath())));
 
         findViewById(R.id.startRecordButton).setOnClickListener(v -> runNative("Start Record", () ->
-                FFmpegNative.startPlayerRecordWithConfig(requireHandle(), requireRecordPath(), requireRecordFormat(), 0)));
+                requirePlayer().startRecord(requireRecordPath())));
 
         findViewById(R.id.startSegmentRecordButton).setOnClickListener(v -> runNative("Start Segment Record", () ->
-                FFmpegNative.startPlayerRecordWithConfig(requireHandle(), requireSegmentPattern(), requireRecordFormat(), requireSegmentDurationSec())));
+                requirePlayer().startRecordWithConfig(requireSegmentPattern(), requireRecordFormat(), requireSegmentDurationSec())));
 
         findViewById(R.id.stopRecordButton).setOnClickListener(v -> runNative("Stop Record", () ->
-                FFmpegNative.stopPlayerRecord(requireHandle())));
+                requirePlayer().stopRecord()));
 
         findViewById(R.id.recordStateButton).setOnClickListener(v -> runNative("Record State", () ->
-                FFmpegNative.getPlayerRecordState(requireHandle())));
+                requirePlayer().getRecordState()));
 
         findViewById(R.id.stateButton).setOnClickListener(v -> runNative("Player State", () ->
-                FFmpegNative.getPlayerState(requireHandle())));
+                requirePlayer().getState()));
 
         findViewById(R.id.statsButton).setOnClickListener(v -> runNative("Player Stats", () ->
-                FFmpegNative.getPlayerStats(requireHandle())));
+                requirePlayer().getStats()));
 
         findViewById(R.id.reconnectStateButton).setOnClickListener(v -> runNative("Reconnect/Latency State", () ->
-                FFmpegNative.getPlayerReconnectState(requireHandle())
-                        + "\nlatency=" + FFmpegNative.getPlayerLatencyConfig(requireHandle())));
+                requirePlayer().getReconnectState()
+                        + "\nlatency=" + requirePlayer().getLatencyConfig()));
 
         findViewById(R.id.clearSurfaceButton).setOnClickListener(v -> runNative("Clear Surface", () ->
-                FFmpegNative.clearPlayerSurface(requireHandle())));
+                requirePlayer().clearSurface()));
 
         binding.controlToggleButton.setOnClickListener(v -> toggleControlPanel());
         controlsBinding.controlPanelCloseButton.setOnClickListener(v -> hideControlPanel());
 
         audioSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            long handle = getPlayerHandle();
-            if (handle != 0) {
-                runNative("Audio Option", () -> applyAudioOption(handle));
+            FFmpegPlayer p = getPlayer();
+            if (p != null && !p.isReleased()) {
+                runNative("Audio Option", () -> applyAudioOption(p));
             }
         });
         reconnectSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            long handle = getPlayerHandle();
-            if (handle != 0) {
-                runNative("Reconnect Option", () -> applyReconnectOptions(handle));
+            FFmpegPlayer p = getPlayer();
+            if (p != null && !p.isReleased()) {
+                runNative("Reconnect Option", () -> applyReconnectOptions(p));
             }
         });
         hardwareDecodeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
@@ -369,15 +390,21 @@ public class MediaPlayerActivity extends AppCompatActivity {
             updateThermalControlsEnabledState();
         });
         transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
-            long handle = getPlayerHandle();
-            if (handle != 0) {
-                runNative("RTSP Transport", () -> applyRtspTransport(handle));
+            FFmpegPlayer p = getPlayer();
+            if (p != null && !p.isReleased()) {
+                runNative("RTSP Transport", () -> applyRtspTransport(p));
             }
         });
         latencyModeRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
-            long handle = getPlayerHandle();
-            if (handle != 0) {
-                runNative("Latency Mode", () -> applyLatencyMode(handle));
+            FFmpegPlayer p = getPlayer();
+            if (p != null && !p.isReleased()) {
+                runNative("Latency Mode", () -> applyLatencyMode(p));
+            }
+        });
+        diagnosticsModeRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
+            FFmpegPlayer p = getPlayer();
+            if (p != null && !p.isReleased()) {
+                runNative("Diagnostics Mode", () -> applyDiagnosticsMode(p));
             }
         });
 
@@ -405,16 +432,16 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     return;
                 }
                 updateThermalControlsEnabledState();
-                long handle = getPlayerHandle();
-                if (handle == 0) {
+                FFmpegPlayer player = getPlayer();
+                if (player == null || player.isReleased()) {
                     return;
                 }
-                callThermalApi("Thermal Enable", () -> applyThermalOptionsToPlayer(handle));
+                callThermalApi("Thermal Enable", () -> applyThermalOptionsToPlayer(player));
             } else {
                 updateThermalControlsEnabledState();
-                long handle = getPlayerHandle();
-                if (handle != 0) {
-                    callThermalApi("Thermal Disable", () -> FFmpegNative.setThermalEnabled(handle, false));
+                FFmpegPlayer player = getPlayer();
+                if (player != null && !player.isReleased()) {
+                    callThermalApi("Thermal Disable", () -> player.setThermalEnabled(false));
                 }
             }
         });
@@ -430,9 +457,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return;
             }
             thermalPalette = palette;
-            long handle = getPlayerHandle();
-            if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
-                callThermalApi("Thermal Palette", () -> FFmpegNative.setThermalPalette(handle, thermalPalette));
+            FFmpegPlayer player = getPlayer();
+            if (player != null && !player.isReleased() && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                callThermalApi("Thermal Palette", () -> player.setThermalPalette(thermalPalette));
             }
         });
 
@@ -441,11 +468,11 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return;
             }
             updateThermalControlsEnabledState();
-            long handle = getPlayerHandle();
-            if (handle == 0 || !controlsBinding.thermalEnabledSwitch.isChecked()) {
+            FFmpegPlayer player = getPlayer();
+            if (player == null || player.isReleased() || !controlsBinding.thermalEnabledSwitch.isChecked()) {
                 return;
             }
-            callThermalApi("Thermal AGC", () -> FFmpegNative.setThermalAgcEnabled(handle, isChecked));
+            callThermalApi("Thermal AGC", () -> player.setThermalAgcEnabled(isChecked));
         });
 
         controlsBinding.thermalGammaSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -460,9 +487,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 }
                 thermalGamma = gamma;
                 controlsBinding.thermalGammaValueText.setText(String.format(Locale.US, "%.2f", gamma));
-                long handle = getPlayerHandle();
-                if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
-                    callThermalApi("Thermal Gamma", () -> FFmpegNative.setThermalGamma(handle, thermalGamma));
+                FFmpegPlayer player = getPlayer();
+                if (player != null && !player.isReleased() && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                    callThermalApi("Thermal Gamma", () -> player.setThermalGamma(thermalGamma));
                 }
             }
 
@@ -533,9 +560,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
         } finally {
             thermalUiUpdating = false;
         }
-        long handle = getPlayerHandle();
-        if (handle != 0 && controlsBinding.thermalEnabledSwitch.isChecked()) {
-            callThermalApi("Thermal Window", () -> FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint));
+        FFmpegPlayer player = getPlayer();
+                if (player != null && !player.isReleased() && controlsBinding.thermalEnabledSwitch.isChecked()) {
+                    callThermalApi("Thermal Window", () -> player.setThermalWindow(thermalBlackPoint, thermalWhitePoint));
         }
     }
 
@@ -581,15 +608,15 @@ public class MediaPlayerActivity extends AppCompatActivity {
         controlsBinding.thermalWhitePointValueText.setAlpha(windowEnabled ? 1.0f : 0.4f);
     }
 
-    private String applyThermalOptionsToPlayer(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyThermalOptionsToPlayer(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
-        String paletteResult = FFmpegNative.setThermalPalette(handle, thermalPalette);
-        String gammaResult = FFmpegNative.setThermalGamma(handle, thermalGamma);
-        String windowResult = FFmpegNative.setThermalWindow(handle, thermalBlackPoint, thermalWhitePoint);
-        String agcResult = FFmpegNative.setThermalAgcEnabled(handle, controlsBinding.thermalAgcSwitch.isChecked());
-        String enableResult = FFmpegNative.setThermalEnabled(handle, controlsBinding.thermalEnabledSwitch.isChecked());
+        String paletteResult = player.setThermalPalette(thermalPalette);
+        String gammaResult = player.setThermalGamma(thermalGamma);
+        String windowResult = player.setThermalWindow(thermalBlackPoint, thermalWhitePoint);
+        String agcResult = player.setThermalAgcEnabled(controlsBinding.thermalAgcSwitch.isChecked());
+        String enableResult = player.setThermalEnabled(controlsBinding.thermalEnabledSwitch.isChecked());
         return "palette=" + paletteResult
                 + "\ngamma=" + gammaResult
                 + "\nwindow=" + windowResult
@@ -614,12 +641,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void bindSurfaceForExistingPlayer(String title) {
-        long handle = getPlayerHandle();
-        if (handle != 0) {
-            runNative(title, () -> bindSurfaceIfReady(handle));
-        } else {
+        FFmpegPlayer p = getPlayer();
+        if (p == null || p.isReleased()) {
             logDebug(title + ": no player yet");
+            return;
         }
+        runNative(title, () -> bindSurfaceIfReady(p));
     }
 
     private void startPlaybackInfoUpdates() {
@@ -629,12 +656,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
     }
 
     private void updatePlaybackInfoAsync() {
-        long handle = getPlayerHandle();
+        final FFmpegPlayer p = getPlayer();
         ExecutorService statsWorker = worker;
         if (destroyed || statsWorker == null) {
             return;
         }
-        if (handle == 0) {
+        if (p == null || p.isReleased()) {
             resetPlaybackInfoCounters();
             playbackInfoTextView.setText("等待播放");
             return;
@@ -646,15 +673,15 @@ public class MediaPlayerActivity extends AppCompatActivity {
             statsWorker.execute(() -> {
                 String statsJson;
                 try {
-                    statsJson = FFmpegNative.getPlayerStats(handle);
+                    statsJson = p.getStats();
                 } catch (Throwable t) {
                     statsJson = jsonError(t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
                 }
                 String finalStatsJson = statsJson;
                 mainHandler.post(() -> {
                     playbackInfoRequestInFlight.set(false);
-                    if (!destroyed && handle == getPlayerHandle()) {
-                        updatePlaybackInfoFromStats(handle, finalStatsJson);
+                    if (!destroyed && p == getPlayer()) {
+                        updatePlaybackInfoFromStats(p, finalStatsJson);
                     }
                 });
             });
@@ -663,7 +690,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         }
     }
 
-    private void updatePlaybackInfoFromStats(long handle, String statsJson) {
+    private void updatePlaybackInfoFromStats(FFmpegPlayer player, String statsJson) {
         try {
             JSONObject stats = new JSONObject(statsJson);
             if (!stats.optBoolean("success", false)) {
@@ -680,8 +707,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
             }
             long videoBytes = stats.optLong("videoPacketBytes", 0);
             long inputBytes = stats.optLong("inputPacketBytes", 0);
-            if (handle != lastPlaybackInfoHandle || lastPlaybackInfoTimeMs <= 0) {
-                lastPlaybackInfoHandle = handle;
+            if (player != lastPlaybackInfoPlayer || lastPlaybackInfoTimeMs <= 0) {
+                lastPlaybackInfoPlayer = player;
                 lastPlaybackInfoTimeMs = nowMs;
                 lastPlaybackInfoRenderedFrames = renderedFrames;
                 lastPlaybackInfoDecodedFrames = decodedFrames;
@@ -869,15 +896,233 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + oesLine
                             + windowLine);
             if (++statsLogCounter % 5 == 0) {
-                Log.d(TAG_STATS, "handle=" + handle + " " + statsJson);
+                String diagnosticsMode = stats.optString("diagnosticsMode", "basic");
+                if ("latency".equals(diagnosticsMode)) {
+                    Log.d(TAG_STATS, statsJson);
+                    logCompactLatencyStats(stats);
+                    Log.d(TAG_AUDIO_LIFECYCLE,
+                            "player=" + player
+                                    + " player=" + playerState
+                                    + " audio=" + stats.optString("audioLifecycleState", "unknown")
+                                    + " enabled=" + stats.optBoolean("audioEnabled", false)
+                                    + " source=" + stats.optBoolean("sourceHasAudio", false)
+                                    + " playable=" + stats.optBoolean("audioPlayable", false)
+                                    + " worker=" + stats.optBoolean("audioWorkerRunning", false)
+                                    + " sink=" + stats.optBoolean("audioSinkReady", false)
+                                    + " clock=" + stats.optBoolean("audioPlaybackClockValid", false)
+                                    + " clockUs=" + stats.optLong("audioPlaybackClockUs", 0)
+                                    + " avDiffUs=" + stats.optLong("audioVideoDiffUs", 0)
+                                    + " ptsRebase=" + stats.optLong("audioClockPtsDiscontinuityCount", 0)
+                                    + " generation=" + stats.optLong("audioGeneration", 0)
+                                    + " flush=" + stats.optLong("audioQueueFlushCount", 0)
+                                    + " start/join=" + stats.optLong("audioWorkerStartCount", 0)
+                                    + "/" + stats.optLong("audioWorkerJoinCount", 0)
+                                    + " restart=" + stats.optLong("audioSinkRestartCount", 0)
+                                    + " reconnect=" + stats.optLong("audioReconnectRecoveryCount", 0)
+                                    + " stale=" + stats.optLong("audioWorkerStaleBlockCount", 0)
+                                    + " cancel=" + stats.optLong("audioSinkControlledCancelCount", 0)
+                                    + " sinkError=" + stats.optLong("audioSinkWriteErrorCount", 0)
+                                    + " queueUs=" + stats.optLong("audioQueueDurationUs", 0)
+                                    + " queueHighUs=" + stats.optLong("audioQueueHighWatermarkUs", 0)
+                                    + " queueDrop=" + stats.optLong("audioQueueDropCount", 0)
+                                    + " master=" + stats.optString("effectiveSyncMaster", "unknown")
+                                    + " decoderOpen=" + stats.optLong("videoDecoderOpenCount", 0)
+                                    + "/" + stats.optLong("hardwareDecoderOpenCount", 0)
+                                    + " recording=" + stats.optBoolean("recording", false)
+                                    + " recordAudio=" + stats.optLong("recordAudioPacketCount", 0));
+                } else if ("basic".equals(diagnosticsMode)) {
+                    logBasicHealthStats(stats);
+                }
             }
         } catch (Throwable t) {
             playbackInfoTextView.setText("播放信息解析失败");
         }
     }
 
+    private void logBasicHealthStats(JSONObject stats) {
+        final long seq = ++latencyStatsSeq;
+        final long decoded = stats.optLong("hardwareDecodedFrameCount", 0)
+                + stats.optLong("softwareDecodedFrameCount", 0);
+        String lastError = stats.optString("lastError", "");
+        if (TextUtils.isEmpty(lastError)) {
+            lastError = "--";
+        }
+        LatencyStatsFormatter.BasicInfo info = new LatencyStatsFormatter.BasicInfo(
+                stats.optString("state", "unknown"),
+                stats.optDouble("measuredDecodeFps", 0),
+                stats.optDouble("measuredRenderFps", 0),
+                stats.optString("decodeBackend", "unknown"),
+                stats.optString("frameOutputType", "unknown"),
+                stats.optString("renderer", "unknown"),
+                stats.optLong("videoPacketCount", 0),
+                decoded,
+                stats.optLong("renderedFrameCount", 0),
+                stats.optLong("droppedVideoFrameCount", 0),
+                stats.optLong("readTimeoutCount", 0),
+                stats.optLong("readErrorCount", 0),
+                stats.optLong("reconnectSuccessCount", 0),
+                stats.optBoolean("clientMediaBacklogValid", false),
+                stats.optLong("clientMediaBacklogUs", -1),
+                stats.optLong("lastPacketReadyToRenderSubmitUs", -1),
+                lastError);
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.basicLine(seq, info));
+    }
+
+    /**
+     * LAT3 diagnostics log-output fix: emit the compact, Logcat-safe latency
+     * lines from the exact same getStats() snapshot that produced the full
+     * FFmpegPlayerStats JSON (no second native snapshot). All four lines share
+     * one monotonic diagnostics sequence so they can be correlated even when
+     * interleaved with other log output. Stats JSON/API contract is untouched.
+     */
+    private void logCompactLatencyStats(JSONObject stats) {
+        final long seq = ++latencyStatsSeq;
+
+        final LatencyStatsFormatter.StateInfo stateInfo = new LatencyStatsFormatter.StateInfo(
+                stats.optLong("handle", 0),
+                stats.optString("state", "unknown"),
+                stats.optLong("videoPtsGeneration", 0),
+                stats.optLong("stageTimingGeneration", 0),
+                stats.optBoolean("steadyStateValid", false),
+                stats.optDouble("measuredDecodeFps", 0),
+                stats.optDouble("measuredRenderFps", 0),
+                stats.optString("decodeBackend", "unknown"),
+                stats.optString("frameOutputType", "unknown"),
+                stats.optString("renderer", "unknown"),
+                stats.optLong("videoPacketCount", 0),
+                stats.optLong("videoFrameCount", 0),
+                stats.optLong("renderedFrameCount", 0));
+
+        final LatencyStatsFormatter.MediaInfo mediaInfo = new LatencyStatsFormatter.MediaInfo(
+                stats.optBoolean("clientMediaBacklogValid", false),
+                stats.optLong("demuxToDecoderBacklogUs", -1),
+                stats.optLong("decoderBacklogUs", -1),
+                stats.optLong("renderBacklogUs", -1),
+                stats.optLong("clientMediaBacklogUs", -1),
+                stats.optLong("demuxToDecoderBacklogP50Us", -1),
+                stats.optLong("demuxToDecoderBacklogP95Us", -1),
+                stats.optLong("demuxToDecoderBacklogP99Us", -1),
+                stats.optLong("demuxToDecoderBacklogDistCount", 0),
+                stats.optLong("decoderBacklogP50Us", -1),
+                stats.optLong("decoderBacklogP95Us", -1),
+                stats.optLong("decoderBacklogP99Us", -1),
+                stats.optLong("decoderBacklogDistCount", 0),
+                stats.optLong("renderBacklogP50Us", -1),
+                stats.optLong("renderBacklogP95Us", -1),
+                stats.optLong("renderBacklogP99Us", -1),
+                stats.optLong("renderBacklogDistCount", 0),
+                stats.optLong("clientMediaBacklogP50Us", -1),
+                stats.optLong("clientMediaBacklogP95Us", -1),
+                stats.optLong("clientMediaBacklogP99Us", -1),
+                stats.optLong("clientMediaBacklogDistCount", 0));
+
+        final LatencyStatsFormatter.StageInfo stageInfo = new LatencyStatsFormatter.StageInfo(
+                stats.optLong("demuxReturnToDecoderSubmitP50Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitP95Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitP99Us", -1),
+                stats.optLong("demuxReturnToDecoderSubmitDistCount", 0),
+                stats.optLong("decoderSubmitToOutputP50Us", -1),
+                stats.optLong("decoderSubmitToOutputP95Us", -1),
+                stats.optLong("decoderSubmitToOutputP99Us", -1),
+                stats.optLong("decoderSubmitToOutputDistCount", 0),
+                stats.optLong("decodedOutputToRenderBeginP50Us", -1),
+                stats.optLong("decodedOutputToRenderBeginP95Us", -1),
+                stats.optLong("decodedOutputToRenderBeginP99Us", -1),
+                stats.optLong("decodedOutputToRenderBeginDistCount", 0),
+                stats.optLong("renderBeginToSubmitP50Us", -1),
+                stats.optLong("renderBeginToSubmitP95Us", -1),
+                stats.optLong("renderBeginToSubmitP99Us", -1),
+                stats.optLong("renderBeginToSubmitDistCount", 0),
+                stats.optLong("packetReadyToRenderSubmitP50Us", -1),
+                stats.optLong("packetReadyToRenderSubmitP95Us", -1),
+                stats.optLong("packetReadyToRenderSubmitP99Us", -1),
+                stats.optLong("packetReadyToRenderSubmitDistCount", 0));
+
+        final boolean ptsDeltaReady = stats.optLong("videoPacketPtsDeltaSampleCount", 0) > 0;
+        final LatencyStatsFormatter.PreT0Info preT0Info = new LatencyStatsFormatter.PreT0Info(
+                stats.optLong("avReadFrameDurationP50Us", -1),
+                stats.optLong("avReadFrameDurationP95Us", -1),
+                stats.optLong("avReadFrameDurationP99Us", -1),
+                stats.optLong("avReadFrameDurationDistCount", 0),
+                stats.optLong("videoPacketReturnGapP50Us", -1),
+                stats.optLong("videoPacketReturnGapP95Us", -1),
+                stats.optLong("videoPacketReturnGapP99Us", -1),
+                stats.optLong("videoPacketReturnGapDistCount", 0),
+                ptsDeltaReady ? stats.optLong("avgVideoPacketPtsDeltaUs", -1) : -1,
+                stats.optLong("fastReturnPacketCount", 0),
+                stats.optLong("maxFastReturnBurstLength", 0),
+                stats.optLong("readStallGt100MsCount", 0),
+                stats.optLong("readStallGt250MsCount", 0),
+                stats.optLong("readStallGt500MsCount", 0),
+                stats.optLong("readStallGt1000MsCount", 0),
+                stats.optLong("readEagainCount", 0),
+                stats.optLong("readTimeoutCount", 0),
+                stats.optLong("readEofCount", 0),
+                stats.optLong("readErrorCount", 0));
+
+        final LatencyStatsFormatter.HealthInfo healthInfo = new LatencyStatsFormatter.HealthInfo(
+                stats.optLong("stageTimingSampleCount", 0),
+                stats.optLong("packetReadyToRenderSubmitDistCount", 0),
+                stats.optLong("clientMediaBacklogDistCount", 0),
+                stats.optLong("decoderTimingUnmatchedCount", 0),
+                stats.optLong("renderTimingUnmatchedCount", 0),
+                stats.optLong("stageTimingForcedEvictionCount", 0),
+                stats.optLong("stageTimingResetCount", 0),
+                stats.optLong("stageTimingClockAnomalyCount", 0),
+                stats.optLong("videoPtsBackwardCount", 0),
+                stats.optLong("decoderPtsBackwardCount", 0),
+                stats.optLong("decodedPtsBackwardCount", 0),
+                stats.optLong("renderedPtsBackwardCount", 0));
+
+        final LatencyStatsFormatter.E2EInfo e2eInfo = new LatencyStatsFormatter.E2EInfo(
+                stats.optString("e2eMeasurementMode", "none"),
+                receiverClockSyncMethod(),
+                stats.optLong("videoRtpClockRate", 0),
+                stats.optLong("lastPacketReadyWallNs", -1),
+                stats.optLong("e2eGeneration", 0),
+                stats.optLong("e2eResetCount", 0),
+                stats.optLong("clockSyncEstimatedErrorUs", -1),
+                stats.optBoolean("e2eValid", false),
+                stats.optBoolean("srMappingValid", false),
+                stats.optLong("rtcpSrReceivedCount", 0),
+                stats.optLong("senderSendToReceiverT0UsLast", -1),
+                stats.optLong("senderSendToReceiverT0UsP50", -1),
+                stats.optLong("senderSendToReceiverT0UsP95", -1),
+                stats.optLong("senderSendToReceiverT0UsP99", -1),
+                stats.optLong("senderSendToReceiverT0UsValidCount", 0),
+                stats.optLong("clockMappingAnomalyCount", 0),
+                stats.optLong("sameFrameUnmatchedCount", 0));
+
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stageLine(seq, stageInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.preT0Line(seq, preT0Info));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.e2eLine(seq, e2eInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.healthLine(seq, healthInfo));
+    }
+
+    /**
+     * LAT6: receiver clock sync evidence. Android keeps the system wall clock
+     * NTP-synced when auto-time is on; the sync ERROR is not observable here
+     * and stays UNKNOWN (never reported as 0 ms).
+     */
+    private String receiverClockSyncMethod() {
+        try {
+            final int autoTime = android.provider.Settings.Global.getInt(
+                    getContentResolver(), android.provider.Settings.Global.AUTO_TIME, -1);
+            if (autoTime == 1) {
+                return "auto_time";
+            }
+            if (autoTime == 0) {
+                return "manual";
+            }
+        } catch (Exception ignored) {
+        }
+        return "unknown";
+    }
+
     private void resetPlaybackInfoCounters() {
-        lastPlaybackInfoHandle = 0;
+        lastPlaybackInfoPlayer = null;
         lastPlaybackInfoTimeMs = 0;
         lastPlaybackInfoRenderedFrames = 0;
         lastPlaybackInfoDecodedFrames = 0;
@@ -916,47 +1161,44 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return String.format(Locale.US, "%.0f KB/s", value);
     }
 
-    private long ensurePlayer() {
+    private FFmpegPlayer ensurePlayer() {
         synchronized (handleLock) {
             if (destroyed) {
-                return 0;
+                return null;
             }
-            if (playerHandle == 0) {
-                playerHandle = FFmpegNative.createPlayer();
-                Log.d(TAG, "playerHandle=" + playerHandle);
-                if (playerHandle != 0) {
-                    Log.d(TAG, "setPlayerEventListener=" + FFmpegNative.setPlayerEventListener(playerHandle, playerEventListener));
-                }
+            if (player == null || player.isReleased()) {
+                player = new FFmpegPlayer();
+                player.setListener(playerEventListener);
             }
-            return playerHandle;
+            return player;
         }
     }
 
-    private long getPlayerHandle() {
+    private FFmpegPlayer getPlayer() {
         synchronized (handleLock) {
-            return playerHandle;
+            return player;
         }
     }
 
-    private long takePlayerHandle() {
+    private FFmpegPlayer takePlayer() {
         synchronized (handleLock) {
-            long handle = playerHandle;
-            playerHandle = 0;
-            return handle;
+            FFmpegPlayer p = player;
+            player = null;
+            return p;
         }
     }
 
-    private long requireHandle() {
-        long handle = getPlayerHandle();
-        if (handle == 0) {
-            throw new IllegalStateException("player handle is 0, tap Create or Prepare first");
+    private FFmpegPlayer requirePlayer() {
+        FFmpegPlayer p = getPlayer();
+        if (p == null || p.isReleased()) {
+            throw new IllegalStateException("player is not ready, tap Create or Prepare first");
         }
-        return handle;
+        return p;
     }
 
-    private String bindSurfaceIfReady(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String bindSurfaceIfReady(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
         Surface surface = currentSurface;
         if (!surfaceReady || surface == null || !surface.isValid()) {
@@ -966,45 +1208,52 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return jsonError("surface size is not ready");
         }
         Log.d(TAG, "bind surface viewSize=" + surfaceWidth + "x" + surfaceHeight);
-        return FFmpegNative.setPlayerSurface(handle, surface);
+        return player.setSurface(surface);
     }
 
-    private String applyAudioOption(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyAudioOption(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
-        return FFmpegNative.enableAudio(handle, audioSwitch.isChecked());
+        return player.setAudioEnabled(audioSwitch.isChecked());
     }
 
-    private String applyReconnectOptions(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyReconnectOptions(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
-        return FFmpegNative.setPlayerReconnectOptions(handle, reconnectSwitch.isChecked(), -1, 1000);
+        return player.setReconnectOptions(reconnectSwitch.isChecked(), -1, 1000);
     }
 
-    private String applyRtspTransport(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyRtspTransport(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
-        return FFmpegNative.setRtspTransport(handle, selectedRtspTransport());
+        return player.setRtspTransport(selectedRtspTransport());
     }
 
-    private String applyLatencyMode(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyLatencyMode(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
-        return FFmpegNative.setPlayerLatencyMode(handle, selectedLatencyMode());
+        return player.setLatencyMode(selectedLatencyMode());
     }
 
-    private String applyDecodeModeOption(long handle) {
-        if (handle == 0) {
-            return jsonError("player handle is 0");
+    private String applyDiagnosticsMode(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
+        }
+        return player.setPlayerOption("diagnostics_mode", selectedDiagnosticsMode());
+    }
+
+    private String applyDecodeModeOption(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
         }
         boolean hardwareDecode = "mediacodec_oes".equals(intentRenderMode)
                 || "mediacodec_nv12_gl".equals(intentRenderMode)
                 || hardwareDecodeSwitch.isChecked();
-        String decodeResult = FFmpegNative.setHardwareDecode(handle, hardwareDecode);
+        String decodeResult = player.setHardwareDecodeEnabled(hardwareDecode);
         // setHardwareDecode(false) may reset software render mode to software_rgba,
         // so apply the explicit render mode afterwards.
         String renderMode;
@@ -1016,7 +1265,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             // Revised Phase 2 main path: Hardware Decode ON -> NV12 GL.
             renderMode = hardwareDecode ? "mediacodec_nv12_gl" : "software_yuv_gl";
         }
-        String renderModeResult = FFmpegNative.setHardwareRenderMode(handle, renderMode);
+        String renderModeResult = player.setHardwareRenderMode(renderMode);
         currentRenderMode = renderMode;
         return "hardwareDecode=" + decodeResult
                 + "\nrenderMode=" + renderModeResult;
@@ -1045,6 +1294,17 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return "stable";
         }
         return "balanced";
+    }
+
+    private String selectedDiagnosticsMode() {
+        int checkedId = diagnosticsModeRadioGroup.getCheckedRadioButtonId();
+        if (checkedId == R.id.diagnosticsOffRadio) {
+            return "off";
+        }
+        if (checkedId == R.id.diagnosticsLatencyRadio) {
+            return "latency";
+        }
+        return "basic";
     }
 
     private String requireUrl() {
@@ -1117,8 +1377,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return path;
     }
 
-    private String takePlayerSnapshotCompat(long handle, String outputPath) throws Exception {
-        String nativeResult = FFmpegNative.takePlayerSnapshot(handle, outputPath);
+    private String takePlayerSnapshotCompat(FFmpegPlayer player, String outputPath) throws Exception {
+        String nativeResult = player.takeSnapshot( outputPath);
         final JSONObject nativeSnapshot;
         try {
             nativeSnapshot = new JSONObject(nativeResult == null ? "" : nativeResult);
@@ -1138,13 +1398,14 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return nativeResult;
         }
         Log.i(TAG, "snapshot route=surface_pixelcopy");
-        return takeSurfaceSnapshotWithPixelCopy(handle, outputPath, nativeResult);
+        return takeSurfaceSnapshotWithPixelCopy(player, outputPath, nativeResult);
     }
 
-    private String takeSurfaceSnapshotWithPixelCopy(long handle,
+    private String takeSurfaceSnapshotWithPixelCopy(FFmpegPlayer player,
                                                     String outputPath,
                                                     String nativeResult) throws Exception {
-        if (destroyed || handle == 0 || handle != getPlayerHandle()) {
+        FFmpegPlayer current = getPlayer();
+                if (destroyed || current == null || current.isReleased()) {
             return snapshotError(
                     "SNAPSHOT_PLAYER_RELEASED",
                     "PixelCopy snapshot cancelled because the player was released",
@@ -1204,7 +1465,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     nativeResult,
                     result);
         }
-        if (destroyed || handle != getPlayerHandle()) {
+        FFmpegPlayer cur = getPlayer();
+            if (destroyed || cur == null || cur.isReleased()) {
             bitmap.recycle();
             return snapshotError(
                     "SNAPSHOT_PLAYER_RELEASED",
@@ -1398,15 +1660,15 @@ public class MediaPlayerActivity extends AppCompatActivity {
         destroyed = true;
         mainHandler.removeCallbacks(playbackInfoRunnable);
         playbackInfoRequestInFlight.set(false);
-        long handle = takePlayerHandle();
+        FFmpegPlayer p = takePlayer();
         ExecutorService releaseWorker = worker;
         worker = null;
         if (releaseWorker != null) {
             releaseWorker.execute(() -> {
-                if (handle != 0) {
-                    Log.d(TAG, "onDestroy stop=" + FFmpegNative.stopPlayer(handle));
-                    Log.d(TAG, "onDestroy clearSurface=" + FFmpegNative.clearPlayerSurface(handle));
-                    Log.d(TAG, "onDestroy release=" + FFmpegNative.releasePlayer(handle));
+                if (p != null && !p.isReleased()) {
+                    Log.d(TAG, "onDestroy stop=" + p.stop());
+                    Log.d(TAG, "onDestroy clearSurface=" + p.clearSurface());
+                    Log.d(TAG, "onDestroy release=" + p.release());
                 }
                 clearSurfaceReferenceOnly();
             });

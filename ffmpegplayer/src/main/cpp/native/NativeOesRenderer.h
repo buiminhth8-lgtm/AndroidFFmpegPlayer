@@ -38,6 +38,7 @@ public:
     NativeOesRenderer &operator=(const NativeOesRenderer &) = delete;
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
+    // 创建 OES 纹理、SurfaceTexture 和解码 Surface，为 MediaCodec 输出建立纹理消费端。
     bool prepareForOesDecode(JNIEnv *env, int64_t handle, std::string &errorMessage);
     // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
     // whitePoint apply to white_hot and ironbow only (window in luminance 0..1 domain).
@@ -76,14 +77,17 @@ private:
     bool runAgcAnalysis(JNIEnv *env, const GLfloat *transform);
     void updateAgcFromReadback();
     bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    // 只释放 EGL 窗口表面；GL 上下文和纹理的清理由独立方法负责。
     void releaseEglSurfaceLocked();
     void releaseGlLocked();
     void releaseJavaLocked(JNIEnv *env);
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    // 待应用的窗口请求；窗口切换延后到持有 EGL 上下文的线程处理。
     ANativeWindow *pendingWindow_ = nullptr;
     PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    // 最新窗口请求的代次，与 appliedSurfaceGeneration_ 对比可判断是否已应用。
     uint64_t surfaceGeneration_ = 0;
     uint64_t appliedSurfaceGeneration_ = 0;
     int pendingSurfaceWidth_ = 0;

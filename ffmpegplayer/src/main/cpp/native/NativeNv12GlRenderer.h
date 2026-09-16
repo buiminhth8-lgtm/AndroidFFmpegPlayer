@@ -47,6 +47,7 @@ public:
     // colorspace: AVColorSpace (BT.601 / BT.709 selection; unknown -> BT.601).
     // thermalMode: 0 = original, 1 = white_hot, 2 = ironbow. gamma / blackPoint /
     // whitePoint apply to white_hot and ironbow only (window in intensity 0..1 domain).
+    // 分别上传 Y 平面与交错 UV 平面，按行步长处理填充，再由着色器完成颜色转换。
     RenderResult renderNv12(const uint8_t *yData, int yStride,
                             const uint8_t *uvData, int uvStride,
                             int width, int height, int colorRange, int colorspace,
@@ -63,14 +64,17 @@ private:
     bool ensureGlLocked(std::string &errorMessage);
     bool compileProgramLocked(std::string &errorMessage);
     bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    // 只释放 EGL 窗口表面；GL 上下文和纹理的清理由独立方法负责。
     void releaseEglSurfaceLocked();
     void releaseGlLocked();
     const uint8_t *compactPlane(const uint8_t *src, int srcStride, int width, int height, std::vector<uint8_t> &buffer);
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    // 待应用的窗口请求；窗口切换延后到持有 EGL 上下文的线程处理。
     ANativeWindow *pendingWindow_ = nullptr;
     PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    // 最新窗口请求的代次，与 appliedSurfaceGeneration_ 对比可判断是否已应用。
     uint64_t surfaceGeneration_ = 0;
     uint64_t appliedSurfaceGeneration_ = 0;
     int pendingSurfaceWidth_ = 0;

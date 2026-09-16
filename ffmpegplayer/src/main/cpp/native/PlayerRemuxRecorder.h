@@ -30,6 +30,7 @@ enum class RecorderState {
     Released
 };
 
+// 直接重封装输入压缩包，不重新编码；录制音频不依赖用户是否开启音频监听。
 class PlayerRemuxRecorder {
 public:
     PlayerRemuxRecorder();
@@ -41,6 +42,7 @@ public:
     std::string start(AVFormatContext *inputFmtCtx, const std::string &outputPath);
     std::string startSegmented(AVFormatContext *inputFmtCtx, const std::string &outputPattern, int segmentDurationSec);
     std::string startWithConfig(AVFormatContext *inputFmtCtx, const RemuxRecordConfig &config);
+    // 接收解复用后的压缩包，依次执行关键帧筛选、分段判断和封装写入。
     void onPacket(const AVPacket *packet, AVFormatContext *inputFmtCtx);
     std::string stop();
     std::string getState();
@@ -52,6 +54,7 @@ public:
     void release();
 
 private:
+    // 以下 Locked 方法要求调用方持有 mutex_，用于串行化输出文件与录制状态变化。
     std::string startLocked(AVFormatContext *inputFmtCtx,
                             const RemuxRecordConfig &config);
     int openOutputLocked(AVFormatContext *inputFmtCtx, const std::string &outputPath);
@@ -67,7 +70,9 @@ private:
     mutable std::mutex mutex_;
     AVFormatContext *outputFmtCtx_ = nullptr;
     AVBSFContext *audioBitstreamFilter_ = nullptr;
+    // 输入流索引到输出流索引的映射，未录制的流不写入输出文件。
     std::vector<int> streamMapping_;
+    // 各流的初始时间戳与最近 DTS，用于输出时间戳归一化及单调性处理。
     std::vector<int64_t> firstPts_;
     std::vector<int64_t> firstDts_;
     std::vector<int64_t> lastDts_;
@@ -100,6 +105,7 @@ private:
     bool videoStreamRecorded_ = false;
     bool audioStreamRecorded_ = false;
     bool audioPlaybackEnabled_ = false;
+    // 有视频时等待可独立解码的关键帧再开始写包。
     bool waitingForKeyFrame_ = false;
     bool headerWritten_ = false;
     bool segmentMode_ = false;

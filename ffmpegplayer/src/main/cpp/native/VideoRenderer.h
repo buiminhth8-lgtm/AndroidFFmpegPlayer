@@ -31,12 +31,14 @@ public:
     VideoRenderer &operator=(const VideoRenderer &) = delete;
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
+    // 按源行步长复制 RGBA 到 ANativeWindow，并记录锁定、复制和提交耗时。
     RenderResult renderRgba(const uint8_t *rgbaData, int lineSize, int width, int height);
     void release();
     bool hasSurface() const;
 
 private:
     mutable std::mutex mutex_;
+    // 当前渲染窗口引用，由渲染器管理释放，并用 mutex_ 与渲染操作串行化。
     ANativeWindow *window_ = nullptr;
     int width_ = 0;
     int height_ = 0;

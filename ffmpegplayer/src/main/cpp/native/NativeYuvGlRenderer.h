@@ -33,6 +33,7 @@ public:
 
     std::string setSurface(JNIEnv *env, jobject surface, int width, int height);
     // thermalMode: 0 = normal, 1 = white_hot, 2 = ironbow
+    // 上传独立的 Y/U/V 平面；各平面步长可能大于有效像素宽度。
     RenderResult renderI420(const uint8_t *yData, int yStride,
                             const uint8_t *uData, int uStride,
                             const uint8_t *vData, int vStride,
@@ -57,6 +58,7 @@ private:
     void applyPendingSurfaceLocked();
     bool ensureGlLocked(std::string &errorMessage);
     bool rebindEglSurfaceLocked(ANativeWindow *newWindow, int width, int height);
+    // 只释放 EGL 窗口表面；GL 上下文和纹理的清理由独立方法负责。
     void releaseEglSurfaceLocked();
     void releaseGlLocked();
     bool compileProgramLocked(std::string &errorMessage);
@@ -76,8 +78,10 @@ private:
 
     mutable std::mutex mutex_;
     ANativeWindow *window_ = nullptr;
+    // 待应用的窗口请求；窗口切换延后到持有 EGL 上下文的线程处理。
     ANativeWindow *pendingWindow_ = nullptr;
     PendingSurfaceAction pendingSurfaceAction_ = PendingSurfaceAction::NONE;
+    // 最新窗口请求的代次，与 appliedSurfaceGeneration_ 对比可判断是否已应用。
     uint64_t surfaceGeneration_ = 0;
     uint64_t appliedSurfaceGeneration_ = 0;
     int pendingSurfaceWidth_ = 0;

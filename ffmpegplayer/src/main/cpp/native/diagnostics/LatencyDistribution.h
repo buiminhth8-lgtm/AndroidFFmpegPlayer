@@ -25,6 +25,7 @@ public:
         int64_t max = 0;
     };
 
+    // 负值代表无效样本并被忽略；环形缓冲只保留最近 1024 个有效耗时。
     void addSample(int64_t us) {
         if (us < 0) {
             return;
@@ -43,6 +44,7 @@ public:
         head_ = 0;
     }
 
+    // 持锁复制样本后再排序，避免分位数计算长时间阻塞播放线程采样。
     Snapshot snapshot() const {
         Snapshot snap;
         std::vector<int64_t> sorted;
@@ -91,6 +93,7 @@ private:
     mutable std::mutex mutex_;
     std::array<int64_t, kLatencyDistributionWindow> samples_{};
     int count_ = 0;
+    // 下一次写入的位置；count_ 为当前窗口样本数，并非历史累计数量。
     int head_ = 0;
 };
 

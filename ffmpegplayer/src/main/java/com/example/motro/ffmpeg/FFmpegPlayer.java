@@ -38,12 +38,15 @@ public final class FFmpegPlayer implements AutoCloseable {
         void onPlayerEvent(String event, String eventJson);
     }
 
+    // 串行保护句柄与释放状态；原生释放在锁外执行，避免等待原生线程时阻塞事件回调。
     private final Object lock = new Object();
+    // JNI 注册表中的逻辑句柄；置零后禁止继续向原生层发送播放器操作。
     private long nativeHandle;
     private boolean released;
     private final LiveAudioPcmSink audioSink;
     private Listener externalListener;
 
+    // 过滤旧句柄事件，并在退出锁后通知业务监听器；业务侧更新界面时需要切回主线程。
     private final FFmpegNative.PlayerEventListener internalListener = new FFmpegNative.PlayerEventListener() {
         @Override
         public void onPlayerEvent(long handle, String event, String eventJson) {
@@ -106,6 +109,7 @@ public final class FFmpegPlayer implements AutoCloseable {
         }
     }
 
+    // 打开输入并准备解码资源，timeoutMs 单位为毫秒；该调用可能阻塞，应放到工作线程。
     public String prepare(String url, int timeoutMs) {
         synchronized (lock) {
             if (released) return errorReleased();
@@ -266,6 +270,7 @@ public final class FFmpegPlayer implements AutoCloseable {
         }
     }
 
+    // 请求原生截图；需要 Surface 捕获的渲染路径会返回专用错误码，由上层选择 PixelCopy。
     public String takeSnapshot(String outputPath) {
         synchronized (lock) {
             if (released) return errorReleased();
@@ -320,6 +325,7 @@ public final class FFmpegPlayer implements AutoCloseable {
         }
     }
 
+    // 幂等释放：先在 Java 侧作废句柄，再解绑回调并释放原生资源。
     public String release() {
         long handleToRelease;
         synchronized (lock) {

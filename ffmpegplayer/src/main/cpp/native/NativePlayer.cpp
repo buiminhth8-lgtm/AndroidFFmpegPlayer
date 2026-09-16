@@ -662,6 +662,7 @@ std::string NativePlayer::clearSurface() {
 }
 
 
+// 打开输入、探测音视频流并配置解码器；使用配置快照，避免初始化过程混用不同版本的选项。
 int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage) {
     if (resetStreamMetadata) {
         resetVideoPtsDiagnostics();
@@ -3889,6 +3890,7 @@ void AudioPcmQueue::configure(int64_t targetDurationUs, int64_t maxDurationUs) {
     maxDurationUs_ = std::max<int64_t>(targetDurationUs_, maxDurationUs);
 }
 
+// 入队前按时长淘汰最旧的块；不等待消费者腾出容量，以保持直播跟进能力。
 void AudioPcmQueue::enqueue(Block block) {
     std::lock_guard<std::mutex> lock(mutex_);
     const int64_t blockUs = blockDurationUs(block);
@@ -3906,6 +3908,7 @@ void AudioPcmQueue::enqueue(Block block) {
     cv_.notify_one();
 }
 
+// 等待新数据或停止信号；停止优先于残留数据，防止退出过程中继续播放旧音频。
 bool AudioPcmQueue::waitAndDequeue(Block &out) {
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock, [this] { return stopRequested_ || !blocks_.empty(); });
@@ -3991,6 +3994,7 @@ int64_t AudioPcmQueue::highWatermarkUs() const {
     return highWatermarkUs_;
 }
 
+// 独立消费 PCM 并调用 Java 音频输出；设备写入耗时不占用视频播放线程。
 void NativePlayer::audioOutputWorkerLoop() {
     LOGI("audio output worker started");
     // Attach this native worker thread to the JVM once for its whole lifetime;
@@ -4069,6 +4073,7 @@ void NativePlayer::stopAudioOutputWorker() {
     }
 }
 
+// 时间线断点处理：清空 PCM、推进代次并使音频时钟失效，同时清除设备侧缓存。
 void NativePlayer::flushAudioPcmForDiscontinuity() {
     audioPcmQueue_.flush();
     const int64_t generation = audioQueueGeneration_.fetch_add(1) + 1;
@@ -4089,6 +4094,7 @@ void NativePlayer::flushAudioPcmForDiscontinuity() {
     sendAudioSinkControl(kAudioSinkCmdPauseFlush, "pause_flush");
 }
 
+// 仅由播放线程重置音频解码器与重采样器，避免生命周期线程并发操作 FFmpeg 状态。
 void NativePlayer::resetAudioDecoderForDiscontinuity(const char *reason) {
     // Called only by the playback thread: decoder/SWR state is never touched
     // concurrently from a JNI lifecycle thread.
@@ -4167,6 +4173,7 @@ void NativePlayer::invalidateAudioClock() {
     audioPlaybackClockValid_.store(false);
 }
 
+// 将设备播放头映射到媒体 PTS；代次变化、时钟失效或 PTS 跳变时重新建立锚点。
 void NativePlayer::updateAudioPlaybackClock(JNIEnv *env, const AudioPcmQueue::Block &block) {
     const int32_t rawHead = queryAudioPlaybackHead(env);
     if (rawHead < 0) {
@@ -4650,6 +4657,7 @@ void NativePlayer::notifyPlayerEvent(const std::string &eventName,
     detachCurrentThreadIfNeeded(attached);
 }
 
+// 按重连策略重新打开输入并恢复播放状态；停止请求可终止重试过程。
 bool NativePlayer::reconnectInput(int readErrorCode) {
     if (!reconnectEnabled_.load() || !isNetworkUrl(url_)) {
         return false;
@@ -4894,6 +4902,7 @@ bool NativePlayer::switchTransportInput() {
     return true;
 }
 
+// 播放主循环：读取压缩包、分流录制与音视频解码，并处理暂停、重连和直播追帧。
 void NativePlayer::playbackLoop() {
     LOGI("playback thread started player=%p", this);
     const bool realtimeInput = isRealtimeInput_;
@@ -5038,6 +5047,7 @@ void NativePlayer::playbackLoop() {
             }
         }
 
+        // 先把压缩包交给录制器，再执行暂停和播放丢包策略，保留独立的录制路径。
         if (remuxRecorder_.isRecording()) {
             remuxRecorder_.onPacket(packet_, formatContext_);
         }
@@ -5221,6 +5231,7 @@ void NativePlayer::notifyOesFrameAvailable() {
     oesFrameAvailableCount_.fetch_add(1);
 }
 
+// 在播放线程消费帧可用通知并执行 OES 绘制；回调线程本身不操作 GL。
 void NativePlayer::renderOesPendingFrameIfReady() {
     if (!oesRenderer_.isPrepared() || !oesFramePending_.load()) {
         return;
@@ -5571,6 +5582,7 @@ bool NativePlayer::renderSoftwareYuvGlFrame(AVFrame *frame, int frameWidth, int 
     return true;
 }
 
+// 按实际帧格式选择硬解、YUV/NV12 GL 或 RGBA 路径，并更新渲染与截图相关状态。
 bool NativePlayer::renderFrame(AVFrame *frame) {
     if (frame == nullptr || videoCodecContext_ == nullptr) {
         return false;
@@ -5772,6 +5784,7 @@ bool NativePlayer::renderFrame(AVFrame *frame) {
     return true;
 }
 
+// 复制最近 RGBA 帧供截图使用，避免截图线程引用会被下一次解码复用的内存。
 void NativePlayer::saveLastFrame(const uint8_t *rgbaData, int lineSize, int width, int height, int64_t ptsUs) {
     if (rgbaData == nullptr || lineSize <= 0 || width <= 0 || height <= 0) {
         return;

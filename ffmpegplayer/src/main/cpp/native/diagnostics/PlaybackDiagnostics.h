@@ -12,6 +12,7 @@
 // Central owner for optional playback diagnostics. Correctness/lifecycle state
 // never depends on this object. Hot-path callers submit scalar hooks only;
 // aggregation stays bounded and JSON/Logcat formatting stays outside the path.
+// 可选诊断的统一入口；统计开关只影响采样开销，不参与播放正确性和生命周期决策。
 class PlaybackDiagnostics {
 public:
     struct LatencySnapshot {
@@ -49,6 +50,7 @@ public:
         return mode() == DiagnosticsMode::Latency;
     }
 
+    // 按模式分流读包统计：LATENCY 记录耗时，BASIC 只记录结果，OFF 不采集。
     void onRead(int64_t durationUs, PreT0TimingTracker::ReadResultClass resultClass) {
         const DiagnosticsMode currentMode = mode();
         if (currentMode == DiagnosticsMode::Latency) {
@@ -86,6 +88,7 @@ public:
         clientMediaBacklog_.addSample(totalUs);
     }
 
+    // 接收同一帧的各阶段耗时（微秒），仅在延迟诊断模式更新分布。
     void onStageSample(int64_t demuxSubmitUs, int64_t decoderResidenceUs,
                        int64_t decodeRenderUs, int64_t renderSubmitUs,
                        int64_t packetRenderUs) {

@@ -38,6 +38,7 @@ namespace {
 
 JavaVM *g_java_vm = nullptr;
 bool g_jni_initialized = false;
+// 递增分配逻辑句柄，Java 端不会持有可直接解引用的原生指针。
 std::atomic<int64_t> g_next_player_handle{1};
 
 struct PlayerEntry {
@@ -48,6 +49,7 @@ struct PlayerEntry {
     const jlong handle;
     std::unique_ptr<NativePlayer> player;
     std::mutex lifetimeMutex;
+    // 释放流程通过此条件变量等待 activeOperations 在途调用计数归零，再销毁播放器。
     std::condition_variable lifetimeCv;
     bool closing = false;
     uint32_t activeOperations = 0;
@@ -58,6 +60,7 @@ struct PlayerEntry {
 std::mutex g_player_registry_mutex;
 std::unordered_map<jlong, std::shared_ptr<PlayerEntry>> g_player_registry;
 
+// 每次 JNI 操作持有的生命周期守卫，析构时归还在途计数并唤醒等待释放的线程。
 class PlayerOperationGuard {
 public:
     PlayerOperationGuard() = default;
@@ -311,6 +314,7 @@ std::string snapshotJniError(const std::string &errorCode, const std::string &me
     return out.str();
 }
 
+// 按注册表锁、条目生命周期锁的顺序获取操作资格，拒绝无效或正在关闭的句柄。
 PlayerOperationGuard acquirePlayer(jlong handle, std::string &errorMessage) {
     if (handle == 0) {
         errorMessage = "player handle is 0";
@@ -931,6 +935,7 @@ void nativeNotifyOesFrameAvailable(JNIEnv *, jclass, jlong handle) {
     }
 }
 
+// 先从注册表移除并禁止新调用，再等待已进入的操作结束，最后释放播放器资源。
 std::string releasePlayerEntry(jlong handle) {
     if (handle == 0) {
         return jsonError(-1, "player handle is 0");

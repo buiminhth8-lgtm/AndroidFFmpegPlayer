@@ -62,7 +62,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
 
     private final Object handleLock = new Object();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    // 防止定时刷新重复排队；上一次统计结果回到主线程后才允许下一次请求。
     private final AtomicBoolean playbackInfoRequestInFlight = new AtomicBoolean(false);
+    // Surface 生命周期代次，用于拒绝窗口已变化时才完成的异步截图结果。
     private final AtomicInteger surfaceGeneration = new AtomicInteger();
     private final Runnable playbackInfoRunnable = new Runnable() {
         @Override
@@ -656,6 +658,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         mainHandler.post(playbackInfoRunnable);
     }
 
+    // 工作线程读取统计、主线程更新界面；回调时校验播放器身份，丢弃旧实例的结果。
     private void updatePlaybackInfoAsync() {
         final FFmpegPlayer p = getPlayer();
         ExecutorService statsWorker = worker;
@@ -1378,6 +1381,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return path;
     }
 
+    // 先尝试原生 RGBA 截图；仅在明确要求 Surface 捕获时转到 PixelCopy。
     private String takePlayerSnapshotCompat(FFmpegPlayer player, String outputPath) throws Exception {
         String nativeResult = player.takeSnapshot( outputPath);
         final JSONObject nativeSnapshot;
@@ -1402,6 +1406,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         return takeSurfaceSnapshotWithPixelCopy(player, outputPath, nativeResult);
     }
 
+    // 工作线程等待主线程发起的异步复制；保存前再次确认 Surface 有效且代次未改变。
     private String takeSurfaceSnapshotWithPixelCopy(FFmpegPlayer player,
                                                     String outputPath,
                                                     String nativeResult) throws Exception {
@@ -1577,6 +1582,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         surfaceHeight = 0;
     }
 
+    // 将可能阻塞的播放器操作提交给工作线程，再把结果投递回界面线程。
     private void runNative(String title, NativeAction action) {
         if (destroyed || worker == null) {
             return;

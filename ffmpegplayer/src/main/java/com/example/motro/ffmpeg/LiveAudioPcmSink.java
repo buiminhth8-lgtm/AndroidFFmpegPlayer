@@ -31,6 +31,7 @@ public final class LiveAudioPcmSink {
     private static final int SAMPLE_RATE = 48000;
     private static final int CHANNEL_OUT = AudioFormat.CHANNEL_OUT_STEREO;
     private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
+    // 单个 PCM 块允许的重试时间窗口（纳秒），避免设备背压导致生命周期操作长期等待。
     private static final long MAX_WRITE_WAIT_NANOS = 250_000_000L;
     private static final long WRITE_RETRY_NANOS = 2_000_000L;
 
@@ -39,6 +40,7 @@ public final class LiveAudioPcmSink {
     // non-blocking and an epoch invalidates any in-flight old-generation block.
     private volatile AudioTrack audioTrack;
     private volatile boolean acceptingWrites;
+    // 生命周期代次；暂停、重新开始或释放后，在途写入据此取消旧块。
     private final AtomicLong lifecycleEpoch = new AtomicLong();
     private int minBufferBytes = -1;
 
@@ -53,6 +55,7 @@ public final class LiveAudioPcmSink {
      * the live pipeline can drop forward rather than block Stop/Release.
      * The caller must keep {@code pcm} alive until this method returns.
      */
+    // 消费原生提供的 S16/48kHz/双声道交错 PCM；返回写入字节数或负错误码，调用期间缓冲区必须有效。
     public int onAudioPcm(ByteBuffer pcm, int sizeBytes, long ptsUs) {
         final long epoch = lifecycleEpoch.get();
         if (!acceptingWrites) {
@@ -99,6 +102,7 @@ public final class LiveAudioPcmSink {
      * Called from the native lifecycle control path. Returns 0 on success or a
      * negative error code.
      */
+    // 处理原生生命周期指令；开始仅开放写入，AudioTrack 在工作线程首次写入时延迟创建。
     public int onAudioControl(int command) {
         switch (command) {
             case CMD_START:
@@ -125,6 +129,7 @@ public final class LiveAudioPcmSink {
      * AudioTrack playback-head frame position (0 when the track is not created).
      * The native side converts this into a monotonic 64-bit played-frame count.
      */
+    // 返回设备已播放采样帧数的原始 32 位值，原生层据此维护扩展计数和音频主时钟。
     public int getPlaybackHeadFrames() {
         AudioTrack track = audioTrack;
         if (track == null) {

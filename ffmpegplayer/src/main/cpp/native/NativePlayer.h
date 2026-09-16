@@ -33,12 +33,14 @@ struct SwrContext;
 // from the audio output worker (consumer). PCM contract is fixed:
 // S16 / 48000 Hz / stereo / interleaved. The producer never blocks; overflow
 // drops the oldest blocks to keep the live edge.
+// 音频解码与设备输出之间的队列；积压时淘汰旧块，避免音频消费速度拖慢视频播放。
 class AudioPcmQueue {
 public:
     struct Block {
         std::vector<uint8_t> data;   // owned PCM bytes (S16/48k/stereo interleaved)
         int64_t startPtsUs = 0;      // media start PTS of the block
         int64_t sampleCount = 0;     // samples per channel in this block
+        // 所属音频时间线代次；重连或时间线重置后，消费者据此识别已取出的旧块。
         int64_t generation = 0;      // discontinuity identity (reconnect/source change)
     };
 
@@ -64,6 +66,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Block> blocks_;
+    // 队列内 PCM 的累计时长，单位微秒；仅在持有 mutex_ 时访问。
     int64_t bufferedDurationUs_ = 0;
     int64_t targetDurationUs_ = 150000;
     int64_t maxDurationUs_ = 250000;
@@ -257,10 +260,12 @@ private:
     NativeNv12GlRenderer nv12GlRenderer_;
     std::atomic<bool> oesFramePending_{false};
     PlayerRemuxRecorder remuxRecorder_;
+    // 执行解复用、解码与视频渲染的播放线程；音频设备写入由独立工作线程完成。
     std::thread playbackThread_;
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> pauseRequested_{false};
     std::atomic<bool> released_{false};
+    // JNI 注册表分配的逻辑句柄，用于事件关联，不是 NativePlayer 的内存地址。
     const int64_t logicalHandle_;
 
     PlayerState state_ = PlayerState::Idle;
@@ -276,9 +281,11 @@ private:
     int64_t realtimeFirstPtsUs_ = 0;
     int64_t realtimeStartWallUs_ = 0;
     int64_t lastRealtimeDropLogMs_ = 0;
+    // 启动或追赶直播进度时等待关键帧，避免直接从缺少参考帧的位置恢复解码。
     bool dropUntilKeyFrame_ = false;
     bool startupKeyFrameWait_ = false;
     int64_t startupKeyFrameWaitStartMs_ = 0;
+    // 触发关键帧追赶策略的延迟阈值，单位微秒。
     int64_t keyFrameCatchupLatencyUs_ = 2000000;
     std::atomic<bool> preferUdpTransport_{false};
     std::atomic<bool> transportSwitchRequested_{false};
@@ -342,6 +349,7 @@ private:
     std::string lastFrameFormatName_;
 
     mutable std::mutex lastFrameMutex_;
+    // 截图使用的最近一帧 RGBA 副本，尺寸、步长与像素数据由 lastFrameMutex_ 共同保护。
     std::vector<uint8_t> lastRgbaFrame_;
     int lastFrameWidth_ = 0;
     int lastFrameHeight_ = 0;
@@ -434,6 +442,7 @@ private:
     // percentile/distribution and E2E correlation overhead of LATENCY mode.
     PlaybackDiagnostics diagnostics_;
     // LAT1 PTS backlog diagnostics (media timeline us; diagnostics only).
+    // 视频时间线代次，防止重连前后的相同 PTS 被关联为同一帧。
     std::atomic<int64_t> videoPtsGeneration_{0};
     std::atomic<int64_t> latestVideoPacketPtsUs_{-1};
     std::atomic<bool> videoPacketPtsValid_{false};
@@ -460,6 +469,7 @@ private:
     // LAT2 monotonic stage timing (single steady monotonic clock; diagnostics only).
     // Records and metric accumulators are owned by the playback thread; getStats()
     // only reads the atomics, so no mutex is needed for the bounded deque.
+    // 播放线程维护的阶段关联记录；耗时采用单调时钟，不能直接与媒体 PTS 相减。
     std::deque<VideoStageTiming> stageTimingRecords_;
     StageTimingMetric demuxSubmitTiming_;
     StageTimingMetric decoderTiming_;
@@ -556,6 +566,7 @@ private:
     std::thread audioOutputWorkerThread_;
     mutable std::mutex audioWorkerMutex_;
     std::atomic<bool> audioWorkerRunning_{false};
+    // 音频队列当前代次；清空队列仍可能有块在消费途中，需要代次校验共同隔离旧数据。
     std::atomic<int64_t> audioQueueGeneration_{0};
     std::atomic<int64_t> audioWorkerConsumedBlockCount_{0};
     std::atomic<int64_t> audioWorkerConsumedSampleCount_{0};
@@ -583,11 +594,13 @@ private:
     std::atomic<int64_t> audioSinkWriteCostSampleCount_{0};
     std::atomic<int64_t> maxAudioSinkWriteCostUs_{0};
     // A5: AudioTrack playback-head based clock (video follows audio).
+    // 由 AudioTrack 已播放采样帧数映射出的媒体时钟，单位微秒；有效性由独立标志表示。
     std::atomic<int64_t> audioPlaybackClockUs_{0};
     std::atomic<bool> audioPlaybackClockValid_{false};
     std::atomic<int64_t> audioPlaybackHeadFrames_{0};
     std::atomic<int64_t> audioClockGeneration_{0};
     std::atomic<int64_t> audioClockBaseMediaPtsUs_{0};
+    // 上一 PCM 块的预计结束 PTS，用于检测同一代次内因丢块造成的时间线跳变。
     std::atomic<int64_t> audioClockExpectedNextPtsUs_{0};
     std::atomic<int32_t> audioPlaybackHeadRaw32_{0};
     std::atomic<int64_t> audioPlaybackHeadExtended64_{0};

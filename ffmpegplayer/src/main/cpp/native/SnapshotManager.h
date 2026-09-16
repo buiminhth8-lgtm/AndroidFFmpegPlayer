@@ -7,6 +7,7 @@
 
 class SnapshotManager {
 public:
+    // 按扩展名将 RGBA 编码为 PNG 或 JPEG；stride 为每行字节数，ptsUs 为帧的媒体时间戳。
     static std::string saveRgba(const std::string &outputPath,
                                 const std::vector<uint8_t> &rgba,
                                 int width,

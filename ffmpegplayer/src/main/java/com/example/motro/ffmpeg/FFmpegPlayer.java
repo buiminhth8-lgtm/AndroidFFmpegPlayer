@@ -238,36 +238,46 @@ public final class FFmpegPlayer implements AutoCloseable {
         }
     }
 
+    // 录制启停可能等待磁盘，不得持有事件回调使用的 Java 锁。
+    // JNI 的 PlayerOperationGuard 负责调用期间的原生对象寿命。
     public String startRecord(String outputPath) {
+        final long handle;
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.startPlayerRecord(nativeHandle, outputPath);
+            handle = nativeHandle;
         }
+        return FFmpegNative.startPlayerRecord(handle, outputPath);
     }
 
     public String startSegmentRecord(String outputPattern, int segmentDurationSec) {
+        final long handle;
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.startPlayerSegmentRecord(nativeHandle, outputPattern, segmentDurationSec);
+            handle = nativeHandle;
         }
+        return FFmpegNative.startPlayerSegmentRecord(handle, outputPattern, segmentDurationSec);
     }
 
     public String startRecordWithConfig(String outputPathOrPattern, String format, int segmentDurationSec) {
+        final long handle;
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.startPlayerRecordWithConfig(nativeHandle, outputPathOrPattern, format, segmentDurationSec);
+            handle = nativeHandle;
         }
+        return FFmpegNative.startPlayerRecordWithConfig(handle, outputPathOrPattern, format, segmentDurationSec);
     }
 
     public String stopRecord() {
+        final long handle;
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.stopPlayerRecord(nativeHandle);
+            handle = nativeHandle;
         }
+        return FFmpegNative.stopPlayerRecord(handle);
     }
 
     // 请求原生截图；需要 Surface 捕获的渲染路径会返回专用错误码，由上层选择 PixelCopy。

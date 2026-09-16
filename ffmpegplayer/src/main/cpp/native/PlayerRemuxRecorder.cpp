@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
+#include <system_error>
 #include <iomanip>
 #include <sstream>
 #include <sys/stat.h>
@@ -15,6 +17,8 @@ extern "C" {
 #include "libavcodec/packet.h"
 #include "libavformat/avformat.h"
 #include "libavutil/avutil.h"
+#include "libavutil/buffer.h"
+#include "libavutil/channel_layout.h"
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
 #include "libavutil/mathematics.h"
@@ -245,36 +249,322 @@ int64_t packetTimestampUs(const AVPacket *packet, AVStream *stream) {
 
 } // namespace
 
-PlayerRemuxRecorder::PlayerRemuxRecorder() = default;
+PlayerRemuxRecorder::PlayerRemuxRecorder() {
+    publishSnapshot();
+}
 
 PlayerRemuxRecorder::~PlayerRemuxRecorder() {
     release();
 }
 
-std::string PlayerRemuxRecorder::start(AVFormatContext *inputFmtCtx, const std::string &outputPath) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    RemuxRecordConfig config;
-    config.outputPathOrPattern = outputPath;
-    config.segmentMode = false;
-    config.segmentDurationSec = 0;
-    return startLocked(inputFmtCtx, config);
+void PlayerRemuxRecorder::PacketDeleter::operator()(AVPacket *packet) const {
+    av_packet_free(&packet);
 }
 
-std::string PlayerRemuxRecorder::startSegmented(AVFormatContext *inputFmtCtx,
-                                                const std::string &outputPattern,
-                                                int segmentDurationSec) {
+void PlayerRemuxRecorder::setInput(AVFormatContext *inputFmtCtx) {
+    InputSnapshot snapshot(avformat_alloc_context(), [](AVFormatContext *ctx) {
+        avformat_free_context(ctx);
+    });
+    bool valid = snapshot != nullptr && inputFmtCtx != nullptr;
+    if (valid) {
+        for (unsigned i = 0; i < inputFmtCtx->nb_streams; ++i) {
+            AVStream *source = inputFmtCtx->streams[i];
+            AVStream *copy = avformat_new_stream(snapshot.get(), nullptr);
+            if (copy == nullptr || source == nullptr || source->codecpar == nullptr
+                || avcodec_parameters_copy(copy->codecpar, source->codecpar) < 0) {
+                valid = false;
+                break;
+            }
+            copy->time_base = source->time_base;
+        }
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    input_ = valid ? std::move(snapshot) : InputSnapshot{};
+    if (!valid && accepting_.exchange(false)) {
+        queueFailure_ = QueueFailure::Allocation;
+        publishedState_ = RecorderState::Error;
+        queueCv_.notify_one();
+    }
+}
+
+void PlayerRemuxRecorder::clearInput() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    input_.reset();
+}
+
+std::string PlayerRemuxRecorder::start(const std::string &outputPath) {
+    RemuxRecordConfig config;
+    config.outputPathOrPattern = outputPath;
+    return startWithConfig(config);
+}
+
+std::string PlayerRemuxRecorder::startSegmented(const std::string &outputPattern, int segmentDurationSec) {
     RemuxRecordConfig config;
     config.outputPathOrPattern = outputPattern;
     config.segmentMode = true;
     config.segmentDurationSec = segmentDurationSec;
-    return startLocked(inputFmtCtx, config);
+    return startWithConfig(config);
 }
 
-std::string PlayerRemuxRecorder::startWithConfig(AVFormatContext *inputFmtCtx, const RemuxRecordConfig &config) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return startLocked(inputFmtCtx, config);
+std::string PlayerRemuxRecorder::startWithConfig(const RemuxRecordConfig &config) {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
+    if (released_) return jsonError(-1, "recorder is released");
+    if (accepting_.load()) return jsonError(-1, "recorder is already recording");
+    // 上一次错误退出也可能留下 joinable 线程；禁止跨会话复用旧队列。
+    stopAndJoin();
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!input_) return jsonError(-1, "input format context is null; player is not prepared");
+    queue_.clear();
+    queueBytes_ = 0;
+    queueDrops_ = 0;
+    queueHighWatermark_ = 0;
+    queueBytesHighWatermark_ = 0;
+    queueFailure_ = QueueFailure::None;
+    stopRequested_ = false;
+    startCompleted_ = false;
+    packetsWritten_.store(0);
+    writeErrors_.store(0);
+    publishedState_ = RecorderState::Starting;
+    try {
+        worker_ = std::thread(&PlayerRemuxRecorder::workerLoop, this, input_, config);
+    } catch (const std::system_error &error) {
+        publishedState_ = RecorderState::Error;
+        return jsonError(-1, error.what());
+    }
+    // 维持同步 start API：只有调用者等待文件打开；播放线程不获取 lifecycleMutex_。
+    startCv_.wait(lock, [this] { return startCompleted_; });
+    return startResult_;
 }
+
+void PlayerRemuxRecorder::onPacket(const AVPacket *packet) {
+    if (packet == nullptr || !accepting_.load()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!accepting_.load() || !input_) return;
+    if (packet->stream_index < 0 || packet->stream_index >= static_cast<int>(input_->nb_streams)) return;
+    const auto type = input_->streams[packet->stream_index]->codecpar->codec_type;
+    if (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO) return;
+
+    // 计算实际持有的缓冲区和 side data；单个超大包也不得突破队列预算。
+    size_t bytes = packet->buf != nullptr ? packet->buf->size : static_cast<size_t>(std::max(packet->size, 0));
+    for (int i = 0; i < packet->side_data_elems; ++i) {
+        const size_t sideBytes = packet->side_data[i].size;
+        if (sideBytes > kMaxQueueBytes || bytes > kMaxQueueBytes - sideBytes) {
+            bytes = kMaxQueueBytes + 1;
+            break;
+        }
+        bytes += sideBytes;
+    }
+    if (queue_.size() >= kMaxQueuePackets || bytes > kMaxQueueBytes
+        || queueBytes_ > kMaxQueueBytes - bytes) {
+        ++queueDrops_;
+        queueFailure_ = QueueFailure::Overflow;
+        accepting_.store(false);
+        publishedState_ = RecorderState::Error;
+        LOGE("recorder queue overflow packets=%zu bytes=%zu; stop recording, keep playback running",
+             queue_.size(), queueBytes_);
+        queueCv_.notify_one();
+        return;
+    }
+    std::unique_ptr<AVPacket, PacketDeleter> copy(av_packet_clone(packet));
+    if (copy) {
+        try {
+            queue_.push_back({std::move(copy), input_, bytes});
+            queueBytes_ += bytes;
+            queueHighWatermark_ = std::max(queueHighWatermark_, queue_.size());
+            queueBytesHighWatermark_ = std::max(queueBytesHighWatermark_, queueBytes_);
+            queueCv_.notify_one();
+            return;
+        } catch (const std::bad_alloc &) {
+            // RAII 释放尚未进入队列的引用。
+        }
+    }
+    ++queueDrops_;
+    queueFailure_ = QueueFailure::Allocation;
+    accepting_.store(false);
+    publishedState_ = RecorderState::Error;
+    queueCv_.notify_one();
+}
+
+bool PlayerRemuxRecorder::adoptInput(const InputSnapshot &input) {
+    if (input == workerInput_) return true;
+    // 不可将不同编码参数的包写入旧容器；变化仅终止录制，不影响重连播放。
+    if (input->nb_streams != workerInput_->nb_streams) {
+        setErrorLocked("record input stream layout changed after reconnect");
+        return false;
+    }
+    for (unsigned i = 0; i < input->nb_streams; ++i) {
+        const AVCodecParameters *a = workerInput_->streams[i]->codecpar;
+        const AVCodecParameters *b = input->streams[i]->codecpar;
+        if (a->codec_type != b->codec_type || a->codec_id != b->codec_id
+            || a->width != b->width || a->height != b->height || a->sample_rate != b->sample_rate
+            || (a->codec_type == AVMEDIA_TYPE_AUDIO
+                && (a->ch_layout.nb_channels != b->ch_layout.nb_channels
+                    || (a->ch_layout.nb_channels > 0
+                        && av_channel_layout_compare(&a->ch_layout, &b->ch_layout) != 0)))
+            || a->extradata_size != b->extradata_size
+            || (a->extradata_size > 0 && std::memcmp(a->extradata, b->extradata, a->extradata_size) != 0)) {
+            setErrorLocked("record codec parameters changed after reconnect");
+            return false;
+        }
+        if (i < streamMapping_.size() && streamMapping_[i] >= 0) {
+            const int outputIndex = streamMapping_[i];
+            timestampOffset_[outputIndex] = lastDts_[outputIndex] == AV_NOPTS_VALUE ? 0 : lastDts_[outputIndex] + 1;
+        }
+    }
+    workerInput_ = input;
+    std::fill(firstPts_.begin(), firstPts_.end(), AV_NOPTS_VALUE);
+    std::fill(firstDts_.begin(), firstDts_.end(), AV_NOPTS_VALUE);
+    if (audioBitstreamFilter_ != nullptr) {
+        av_bsf_flush(audioBitstreamFilter_);
+        audioBitstreamFilter_->time_base_in = input->streams[audioInputStreamIndex_]->time_base;
+        audioBitstreamFilter_->time_base_out = audioBitstreamFilter_->time_base_in;
+    }
+    waitingForKeyFrame_ = hasVideo_;
+    state_ = hasVideo_ ? RecorderState::WaitingKeyFrame : RecorderState::Recording;
+    segmentStartPtsUs_ = AV_NOPTS_VALUE;
+    LOGI("recorder adopted reconnect input snapshot; waitKeyFrame=%d", waitingForKeyFrame_ ? 1 : 0);
+    return true;
+}
+
+void PlayerRemuxRecorder::workerLoop(InputSnapshot input, RemuxRecordConfig config) {
+    workerInput_ = std::move(input);
+    const std::string result = startLocked(workerInput_.get(), config);
+    const bool started = result.find("\"success\":true") != std::string::npos;
+    publishSnapshot();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        startResult_ = result;
+        startCompleted_ = true;
+        accepting_.store(started && queueFailure_ == QueueFailure::None);
+    }
+    startCv_.notify_all();
+    if (started) {
+        for (;;) {
+            QueuedPacket next;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                queueCv_.wait(lock, [this] {
+                    return stopRequested_ || queueFailure_ != QueueFailure::None || !queue_.empty();
+                });
+                if (queueFailure_ != QueueFailure::None) {
+                    const QueueFailure failure = queueFailure_;
+                    lock.unlock();
+                    setErrorLocked(failure == QueueFailure::Overflow
+                                   ? "record packet queue overflow; recording stopped"
+                                   : "record packet/input allocation failed; recording stopped");
+                    break;
+                }
+                if (queue_.empty()) break; // 正常 stop 在所有已接受包排空后退出。
+                next = std::move(queue_.front());
+                queueBytes_ -= next.bytes;
+                queue_.pop_front();
+            }
+            // 此区间无队列锁/生命周期锁，写盘阻塞不会传递给生产者或诊断查询。
+            if (!adoptInput(next.input)) break;
+            if (shouldWritePacketLocked(next.packet.get(), workerInput_.get())
+                && rotateSegmentIfNeededLocked(next.packet.get(), workerInput_.get())) {
+                writePacketLocked(next.packet.get(), workerInput_.get());
+            }
+            publishSnapshot();
+            if (state_ == RecorderState::Error) break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        accepting_.store(false);
+        queueDrops_ += queue_.size();
+        queue_.clear();
+        queueBytes_ = 0;
+    }
+    finishWorker();
+    workerInput_.reset();
+    publishSnapshot();
+}
+
+void PlayerRemuxRecorder::finishWorker() {
+    stopTimeUs_ = av_gettime_relative();
+    const bool sourceVideo = sourceHasVideo_;
+    const bool sourceAudio = sourceHasAudio_;
+    const bool recordedVideo = videoStreamRecorded_;
+    const bool recordedAudio = audioStreamRecorded_;
+    const int result = closeOutputLocked(true);
+    sourceHasVideo_ = sourceVideo;
+    sourceHasAudio_ = sourceAudio;
+    videoStreamRecorded_ = recordedVideo;
+    audioStreamRecorded_ = recordedAudio;
+    if (result < 0) setErrorLocked(ffmpegErrorToString(result), result);
+    if (state_ != RecorderState::Error) state_ = RecorderState::Stopped;
+}
+
+void PlayerRemuxRecorder::stopAndJoin() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        accepting_.store(false);
+        stopRequested_ = true;
+        if (isRecorderActive(publishedState_)) publishedState_ = RecorderState::Stopping;
+    }
+    queueCv_.notify_one();
+    if (worker_.joinable()) worker_.join();
+}
+
+std::string PlayerRemuxRecorder::stop() {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
+    stopAndJoin();
+    std::string result = getState();
+    result.insert(1, "\"message\":\"player remux recording stopped\",");
+    return result;
+}
+
+void PlayerRemuxRecorder::release() {
+    std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex_);
+    if (released_) return;
+    stopAndJoin();
+    released_ = true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    input_.reset();
+    publishedState_ = RecorderState::Released;
+}
+
+void PlayerRemuxRecorder::publishSnapshot() {
+    const std::string details = buildStateDetails();
+    publishedVideoPackets_.store(videoPacketCount_);
+    publishedAudioPackets_.store(audioPacketCount_);
+    publishedSegments_.store(completedSegmentCount_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    publishedDetails_ = details;
+    publishedState_ = queueFailure_ != QueueFailure::None ? RecorderState::Error
+                      : stopRequested_ && isRecorderActive(state_) ? RecorderState::Stopping : state_;
+}
+
+std::string PlayerRemuxRecorder::getState() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::ostringstream out;
+    out << "{\"success\":" << (publishedState_ == RecorderState::Error ? "false" : "true") << ","
+        << "\"recording\":" << (accepting_.load() ? "true" : "false") << ","
+        << "\"state\":\"" << stateName(publishedState_) << "\","
+        << publishedDetails_ << ","
+        << "\"audioPlaybackEnabled\":" << (audioPlaybackEnabled_.load() ? "true" : "false") << ","
+        << "\"queuePackets\":" << queue_.size() << ","
+        << "\"queueBytes\":" << queueBytes_ << ","
+        << "\"queueDrops\":" << queueDrops_ << ","
+        << "\"queueHighWatermark\":" << queueHighWatermark_ << ","
+        << "\"queueBytesHighWatermark\":" << queueBytesHighWatermark_ << ","
+        << "\"queueMaxPackets\":" << kMaxQueuePackets << ","
+        << "\"queueMaxBytes\":" << kMaxQueueBytes << ","
+        << "\"queueOverflowPolicy\":\"stop_recording\","
+        << "\"packetsWritten\":" << packetsWritten_.load() << ","
+        << "\"writeErrors\":" << writeErrors_.load() << "}";
+    return out.str();
+}
+
+void PlayerRemuxRecorder::setAudioPlaybackState(bool enabled) {
+    audioPlaybackEnabled_.store(enabled);
+}
+
+bool PlayerRemuxRecorder::isRecording() const { return accepting_.load(); }
+int64_t PlayerRemuxRecorder::getVideoPacketCount() const { return publishedVideoPackets_.load(); }
+int64_t PlayerRemuxRecorder::getAudioPacketCount() const { return publishedAudioPackets_.load(); }
+int64_t PlayerRemuxRecorder::getCompletedSegmentCount() const { return publishedSegments_.load(); }
 
 std::string PlayerRemuxRecorder::startLocked(AVFormatContext *inputFmtCtx,
                                              const RemuxRecordConfig &config) {
@@ -496,6 +786,7 @@ int PlayerRemuxRecorder::openOutputLocked(AVFormatContext *inputFmtCtx, const st
     }
 
     lastDts_.assign(outputFmtCtx_->nb_streams, AV_NOPTS_VALUE);
+    timestampOffset_.assign(outputFmtCtx_->nb_streams, 0);
 
     if (!(outputFmtCtx_->oformat->flags & AVFMT_NOFILE)) {
         result = avio_open(&outputFmtCtx_->pb, outputPath.c_str(), AVIO_FLAG_WRITE);
@@ -556,7 +847,10 @@ int PlayerRemuxRecorder::closeOutputLocked(bool writeTrailer) {
 
     if (outputFmtCtx_ != nullptr) {
         if (!(outputFmtCtx_->oformat->flags & AVFMT_NOFILE) && outputFmtCtx_->pb != nullptr) {
-            avio_closep(&outputFmtCtx_->pb);
+            const int closeResult = avio_closep(&outputFmtCtx_->pb);
+            if (trailerResult >= 0 && closeResult < 0) {
+                trailerResult = closeResult;
+            }
         }
         avformat_free_context(outputFmtCtx_);
         outputFmtCtx_ = nullptr;
@@ -589,152 +883,6 @@ int PlayerRemuxRecorder::closeOutputLocked(bool writeTrailer) {
     segmentStartPtsUs_ = AV_NOPTS_VALUE;
     currentSegmentStartTimeUs_ = 0;
     return trailerResult;
-}
-
-void PlayerRemuxRecorder::onPacket(const AVPacket *packet, AVFormatContext *inputFmtCtx) {
-    if (packet == nullptr || inputFmtCtx == nullptr) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!isRecorderActive(state_) || outputFmtCtx_ == nullptr || !headerWritten_) {
-        return;
-    }
-    if (!shouldWritePacketLocked(packet, inputFmtCtx)) {
-        return;
-    }
-    if (!rotateSegmentIfNeededLocked(packet, inputFmtCtx)) {
-        return;
-    }
-    writePacketLocked(packet, inputFmtCtx);
-}
-
-std::string PlayerRemuxRecorder::stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (state_ == RecorderState::Released) {
-        return buildStateJsonLocked(true);
-    }
-    if (!isRecorderActive(state_) && outputFmtCtx_ == nullptr) {
-        return buildStateJsonLocked(true);
-    }
-
-    state_ = RecorderState::Stopping;
-    stopTimeUs_ = av_gettime_relative();
-    LOGI("stopPlayerRecord outputPath=%s segmentMode=%d videoPackets=%lld audioPackets=%lld completedSegments=%lld",
-         outputPath_.c_str(), segmentMode_ ? 1 : 0,
-         static_cast<long long>(videoPacketCount_), static_cast<long long>(audioPacketCount_),
-         static_cast<long long>(completedSegmentCount_));
-
-    const bool stoppedSourceHasVideo = sourceHasVideo_;
-    const bool stoppedSourceHasAudio = sourceHasAudio_;
-    const bool stoppedVideoStreamRecorded = videoStreamRecorded_;
-    const bool stoppedAudioStreamRecorded = audioStreamRecorded_;
-    const bool stoppedAudioPlaybackEnabled = audioPlaybackEnabled_;
-    const int trailerResult = closeOutputLocked(true);
-    const std::string stoppedPath = outputPath_;
-    const std::string stoppedPattern = outputPattern_;
-    const std::string stoppedSegmentPath = currentSegmentPath_;
-    const std::string stoppedLastSegmentPath = lastSegmentPath_;
-    const std::string stoppedFormat = formatName_;
-    const std::string stoppedRequestedFormat = requestedFormatName_;
-    const int64_t stoppedVideoPackets = videoPacketCount_;
-    const int64_t stoppedAudioPackets = audioPacketCount_;
-    const int64_t stoppedDurationUs = elapsedUs(startTimeUs_, stopTimeUs_);
-    const int64_t stoppedCompletedSegments = completedSegmentCount_;
-    const bool stoppedSegmentMode = segmentMode_;
-    const int64_t stoppedSegmentDurationUs = segmentDurationUs_;
-    const bool stoppedFragmentedMp4 = fragmentedMp4_;
-
-    resetLocked(false);
-    state_ = RecorderState::Stopped;
-    outputPath_ = stoppedPath;
-    outputPattern_ = stoppedPattern;
-    currentSegmentPath_ = stoppedSegmentPath;
-    lastSegmentPath_ = stoppedLastSegmentPath;
-    formatName_ = stoppedFormat;
-    requestedFormatName_ = stoppedRequestedFormat;
-    videoPacketCount_ = stoppedVideoPackets;
-    audioPacketCount_ = stoppedAudioPackets;
-    completedSegmentCount_ = stoppedCompletedSegments;
-    segmentMode_ = stoppedSegmentMode;
-    segmentDurationUs_ = stoppedSegmentDurationUs;
-    fragmentedMp4_ = stoppedFragmentedMp4;
-    sourceHasVideo_ = stoppedSourceHasVideo;
-    sourceHasAudio_ = stoppedSourceHasAudio;
-    videoStreamRecorded_ = stoppedVideoStreamRecorded;
-    audioStreamRecorded_ = stoppedAudioStreamRecorded;
-    audioPlaybackEnabled_ = stoppedAudioPlaybackEnabled;
-    startTimeUs_ = stopTimeUs_ > 0 ? stopTimeUs_ - stoppedDurationUs : 0;
-    stopTimeUs_ = startTimeUs_ + stoppedDurationUs;
-    if (trailerResult < 0) {
-        lastError_ = ffmpegErrorToString(trailerResult);
-        lastErrorCode_ = trailerResult;
-    }
-
-    std::ostringstream out;
-    out << "{\"success\":true,\"message\":\"player remux recording stopped\","
-        << "\"outputPath\":\"" << escapeJson(outputPath_) << "\","
-        << "\"outputPattern\":\"" << escapeJson(outputPattern_) << "\","
-        << "\"lastSegmentPath\":\"" << escapeJson(lastSegmentPath_) << "\","
-        << "\"segmentMode\":" << (segmentMode_ ? "true" : "false") << ","
-        << "\"completedSegmentCount\":" << completedSegmentCount_ << ","
-        << "\"format\":\"" << escapeJson(formatName_) << "\","
-        << "\"requestedFormat\":\"" << escapeJson(requestedFormatName_) << "\","
-        << "\"fragmentedMp4\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
-        << "\"abnormalExitReadable\":" << (isMp4LikeFormat(formatName_) && fragmentedMp4_ ? "true" : "false") << ","
-        << "\"sourceHasVideo\":" << (sourceHasVideo_ ? "true" : "false") << ","
-        << "\"sourceHasAudio\":" << (sourceHasAudio_ ? "true" : "false") << ","
-        << "\"videoStreamRecorded\":" << (videoStreamRecorded_ ? "true" : "false") << ","
-        << "\"audioStreamRecorded\":" << (audioStreamRecorded_ ? "true" : "false") << ","
-        << "\"videoPacketCount\":" << videoPacketCount_ << ","
-        << "\"audioPacketCount\":" << audioPacketCount_ << ","
-        << "\"durationUs\":" << stoppedDurationUs << "}";
-    return out.str();
-}
-
-std::string PlayerRemuxRecorder::getState() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return buildStateJsonLocked(true);
-}
-
-
-void PlayerRemuxRecorder::setAudioPlaybackState(bool enabled) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    audioPlaybackEnabled_ = enabled;
-}
-bool PlayerRemuxRecorder::isRecording() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return isRecorderActive(state_);
-}
-
-int64_t PlayerRemuxRecorder::getVideoPacketCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return videoPacketCount_;
-}
-
-int64_t PlayerRemuxRecorder::getAudioPacketCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return audioPacketCount_;
-}
-
-int64_t PlayerRemuxRecorder::getCompletedSegmentCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return completedSegmentCount_;
-}
-
-void PlayerRemuxRecorder::release() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == RecorderState::Released) {
-        return;
-    }
-    if (isRecorderActive(state_) && outputFmtCtx_ != nullptr && headerWritten_) {
-        LOGI("release recorder: active recording will be stopped first outputPath=%s", outputPath_.c_str());
-        closeOutputLocked(true);
-    }
-    resetLocked(true);
-    state_ = RecorderState::Released;
-    LOGI("release recorder");
 }
 
 void PlayerRemuxRecorder::resetLocked(bool keepReleasedState) {
@@ -778,13 +926,9 @@ void PlayerRemuxRecorder::resetLocked(bool keepReleasedState) {
     fragmentedMp4_ = true;
 }
 
-std::string PlayerRemuxRecorder::buildStateJsonLocked(bool success) const {
-    const bool active = isRecorderActive(state_);
+std::string PlayerRemuxRecorder::buildStateDetails() const {
     std::ostringstream out;
-    out << "{\"success\":" << (success ? "true" : "false") << ","
-        << "\"recording\":" << (active ? "true" : "false") << ","
-        << "\"state\":\"" << stateName(state_) << "\","
-        << "\"outputPath\":\"" << escapeJson(outputPath_) << "\","
+    out << "\"outputPath\":\"" << escapeJson(outputPath_) << "\","
         << "\"outputPattern\":\"" << escapeJson(outputPattern_) << "\","
         << "\"format\":\"" << escapeJson(formatName_) << "\","
         << "\"requestedFormat\":\"" << escapeJson(requestedFormatName_) << "\","
@@ -796,7 +940,6 @@ std::string PlayerRemuxRecorder::buildStateJsonLocked(bool success) const {
         << "\"sourceHasAudio\":" << (sourceHasAudio_ ? "true" : "false") << ","
         << "\"videoStreamRecorded\":" << (videoStreamRecorded_ ? "true" : "false") << ","
         << "\"audioStreamRecorded\":" << (audioStreamRecorded_ ? "true" : "false") << ","
-        << "\"audioPlaybackEnabled\":" << (audioPlaybackEnabled_ ? "true" : "false") << ","
         << "\"audioRecordingIndependentOfPlayback\":true,"
         << "\"currentSegmentIndex\":" << (currentSegmentIndex_ + 1) << ","
         << "\"currentSegmentPath\":\"" << escapeJson(currentSegmentPath_) << "\","
@@ -808,7 +951,7 @@ std::string PlayerRemuxRecorder::buildStateJsonLocked(bool success) const {
         << "\"currentSegmentAudioPacketCount\":" << currentSegmentAudioPacketCount_ << ","
         << "\"waitingForKeyFrame\":" << (waitingForKeyFrame_ ? "true" : "false") << ","
         << "\"lastError\":\"" << escapeJson(lastError_) << "\","
-        << "\"durationUs\":" << elapsedUs(startTimeUs_, stopTimeUs_) << "}";
+        << "\"durationUs\":" << elapsedUs(startTimeUs_, stopTimeUs_);
     return out.str();
 }
 
@@ -887,15 +1030,10 @@ bool PlayerRemuxRecorder::rotateSegmentIfNeededLocked(const AVPacket *packet, AV
     LOGI("rotate record segment currentPath=%s elapsedUs=%lld targetUs=%lld nextIndex=%d",
          currentSegmentPath_.c_str(), static_cast<long long>(segmentElapsedUs),
          static_cast<long long>(segmentDurationUs_), currentSegmentIndex_ + 2);
-    const bool stoppedSourceHasVideo = sourceHasVideo_;
-    const bool stoppedSourceHasAudio = sourceHasAudio_;
-    const bool stoppedVideoStreamRecorded = videoStreamRecorded_;
-    const bool stoppedAudioStreamRecorded = audioStreamRecorded_;
-    const bool stoppedAudioPlaybackEnabled = audioPlaybackEnabled_;
     const int trailerResult = closeOutputLocked(true);
     if (trailerResult < 0) {
-        lastError_ = ffmpegErrorToString(trailerResult);
-        lastErrorCode_ = trailerResult;
+        setErrorLocked(ffmpegErrorToString(trailerResult), trailerResult);
+        return false;
     }
 
     ++currentSegmentIndex_;
@@ -959,6 +1097,9 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
 
     auto writeOutputPacket = [&](AVPacket *outputPacket, AVRational sourceTimeBase) -> bool {
         av_packet_rescale_ts(outputPacket, sourceTimeBase, outputStream->time_base);
+        // 重连后以输出时间基衔接已写 DTS，输入 PTS 可从零重新开始。
+        if (outputPacket->pts != AV_NOPTS_VALUE) outputPacket->pts += timestampOffset_[outputIndex];
+        if (outputPacket->dts != AV_NOPTS_VALUE) outputPacket->dts += timestampOffset_[outputIndex];
         outputPacket->stream_index = outputIndex;
         outputPacket->pos = -1;
 
@@ -983,7 +1124,12 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
         if (isMp4LikeFormat(formatName_) && fragmentedMp4_ && outputFmtCtx_ != nullptr
             && outputFmtCtx_->pb != nullptr) {
             avio_flush(outputFmtCtx_->pb);
+            if (outputFmtCtx_->pb->error < 0) {
+                setErrorLocked(ffmpegErrorToString(outputFmtCtx_->pb->error), outputFmtCtx_->pb->error);
+                return false;
+            }
         }
+        packetsWritten_.fetch_add(1);
 
         if (packet->stream_index == videoInputStreamIndex_) {
             ++videoPacketCount_;
@@ -1052,6 +1198,7 @@ std::string PlayerRemuxRecorder::makeSegmentPathLocked(int segmentIndex) const {
 }
 
 void PlayerRemuxRecorder::setErrorLocked(const std::string &message, int errorCode) {
+    writeErrors_.fetch_add(1);
     lastError_ = message;
     lastErrorCode_ = errorCode;
     state_ = RecorderState::Error;

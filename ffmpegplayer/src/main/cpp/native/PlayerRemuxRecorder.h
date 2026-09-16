@@ -3,6 +3,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -39,11 +43,16 @@ public:
     PlayerRemuxRecorder(const PlayerRemuxRecorder &) = delete;
     PlayerRemuxRecorder &operator=(const PlayerRemuxRecorder &) = delete;
 
-    std::string start(AVFormatContext *inputFmtCtx, const std::string &outputPath);
-    std::string startSegmented(AVFormatContext *inputFmtCtx, const std::string &outputPattern, int segmentDurationSec);
-    std::string startWithConfig(AVFormatContext *inputFmtCtx, const RemuxRecordConfig &config);
-    // 接收解复用后的压缩包，依次执行关键帧筛选、分段判断和封装写入。
-    void onPacket(const AVPacket *packet, AVFormatContext *inputFmtCtx);
+    std::string start(const std::string &outputPath);
+    std::string startSegmented(const std::string &outputPattern, int segmentDurationSec);
+    std::string startWithConfig(const RemuxRecordConfig &config);
+    // 在输入所属线程复制流参数；快照不含 AVIO，也不借用输入上下文的内存。
+    void setInput(AVFormatContext *inputFmtCtx);
+    void clearInput();
+    // 只引用压缩包并入队；不得获取生命周期锁或执行任何输出文件操作。
+    void onPacket(const AVPacket *packet);
+    static constexpr size_t kMaxQueuePackets = 512;
+    static constexpr size_t kMaxQueueBytes = 16 * 1024 * 1024;
     std::string stop();
     std::string getState();
     void setAudioPlaybackState(bool enabled);
@@ -54,13 +63,27 @@ public:
     void release();
 
 private:
-    // 以下 Locked 方法要求调用方持有 mutex_，用于串行化输出文件与录制状态变化。
+    struct PacketDeleter { void operator()(AVPacket *packet) const; };
+    using InputSnapshot = std::shared_ptr<AVFormatContext>;
+    struct QueuedPacket {
+        std::unique_ptr<AVPacket, PacketDeleter> packet;
+        InputSnapshot input;
+        size_t bytes;
+    };
+    enum class QueueFailure { None, Overflow, Allocation };
+    void workerLoop(InputSnapshot input, RemuxRecordConfig config);
+    void finishWorker();
+    void stopAndJoin();
+    void publishSnapshot();
+    bool adoptInput(const InputSnapshot &input);
+    // 保留原 Locked 命名；这些封装方法现在只由唯一的 Remux Worker 调用。
+    // mutex_ 只保护队列和已发布快照，绝不能跨磁盘 I/O 持有。
     std::string startLocked(AVFormatContext *inputFmtCtx,
                             const RemuxRecordConfig &config);
     int openOutputLocked(AVFormatContext *inputFmtCtx, const std::string &outputPath);
     int closeOutputLocked(bool writeTrailer);
     void resetLocked(bool keepReleasedState);
-    std::string buildStateJsonLocked(bool success) const;
+    std::string buildStateDetails() const;
     bool shouldWritePacketLocked(const AVPacket *packet, AVFormatContext *inputFmtCtx);
     bool rotateSegmentIfNeededLocked(const AVPacket *packet, AVFormatContext *inputFmtCtx);
     bool writePacketLocked(const AVPacket *packet, AVFormatContext *inputFmtCtx);
@@ -68,6 +91,32 @@ private:
     void setErrorLocked(const std::string &message, int errorCode = -1);
 
     mutable std::mutex mutex_;
+    // 仅 start/stop/release 使用，允许等待 worker；播放线程永不获取此锁。
+    std::mutex lifecycleMutex_;
+    std::condition_variable queueCv_;
+    std::condition_variable startCv_;
+    std::thread worker_;
+    std::deque<QueuedPacket> queue_;
+    InputSnapshot input_;
+    InputSnapshot workerInput_;
+    std::atomic<bool> accepting_{false};
+    bool released_ = false; // lifecycleMutex_
+    bool stopRequested_ = false; // 以下队列/发布字段均由 mutex_ 保护
+    bool startCompleted_ = false;
+    QueueFailure queueFailure_ = QueueFailure::None;
+    size_t queueBytes_ = 0;
+    size_t queueHighWatermark_ = 0;
+    size_t queueBytesHighWatermark_ = 0;
+    uint64_t queueDrops_ = 0;
+    std::string startResult_;
+    std::string publishedDetails_;
+    RecorderState publishedState_ = RecorderState::Idle;
+    std::atomic<int64_t> packetsWritten_{0};
+    std::atomic<int64_t> writeErrors_{0};
+    std::atomic<int64_t> publishedVideoPackets_{0};
+    std::atomic<int64_t> publishedAudioPackets_{0};
+    std::atomic<int64_t> publishedSegments_{0};
+    // 以下资源和非原子状态只由 worker 访问，队列中的输入快照延长流参数寿命。
     AVFormatContext *outputFmtCtx_ = nullptr;
     AVBSFContext *audioBitstreamFilter_ = nullptr;
     // 输入流索引到输出流索引的映射，未录制的流不写入输出文件。
@@ -76,6 +125,7 @@ private:
     std::vector<int64_t> firstPts_;
     std::vector<int64_t> firstDts_;
     std::vector<int64_t> lastDts_;
+    std::vector<int64_t> timestampOffset_;
 
     RecorderState state_ = RecorderState::Idle;
     std::string outputPath_;
@@ -104,7 +154,7 @@ private:
     bool sourceHasAudio_ = false;
     bool videoStreamRecorded_ = false;
     bool audioStreamRecorded_ = false;
-    bool audioPlaybackEnabled_ = false;
+    std::atomic<bool> audioPlaybackEnabled_{false};
     // 有视频时等待可独立解码的关键帧再开始写包。
     bool waitingForKeyFrame_ = false;
     bool headerWritten_ = false;

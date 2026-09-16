@@ -1207,6 +1207,7 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         audioDecodeError_.clear();
         LOGI("prepare source has no audio stream; video-only playback/recording is allowed");
     }
+    remuxRecorder_.setInput(formatContext_);
     return 0;
 }
 
@@ -1636,6 +1637,7 @@ std::string NativePlayer::stop() {
     if (remuxRecorder_.isRecording()) {
         LOGI("stopPlayer auto stop active recorder");
     }
+    remuxRecorder_.clearInput();
     remuxRecorder_.stop();
 
     releaseFfmpegResources();
@@ -2164,6 +2166,7 @@ std::string NativePlayer::getStats() {
         << "\"recordVideoPacketCount\":" << remuxRecorder_.getVideoPacketCount() << ","
         << "\"recordAudioPacketCount\":" << remuxRecorder_.getAudioPacketCount() << ","
         << "\"recordCompletedSegmentCount\":" << remuxRecorder_.getCompletedSegmentCount() << ","
+        << "\"recorder\":" << remuxRecorder_.getState() << ","
         << "\"surfaceAttached\":" << (surfaceAttached ? "true" : "false") << ","
         << "\"hasLastFrame\":" << (hasFrame ? "true" : "false") << ","
         << "\"lastFrameWidth\":" << frameWidth << ","
@@ -2921,13 +2924,11 @@ std::string NativePlayer::startRecord(const std::string &outputPath) {
         return jsonError(-1, "player is released");
     }
 
-    AVFormatContext *input = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Prepared && state_ != PlayerState::Playing && state_ != PlayerState::Paused) {
             return jsonError(-1, "player is not prepared");
         }
-        input = formatContext_;
     }
 
     remuxRecorder_.setAudioPlaybackState(audioEnabled_.load());
@@ -2935,7 +2936,7 @@ std::string NativePlayer::startRecord(const std::string &outputPath) {
         LOGI("AudioTrack disabled but audio remux recording remains enabled by source audio stream");
     }
     LOGI("startPlayerRecord outputPath=%s sourceHasAudio=%d audioPlaybackEnabled=%d", outputPath.c_str(), sourceHasAudio_.load() ? 1 : 0, audioEnabled_.load() ? 1 : 0);
-    return remuxRecorder_.start(input, outputPath);
+    return remuxRecorder_.start(outputPath);
 }
 
 
@@ -2944,13 +2945,11 @@ std::string NativePlayer::startSegmentRecord(const std::string &outputPattern, i
         return jsonError(-1, "player is released");
     }
 
-    AVFormatContext *input = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Prepared && state_ != PlayerState::Playing && state_ != PlayerState::Paused) {
             return jsonError(-1, "player is not prepared");
         }
-        input = formatContext_;
     }
 
     remuxRecorder_.setAudioPlaybackState(audioEnabled_.load());
@@ -2958,7 +2957,7 @@ std::string NativePlayer::startSegmentRecord(const std::string &outputPattern, i
         LOGI("AudioTrack disabled but segmented audio remux recording remains enabled by source audio stream");
     }
     LOGI("startPlayerSegmentRecord outputPattern=%s segmentDurationSec=%d sourceHasAudio=%d audioPlaybackEnabled=%d", outputPattern.c_str(), segmentDurationSec, sourceHasAudio_.load() ? 1 : 0, audioEnabled_.load() ? 1 : 0);
-    return remuxRecorder_.startSegmented(input, outputPattern, segmentDurationSec);
+    return remuxRecorder_.startSegmented(outputPattern, segmentDurationSec);
 }
 
 std::string NativePlayer::startRecordWithConfig(const std::string &outputPathOrPattern,
@@ -2968,13 +2967,11 @@ std::string NativePlayer::startRecordWithConfig(const std::string &outputPathOrP
         return jsonError(-1, "player is released");
     }
 
-    AVFormatContext *input = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ != PlayerState::Prepared && state_ != PlayerState::Playing && state_ != PlayerState::Paused) {
             return jsonError(-1, "player is not prepared");
         }
-        input = formatContext_;
     }
 
     RemuxRecordConfig config;
@@ -2991,7 +2988,7 @@ std::string NativePlayer::startRecordWithConfig(const std::string &outputPathOrP
     LOGI("startPlayerRecordWithConfig output=%s format=%s segmentDurationSec=%d segmentMode=%d sourceHasAudio=%d audioPlaybackEnabled=%d",
          outputPathOrPattern.c_str(), formatName.c_str(), segmentDurationSec, config.segmentMode ? 1 : 0,
          sourceHasAudio_.load() ? 1 : 0, audioEnabled_.load() ? 1 : 0);
-    return remuxRecorder_.startWithConfig(input, config);
+    return remuxRecorder_.startWithConfig(config);
 }
 
 std::string NativePlayer::stopRecord() {
@@ -5049,7 +5046,7 @@ void NativePlayer::playbackLoop() {
 
         // 先把压缩包交给录制器，再执行暂停和播放丢包策略，保留独立的录制路径。
         if (remuxRecorder_.isRecording()) {
-            remuxRecorder_.onPacket(packet_, formatContext_);
+            remuxRecorder_.onPacket(packet_);
         }
 
         if (pauseRequested_.load() || audioResumeDiscontinuityRequested_.load()) {
@@ -6047,6 +6044,8 @@ void NativePlayer::resetStats() {
 }
 
 void NativePlayer::releaseFfmpegResources() {
+    // 只撤销后续录制启动使用的快照；已排队包持有自己的参数，不等待磁盘。
+    remuxRecorder_.clearInput();
     if (swsContext_ != nullptr) {
         sws_freeContext(swsContext_);
         swsContext_ = nullptr;

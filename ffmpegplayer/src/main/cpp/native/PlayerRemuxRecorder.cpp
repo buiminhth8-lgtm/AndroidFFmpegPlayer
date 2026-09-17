@@ -1066,7 +1066,7 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
     if (result < 0) {
         const std::string error = ffmpegErrorToString(result);
         av_packet_free(&recordPacket);
-        setErrorLocked(error, result);
+        setErrorLocked("packet reference: " + error, result);
         return false;
     }
 
@@ -1103,20 +1103,32 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
         outputPacket->stream_index = outputIndex;
         outputPacket->pos = -1;
 
-        if (outputPacket->dts != AV_NOPTS_VALUE && outputIndex >= 0
-            && static_cast<size_t>(outputIndex) < lastDts_.size()) {
-            if (lastDts_[outputIndex] != AV_NOPTS_VALUE && outputPacket->dts <= lastDts_[outputIndex]) {
-                LOGE("skip non-monotonic dts stream=%d dts=%lld lastDts=%lld",
-                     outputIndex, static_cast<long long>(outputPacket->dts),
-                     static_cast<long long>(lastDts_[outputIndex]));
-                return false;
-            }
-            lastDts_[outputIndex] = outputPacket->dts;
+        // RTSP 重连首包可能没有 PTS/DTS。不能让 muxer 隐式补值，否则本地
+        // lastDts 与容器时间线分离，随后恢复有效时间戳的包会被判为倒退。
+        const int64_t step = std::max<int64_t>(1, outputPacket->duration);
+        const int64_t previousDts = lastDts_[outputIndex];
+        if (outputPacket->dts == AV_NOPTS_VALUE) {
+            outputPacket->dts = outputPacket->pts != AV_NOPTS_VALUE ? outputPacket->pts
+                               : previousDts == AV_NOPTS_VALUE ? timestampOffset_[outputIndex]
+                               : previousDts + step;
         }
+        if (previousDts != AV_NOPTS_VALUE && outputPacket->dts <= previousDts) {
+            const int64_t correction = previousDts + step - outputPacket->dts;
+            outputPacket->dts += correction;
+            if (outputPacket->pts != AV_NOPTS_VALUE) outputPacket->pts += correction;
+            // 把同一修正应用于后续包，保留输入时间间隔，而非逐包丢弃。
+            timestampOffset_[outputIndex] += correction;
+            LOGI("record timestamp discontinuity stream=%d correction=%lld",
+                 outputIndex, static_cast<long long>(correction));
+        }
+        if (outputPacket->pts == AV_NOPTS_VALUE || outputPacket->pts < outputPacket->dts) {
+            outputPacket->pts = outputPacket->dts;
+        }
+        const int64_t writtenDts = outputPacket->dts;
 
         result = av_interleaved_write_frame(outputFmtCtx_, outputPacket);
         if (result < 0) {
-            const std::string error = ffmpegErrorToString(result);
+            const std::string error = "mux write: " + ffmpegErrorToString(result);
             LOGE("av_interleaved_write_frame failed stream=%d error=%s", outputIndex, error.c_str());
             setErrorLocked(error, result);
             return false;
@@ -1125,10 +1137,12 @@ bool PlayerRemuxRecorder::writePacketLocked(const AVPacket *packet, AVFormatCont
             && outputFmtCtx_->pb != nullptr) {
             avio_flush(outputFmtCtx_->pb);
             if (outputFmtCtx_->pb->error < 0) {
-                setErrorLocked(ffmpegErrorToString(outputFmtCtx_->pb->error), outputFmtCtx_->pb->error);
+                setErrorLocked("mux flush: " + ffmpegErrorToString(outputFmtCtx_->pb->error),
+                               outputFmtCtx_->pb->error);
                 return false;
             }
         }
+        lastDts_[outputIndex] = writtenDts;
         packetsWritten_.fetch_add(1);
 
         if (packet->stream_index == videoInputStreamIndex_) {

@@ -135,11 +135,14 @@ public final class FFmpegPlayer implements AutoCloseable {
     }
 
     public String stop() {
+        final long handle;
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.stopPlayer(nativeHandle);
+            handle = nativeHandle;
         }
+        // 原生 stop 会 join 播放线程；锁外调用，避免播放线程投递事件时反向等待 Java 锁。
+        return FFmpegNative.stopPlayer(handle);
     }
 
     public String setAudioEnabled(boolean enabled) {

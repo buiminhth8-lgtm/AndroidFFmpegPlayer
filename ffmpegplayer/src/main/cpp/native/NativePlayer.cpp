@@ -776,7 +776,11 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         av_dict_set(&options, "rw_timeout", timeoutValue.c_str(), 0);
     }
 
-    int result = avformat_open_input(&formatContext_, url.c_str(), nullptr, &options);
+    const int64_t openTimeoutUs = isRtspSource(sourceType) ? optionsSnapshot.openTimeoutUs
+                                  : static_cast<int64_t>(std::max(timeoutMs, 1)) * 1000;
+    readIoTimeoutUs_.store(isRtspSource(sourceType) ? optionsSnapshot.readTimeoutUs : openTimeoutUs);
+    if (isNetworkUrl(url)) networkIoDeadline_.arm(steadyNowUs(), openTimeoutUs);
+    int result = finishNetworkIo(avformat_open_input(&formatContext_, url.c_str(), nullptr, &options));
     AVDictionaryEntry *unusedOption = nullptr;
     while ((unusedOption = av_dict_get(options, "", unusedOption, AV_DICT_IGNORE_SUFFIX)) != nullptr) {
         LOGI("unused FFmpeg open option %s=%s", unusedOption->key, unusedOption->value);
@@ -801,7 +805,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
     LOGI("input session opened count=%lld sourceType=%s",
          static_cast<long long>(inputOpenCount), sourceTypeName(sourceType).c_str());
 
-    result = avformat_find_stream_info(formatContext_, nullptr);
+    if (isNetworkUrl(url)) networkIoDeadline_.arm(steadyNowUs(), openTimeoutUs);
+    result = finishNetworkIo(avformat_find_stream_info(formatContext_, nullptr));
     if (result < 0) {
         errorMessage = ffmpegErrorToString(result);
         LOGE("avformat_find_stream_info failed: %s", errorMessage.c_str());
@@ -1427,6 +1432,7 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     }
     transportSwitchRequested_.store(false);
     resetStats();
+    initialOpenError_.store(0);
     clearLastFrame();
 
     {
@@ -1452,6 +1458,19 @@ std::string NativePlayer::prepare(const std::string &url, int timeoutMs) {
     lastPrepareCostUs_.store(std::max<int64_t>(0, steadyNowUs() - prepareStartUs));
     if (result < 0) {
         preparedAtTimeMs_.store(0);
+        if (waitForInitialRtsp404(isRtspSource(sourceType_), result == AVERROR_HTTP_NOT_FOUND
+                                 || containsInsensitive(error, "404") || containsInsensitive(error, "not found"),
+                                 reconnectEnabled_.load(), reconnectOn404_.load(),
+                                 keepWaitingWhenSourceMissing_.load(),
+                                 infiniteReconnect_.load() || reconnectMaxRetryCount_.load() != 0)) {
+            initialOpenError_.store(result);
+            waitingSource_.store(true);
+            setState(PlayerState::WaitingSource, error);
+            notifyPlayerEvent("waiting_source", PlayerState::WaitingSource, 0,
+                              reconnectMaxRetryCount_.load(), 0, result, error);
+            return "{\"success\":true,\"message\":\"source missing; start will retry\","
+                   "\"state\":\"waiting_source\",\"pendingReconnect\":true}";
+        }
         setState(PlayerState::Error, error);
         return jsonError(result, error);
     }
@@ -1507,6 +1526,7 @@ std::string NativePlayer::start() {
     }
 
     bool shouldPrepareRealtimeInput = false;
+    bool initialSourceMissing = false;
     bool resumeFromPause = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1519,13 +1539,14 @@ std::string NativePlayer::start() {
             state_ = PlayerState::Playing;
             resumeFromPause = true;
         } else {
-            if (state_ != PlayerState::Prepared) {
+            initialSourceMissing = state_ == PlayerState::WaitingSource && initialOpenError_.load() < 0;
+            if (state_ != PlayerState::Prepared && !initialSourceMissing) {
                 return jsonError(-1, "player is not prepared");
             }
             if (playbackThread_.joinable()) {
                 return jsonError(-1, "playback thread is already running");
             }
-            shouldPrepareRealtimeInput = isRealtimeInput_;
+            shouldPrepareRealtimeInput = isRealtimeInput_ && !initialSourceMissing;
         }
     }
 
@@ -1548,7 +1569,7 @@ std::string NativePlayer::start() {
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != PlayerState::Prepared) {
+        if (state_ != PlayerState::Prepared && !initialSourceMissing) {
             return jsonError(-1, "player is not prepared");
         }
         stopRequested_.store(false);
@@ -1557,11 +1578,11 @@ std::string NativePlayer::start() {
         beginStartupKeyFrameWait("start");
         startPlayTimeMs_.store(nowMs());
         startToFirstFrameMs_.store(-1);
-        state_ = PlayerState::Playing;
+        state_ = initialSourceMissing ? PlayerState::WaitingSource : PlayerState::Playing;
     }
     // Restart sink/worker when monitoring is still requested. Prepare stops the
     // worker but preserves the user's audioEnabled policy.
-    if (audioEnabled_.load()) {
+    if (audioEnabled_.load() && !initialSourceMissing) {
         startAudioSinkForCurrentGeneration();
         startAudioOutputWorker();
     }
@@ -1625,6 +1646,9 @@ std::string NativePlayer::stop() {
     if (shouldJoin) {
         playbackThread_.join();
     }
+    // 重连可能在首次 audio join 与 playback join 之间完成启动；再次回收，避免遗留线程。
+    audioPcmQueue_.requestStop();
+    stopAudioOutputWorker();
     // A producer already inside conversion may observe stop after the first
     // flush. Clear once more after join; no producer remains at this point.
     audioPcmQueue_.flush();
@@ -2265,6 +2289,7 @@ std::string NativePlayer::getStats() {
         << "\"maxReadStallUs\":" << preT0Timing.maxReadStallUs << ","
         << "\"readEagainCount\":" << preT0Timing.readEagainCount << ","
         << "\"readTimeoutCount\":" << preT0Timing.readTimeoutCount << ","
+        << "\"ioDeadlineTimeoutCount\":" << ioDeadlineTimeoutCount_.load() << ","
         << "\"readEofCount\":" << preT0Timing.readEofCount << ","
         << "\"readErrorCount\":" << preT0Timing.readErrorCount << ","
         // LAT6-FINAL route B. AV_PKT_DATA_RTCP_SR supplies the RTP/NTP anchor;
@@ -3058,7 +3083,19 @@ int NativePlayer::interruptCallback(void *opaque) {
     if (player == nullptr) {
         return 0;
     }
-    return (player->stopRequested_.load() || player->transportSwitchRequested_.load()) ? 1 : 0;
+    return (player->stopRequested_.load() || player->transportSwitchRequested_.load()
+            || player->networkIoDeadline_.expired(steadyNowUs())) ? 1 : 0;
+}
+
+int NativePlayer::finishNetworkIo(int result) {
+    const bool expired = networkIoDeadline_.expired(steadyNowUs());
+    networkIoDeadline_.clear();
+    // 停止/切换保持其取消语义；网络截止时间统一上报 ETIMEDOUT 并进入正常重连。
+    if (result < 0 && expired && !stopRequested_.load() && !transportSwitchRequested_.load()) {
+        ioDeadlineTimeoutCount_.fetch_add(1);
+        return AVERROR(ETIMEDOUT);
+    }
+    return result;
 }
 
 bool NativePlayer::prepareRealtimeInputForStart() {
@@ -4047,7 +4084,7 @@ void NativePlayer::audioOutputWorkerLoop() {
 
 void NativePlayer::startAudioOutputWorker() {
     std::lock_guard<std::mutex> lock(audioWorkerMutex_);
-    if (audioOutputWorkerThread_.joinable()) {
+    if (stopRequested_.load() || audioOutputWorkerThread_.joinable()) {
         return;
     }
     audioPcmQueue_.resetForRestart();
@@ -4112,7 +4149,7 @@ void NativePlayer::resetAudioDecoderForDiscontinuity(const char *reason) {
 }
 
 void NativePlayer::startAudioSinkForCurrentGeneration() {
-    if (!audioEnabled_.load() || pauseRequested_.load() || !audioCallbackSet_.load()) {
+    if (stopRequested_.load() || !audioEnabled_.load() || pauseRequested_.load() || !audioCallbackSet_.load()) {
         return;
     }
     if (sendAudioSinkControl(kAudioSinkCmdStart, "start")) {
@@ -4527,13 +4564,7 @@ bool NativePlayer::waitForReconnectDelay(int delayMs) {
 }
 
 int NativePlayer::reconnectDelayForAttempt(int attempt) const {
-    const int initialDelayMs = std::max(100, reconnectRetryDelayMs_.load());
-    const int maxDelayMs = std::max(initialDelayMs, reconnectMaxDelayMs_.load());
-    int64_t delayMs = initialDelayMs;
-    for (int i = 1; i < attempt && delayMs < maxDelayMs; ++i) {
-        delayMs = std::min<int64_t>(delayMs * 2, maxDelayMs);
-    }
-    return static_cast<int>(std::clamp<int64_t>(delayMs, 100, maxDelayMs));
+    return reconnectBackoffMs(attempt, reconnectRetryDelayMs_.load(), reconnectMaxDelayMs_.load());
 }
 
 bool NativePlayer::shouldTreatOpenErrorAsSourceMissing(const std::string &errorMessage) const {
@@ -4701,6 +4732,10 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
     // Isolate the old audio generation immediately at disconnect. Do not let
     // queued/AudioTrack PCM play throughout reconnect delay/open retries.
     flushAudioPcmForDiscontinuity();
+    // 等待有界的音频写入退出，禁止旧代次在新 AudioTrack 启动后再次 flush/更新时间线。
+    audioPcmQueue_.requestStop();
+    stopAudioOutputWorker();
+    invalidateAudioClock();
     releaseFfmpegResources();
     resetRealtimeClock();
 
@@ -4746,6 +4781,9 @@ bool NativePlayer::reconnectInput(int readErrorCode) {
 
         std::string error;
         const int result = openInput(url_, timeoutMs_, true, error);
+        if (stopRequested_.load()) {
+            break;
+        }
         if (result >= 0) {
             reconnectSuccessCount_.fetch_add(1);
             reconnecting_.store(false);
@@ -4902,6 +4940,11 @@ bool NativePlayer::switchTransportInput() {
 // 播放主循环：读取压缩包、分流录制与音视频解码，并处理暂停、重连和直播追帧。
 void NativePlayer::playbackLoop() {
     LOGI("playback thread started player=%p", this);
+    const int initialError = initialOpenError_.exchange(0);
+    if (initialError < 0 && !reconnectInput(initialError)) {
+        if (!stopRequested_.load()) setState(PlayerState::Error, "initial source recovery failed");
+        return;
+    }
     const bool realtimeInput = isRealtimeInput_;
     const int frameDelayMs = realtimeInput ? 0 : static_cast<int>(std::clamp(1000.0 / std::max(fps_, 1.0), 5.0, 100.0));
     LOGI("playback pacing realtimeInput=%d fps=%.2f frameDelayMs=%d", realtimeInput ? 1 : 0, fps_, frameDelayMs);
@@ -4941,7 +4984,8 @@ void NativePlayer::playbackLoop() {
         }
 
         const int64_t readStartUs = steadyNowUs();
-        const int readResult = av_read_frame(formatContext_, packet_);
+        if (realtimeInput) networkIoDeadline_.arm(readStartUs, readIoTimeoutUs_.load());
+        const int readResult = finishNetworkIo(av_read_frame(formatContext_, packet_));
         const int64_t readCostUs = steadyNowUs() - readStartUs;
         recordCost(lastReadFrameCostUs_, totalReadFrameCostUs_, readFrameCostSampleCount_, maxReadFrameCostUs_,
                    readCostUs);
@@ -5851,6 +5895,7 @@ void NativePlayer::deleteSurfaceGlobalRefLocked(JNIEnv *env) {
 }
 
 void NativePlayer::resetStats() {
+    ioDeadlineTimeoutCount_.store(0);
     readPacketCount_.store(0);
     videoPacketCount_.store(0);
     audioPacketCount_.store(0);

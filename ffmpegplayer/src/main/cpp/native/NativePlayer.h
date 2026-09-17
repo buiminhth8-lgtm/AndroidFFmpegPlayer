@@ -3,6 +3,7 @@
 
 #include "PlayerRemuxRecorder.h"
 #include "PlayerOptions.h"
+#include "NetworkIoDeadline.h"
 #include "NativeYuvGlRenderer.h"
 #include "NativeOesRenderer.h"
 #include "NativeNv12GlRenderer.h"
@@ -174,6 +175,7 @@ private:
     };
 
     static int interruptCallback(void *opaque);
+    int finishNetworkIo(int result);
 
     void playbackLoop();
     int openInput(const std::string &url, int timeoutMs, bool resetStreamMetadata, std::string &errorMessage);
@@ -276,6 +278,10 @@ private:
     PlayerOptions playerOptions_;
     SourceType sourceType_ = SourceType::OTHER;
     int timeoutMs_ = 5000;
+    NetworkIoDeadline networkIoDeadline_;
+    std::atomic<int64_t> readIoTimeoutUs_{5000000};
+    std::atomic<int64_t> ioDeadlineTimeoutCount_{0};
+    std::atomic<int> initialOpenError_{0};
     bool isRealtimeInput_ = false;
     bool realtimeClockInitialized_ = false;
     int64_t realtimeFirstPtsUs_ = 0;

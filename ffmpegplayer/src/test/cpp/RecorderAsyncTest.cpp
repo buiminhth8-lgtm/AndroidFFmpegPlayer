@@ -175,6 +175,23 @@ int main() {
         const auto packets = fake::written(); CHECK(packets[2].dts > packets[0].dts);
         CHECK(packets[3].dts > packets[1].dts);
     });
+    run("reconnect missing timestamps remain explicit and monotonic", [] {
+        PlayerRemuxRecorder recorder; setInput(recorder); recorder.start("./test.mp4");
+        fake::blockIo("write"); send(recorder, 0, 1000); CHECK(fake::waitForIo());
+        setInput(recorder);
+        auto *unknown = fake::packet(0, 0, true, 32);
+        unknown->pts = unknown->dts = AV_NOPTS_VALUE;
+        unknown->duration = 40;
+        recorder.onPacket(unknown); av_packet_free(&unknown);
+        send(recorder, 0, 0); send(recorder, 0, 40); send(recorder, 1, 40);
+        fake::unblockIo(); const auto stats = recorder.stop();
+        CHECK(number(stats, "writeErrors") == 0); CHECK(number(stats, "packetsWritten") == 5);
+        const auto packets = fake::written();
+        for (size_t i = 1; i < 4; ++i) {
+            CHECK(packets[i].dts != AV_NOPTS_VALUE); CHECK(packets[i].pts >= packets[i].dts);
+            CHECK(packets[i].dts > packets[i-1].dts);
+        }
+    });
     run("changed reconnect codec stops only recorder", [] {
         PlayerRemuxRecorder recorder; setInput(recorder); recorder.start("./test.ts");
         fake::blockIo("write"); send(recorder, 0, 0); CHECK(fake::waitForIo());

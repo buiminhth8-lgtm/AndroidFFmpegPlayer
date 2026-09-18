@@ -1,0 +1,32 @@
+{
+  "serial": "ANDROID_SERIAL",
+  "url": "rtsp://USER:PASSWORD@HOST:PORT/PATH",
+  "rounds": 3,
+  "baselineSeconds": 5,
+  "faultSeconds": 12,
+  "observeSeconds": 8,
+  "detectSeconds": 15,
+  "recoverSeconds": 45,
+  "stopSeconds": 15,
+  "segmentSeconds": 5,
+  "ffprobe": "ffprobe",
+  "resourceGrowthLimits": {
+    "fdCount": 4,
+    "threadCount": 4,
+    "nativeHeapBytes": 16777216
+  },
+  "faults": {
+    "network": {
+      "apply": ["python", "LOCAL_FAULT_CONTROL.py", "network-down"],
+      "restore": ["python", "LOCAL_FAULT_CONTROL.py", "network-up"]
+    },
+    "service_restart": {
+      "apply": ["python", "LOCAL_FAULT_CONTROL.py", "service-stop"],
+      "restore": ["python", "LOCAL_FAULT_CONTROL.py", "service-start"]
+    },
+    "source_404": {
+      "apply": ["python", "LOCAL_FAULT_CONTROL.py", "source-missing"],
+      "restore": ["python", "LOCAL_FAULT_CONTROL.py", "source-restore"]
+    }
+  }
+}

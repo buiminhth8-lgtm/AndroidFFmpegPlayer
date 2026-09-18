@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug source set only; never present in the production APK. -->
+        <activity android:name=".RtspMatrixActivity" android:exported="true"
+            android:launchMode="singleTop" />
+    </application>
+</manifest>

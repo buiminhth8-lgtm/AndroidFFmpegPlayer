@@ -1,68 +1,41 @@
 plugins {
     id 'com.android.library'
-    id 'maven-publish'
 }
 
 android {
     namespace 'com.example.motro.ffmpeg'
-    compileSdk 36
+    compileSdk 35
 
     defaultConfig {
         minSdk 24
-        targetSdk 31
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
         consumerProguardFiles 'consumer-rules.pro'
+
 
         ndk {
             abiFilters "armeabi-v7a", "arm64-v8a"
         }
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    sourceSets {
-        main {
-            java {
-                srcDirs = ['../app/src/main/java']
-                exclude 'com/example/motro/MediaPlayerActivity.java'
-                exclude 'com/example/motro/MediacodecPlayerActivity.java'
-                exclude 'com/example/motro/ExoplayerPlayerActivity.java'
-                exclude 'com/example/motro/PlayerLauncherActivity.java'
-            }
-            jniLibs.srcDirs = ['../app/src/main/jniLibs']
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+
+        debug {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 
     externalNativeBuild {
         cmake {
-            path file('../app/src/main/cpp/CMakeLists.txt')
-        }
-    }
-
-    packagingOptions {
-        jniLibs {
-            useLegacyPackaging true
-        }
-    }
-
-//    compileOptions {
-//        sourceCompatibility = JavaVersion.VERSION_17
-//        targetCompatibility = JavaVersion.VERSION_17
-//    }
-
-    publishing {
-        singleVariant("release") {
-            withSourcesJar()
+            path file('src/main/cpp/CMakeLists.txt')
         }
     }
 }
 
-afterEvaluate {
-    publishing {
-        publications {
-            release(MavenPublication) {
-                from components.release
-                groupId = 'com.example.motro'
-                artifactId = 'ffmpegplayer'
-                version = '1.0.0.6'
-            }
-        }
-    }
-}

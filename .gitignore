@@ -14,3 +14,4 @@ local.properties
 __pycache__/
 /artifacts/udp_latency_ab/
 /artifacts/hevc_bframe_ab/
+/artifacts/mediacodec_low_latency_ab/

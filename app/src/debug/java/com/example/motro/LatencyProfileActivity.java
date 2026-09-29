@@ -49,6 +49,8 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
     private long playbackStartMs;
     private long latencyModeStartMs = -1;
     private long formalStartMs = -1;
+    private long steadyRenderedBaseline = -1;
+    private long resetCountBaseline = -1;
     private int warmupSec;
     private int durationSec;
     private int sampleSeq;
@@ -165,9 +167,20 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
             } else if (latencyModeStartMs >= 0 && formalStartMs < 0) {
                 phase = "LATENCY_SETTLE";
                 if (playing && stats.optBoolean("steadyStateValid", false)) {
-                    formalStartMs = now;
-                    phase = "FORMAL";
-                    Log.i(TAG, "FORMAL_STARTED");
+                    long rendered = stats.optLong("nv12GlRenderedFrameCount",
+                            stats.optLong("videoFrameCount", 0));
+                    if (steadyRenderedBaseline < 0) {
+                        steadyRenderedBaseline = rendered;
+                        Log.i(TAG, "STEADY_STATE_CONFIRMED rendered=" + rendered);
+                    } else if (rendered - steadyRenderedBaseline >= 30) {
+                        resetCountBaseline = stats.optLong("formalDiagnosticsResetCount", 0);
+                        requireSuccess("reset formal diagnostics",
+                                player.setPlayerOption("reset_formal_diagnostics", "true"));
+                        formalStartMs = now;
+                        phase = "FORMAL";
+                        Log.i(TAG, "FORMAL_STARTED afterExtraFrames="
+                                + (rendered - steadyRenderedBaseline));
+                    }
                 }
             } else if (formalStartMs >= 0) {
                 phase = "FORMAL";
@@ -196,6 +209,13 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
                     + stats.optString("actualDecoderName"));
 
             if (formalStartMs >= 0) {
+                if (now - formalStartMs >= 5000L
+                        && stats.optLong("formalDiagnosticsResetCount", 0) <= resetCountBaseline) {
+                    fail("DIAGNOSTICS_RESET_NOT_APPLIED", new IllegalStateException(
+                            "resetCount=" + stats.optLong("formalDiagnosticsResetCount", 0)
+                                    + ", baseline=" + resetCountBaseline));
+                    return;
+                }
                 if (!playing || reconnectSeen.get()
                         || stats.optLong("reconnectAttemptCount", 0) > 0
                         || stats.optLong("readTimeoutCount", 0) > 0

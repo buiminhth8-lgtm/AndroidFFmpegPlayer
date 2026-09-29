@@ -12,3 +12,4 @@ local.properties
 /artifacts/latency_5min/
 /artifacts/latency_5min_pending*/
 __pycache__/
+/artifacts/udp_latency_ab/

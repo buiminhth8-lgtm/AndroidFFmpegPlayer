@@ -203,6 +203,7 @@ private:
     void recordVideoStageTiming(int64_t generation, int64_t ptsUs, StageTimingPoint stage, int64_t monoUs);
     void recordStageTimingRenderSubmit(int64_t ptsUs);
     void resetStageTimingCorrelation();
+    void resetFormalDiagnosticsWindow();
     bool finalizeStageTiming(VideoStageTiming &record);
     bool renderFrame(AVFrame *frame);
     bool renderMediaCodecFrame(AVFrame *frame, int64_t ptsUs);
@@ -422,6 +423,11 @@ private:
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};
+    std::atomic<int64_t> latePacketDropCount_{0};
+    std::atomic<int64_t> lateFrameDropCount_{0};
+    std::atomic<int64_t> latestFrameReplaceCount_{0};
+    std::atomic<int64_t> catchUpDropCount_{0};
+    std::atomic<int64_t> dropUntilKeyFrameCount_{0};
     std::atomic<bool> startupKeyFrameWaitActive_{false};
     std::atomic<int64_t> startupKeyFrameDroppedPacketCount_{0};
     std::atomic<int64_t> lastFrameCacheUpdateCount_{0};
@@ -489,6 +495,9 @@ private:
     std::atomic<int64_t> stageTimingResetCount_{0};
     std::atomic<int64_t> stageTimingClockAnomalyCount_{0};
     std::atomic<bool> steadyStateValid_{false};
+    // 由控制线程发起、播放线程执行，避免清理阶段关联队列时产生竞态。
+    std::atomic<bool> formalDiagnosticsResetRequested_{false};
+    std::atomic<int64_t> formalDiagnosticsResetCount_{0};
     std::atomic<int64_t> lastAudioFrameTimeMs_{0};
     std::atomic<int64_t> lastRenderTimeMs_{0};
     std::atomic<int64_t> lastSnapshotTimeMs_{0};
@@ -511,6 +520,9 @@ private:
     // PRFT is correlated by construction to the same AVPacket/T0. The
     // distribution remains empty while cross-device clock error is unknown.
     std::atomic<int64_t> lastSendPacketCostUs_{-1};
+    std::atomic<int64_t> totalSendPacketCostUs_{0};
+    std::atomic<int64_t> sendPacketCostSampleCount_{0};
+    std::atomic<int64_t> maxSendPacketCostUs_{0};
     std::atomic<int64_t> lastReceiveFrameCostUs_{-1};
     std::atomic<int64_t> totalDecodeCostUs_{0};
     std::atomic<int64_t> decodeCostSampleCount_{0};

@@ -1868,6 +1868,7 @@ std::string NativePlayer::getStats() {
         audioLifecycleState = "playing";
     }
     const int64_t avgReadFrameCostUs = averageUs(totalReadFrameCostUs_.load(), readFrameCostSampleCount_.load());
+    const int64_t avgSendPacketCostUs = averageUs(totalSendPacketCostUs_.load(), sendPacketCostSampleCount_.load());
     const int64_t avgDecodeCostUs = averageUs(totalDecodeCostUs_.load(), decodeCostSampleCount_.load());
     const int64_t avgSwsScaleCostUs = averageUs(totalSwsScaleCostUs_.load(), swsScaleCostSampleCount_.load());
     const int64_t avgRenderCostUs = averageUs(totalRenderCostUs_.load(), renderCostSampleCount_.load());
@@ -2356,7 +2357,13 @@ std::string NativePlayer::getStats() {
         << "\"srSendToReceiverT0ValidCount\":" << e2eDist.validCount << ","
         << "\"effectiveFmtCtxMaxDelayUs\":" << effectiveFmtCtxMaxDelayUs_.load() << ","
         << "\"lastSendPacketCostUs\":" << lastSendPacketCostUs_.load() << ","
+        << "\"avgSendPacketCostUs\":" << avgSendPacketCostUs << ","
+        << "\"maxSendPacketCostUs\":" << maxSendPacketCostUs_.load() << ","
+        << "\"sendPacketCostSampleCount\":" << sendPacketCostSampleCount_.load() << ","
         << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
+        << "\"avgReceiveFrameCostUs\":" << avgDecodeCostUs << ","
+        << "\"maxReceiveFrameCostUs\":" << maxDecodeCostUs_.load() << ","
+        << "\"receiveFrameCostSampleCount\":" << decodeCostSampleCount_.load() << ","
         << "\"avgDecodeCostUs\":" << avgDecodeCostUs << ","
         << "\"maxDecodeCostUs\":" << maxDecodeCostUs_.load() << ","
         << "\"lastSwsScaleCostUs\":" << lastSwsScaleCostUs_.load() << ","
@@ -2377,6 +2384,14 @@ std::string NativePlayer::getStats() {
         << "\"droppedVideoPacketCount\":" << droppedVideoPacketCount_.load() << ","
         << "\"packetDropBeforeDecodeCount\":" << packetDropBeforeDecodeCount_.load() << ","
         << "\"frameDropBeforeRenderCount\":" << frameDropBeforeRenderCount_.load() << ","
+        << "\"softwareDroppedFrameCount\":"
+        << std::max<int64_t>(0, droppedVideoFrameCount_.load() - hardwareDroppedFrameCount_.load()) << ","
+        << "\"latePacketDropCount\":" << latePacketDropCount_.load() << ","
+        << "\"lateFrameDropCount\":" << lateFrameDropCount_.load() << ","
+        << "\"latestFrameReplaceCount\":" << latestFrameReplaceCount_.load() << ","
+        << "\"catchUpDropCount\":" << catchUpDropCount_.load() << ","
+        << "\"dropUntilKeyFrameCount\":" << dropUntilKeyFrameCount_.load() << ","
+        << "\"formalDiagnosticsResetCount\":" << formalDiagnosticsResetCount_.load() << ","
         << "\"startupKeyFrameWaitActive\":" << (startupKeyFrameWaitActive_.load() ? "true" : "false") << ","
         << "\"startupKeyFrameDroppedPacketCount\":" << startupKeyFrameDroppedPacketCount_.load() << ","
         << "\"lastFrameCacheUpdateCount\":" << lastFrameCacheUpdateCount_.load() << ","
@@ -2602,6 +2617,13 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
         out << "{\"success\":true,\"message\":\"diagnostics mode updated\","
             << "\"diagnosticsMode\":\"" << diagnosticsModeName(parsedMode) << "\"}";
         return out.str();
+    }
+    if (normalizedKey == "reset_formal_diagnostics") {
+        if (!diagnostics_.latencyEnabled()) {
+            return jsonError(-1, "reset_formal_diagnostics requires latency diagnostics");
+        }
+        formalDiagnosticsResetRequested_.store(true);
+        return "{\"success\":true,\"message\":\"formal diagnostics reset requested\"}";
     }
     if (normalizedKey == "enable_hardware_decode") {
         bool enabled = false;
@@ -3439,6 +3461,33 @@ void NativePlayer::resetStageTimingCorrelation() {
     // LAT3: clear steady-state distribution windows and warm-up gate.
     diagnostics_.resetLatency();
     steadyStateValid_.store(false);
+}
+
+void NativePlayer::resetFormalDiagnosticsWindow() {
+    resetStageTimingCorrelation();
+    // 预热已由测试驱动完成；复位后从下一帧开始记录正式分布。
+    stageTimingSampleCount_.store(kStageTimingWarmupSamples);
+    steadyStateValid_.store(true);
+    diagnostics_.resetPreT0();
+    lastSendPacketCostUs_.store(-1);
+    totalSendPacketCostUs_.store(0);
+    sendPacketCostSampleCount_.store(0);
+    maxSendPacketCostUs_.store(0);
+    lastReceiveFrameCostUs_.store(-1);
+    totalDecodeCostUs_.store(0);
+    decodeCostSampleCount_.store(0);
+    maxDecodeCostUs_.store(0);
+    nv12GlLastRenderCostUs_.store(-1);
+    nv12GlTotalRenderCostUs_.store(0);
+    nv12GlRenderCostSampleCount_.store(0);
+    nv12GlMaxRenderCostUs_.store(0);
+    nv12GlLastUploadCostUs_.store(-1);
+    nv12GlTotalUploadCostUs_.store(0);
+    nv12GlUploadCostSampleCount_.store(0);
+    nv12GlMaxUploadCostUs_.store(0);
+    formalDiagnosticsResetCount_.fetch_add(1);
+    LOGI("formal diagnostics window reset count=%lld",
+         static_cast<long long>(formalDiagnosticsResetCount_.load()));
 }
 
 bool NativePlayer::finalizeStageTiming(VideoStageTiming &record) {
@@ -4503,6 +4552,7 @@ bool NativePlayer::shouldDropRealtimePacket(const AVPacket *packet) {
 
     droppedVideoPacketCount_.fetch_add(1);
     packetDropBeforeDecodeCount_.fetch_add(1);
+    latePacketDropCount_.fetch_add(1);
     const int64_t nowMsValue = nowMs();
     if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
         LOGE("drop realtime video packet before decode delayUs=%lld ptsUs=%lld masterClockUs=%lld thresholdUs=%lld master=%s",
@@ -4544,6 +4594,7 @@ bool NativePlayer::shouldDropRealtimeFrame(int64_t ptsUs) {
 
     droppedVideoFrameCount_.fetch_add(1);
     frameDropBeforeRenderCount_.fetch_add(1);
+    lateFrameDropCount_.fetch_add(1);
     const int64_t nowMsValue = nowMs();
     if (nowMsValue - lastRealtimeDropLogMs_ > 1000) {
         LOGE("drop realtime frame before render delayUs=%lld ptsUs=%lld masterClockUs=%lld thresholdUs=%lld master=%s",
@@ -4964,6 +5015,9 @@ void NativePlayer::playbackLoop() {
     int64_t sessionReadPacketCount = 0;
 
     while (!stopRequested_.load()) {
+        if (formalDiagnosticsResetRequested_.exchange(false)) {
+            resetFormalDiagnosticsWindow();
+        }
         if (transportSwitchRequested_.exchange(false)) {
             if (!switchTransportInput()) {
                 break;
@@ -5136,8 +5190,11 @@ void NativePlayer::playbackLoop() {
                 if ((packet_->flags & AV_PKT_FLAG_KEY) == 0) {
                     droppedVideoPacketCount_.fetch_add(1);
                     packetDropBeforeDecodeCount_.fetch_add(1);
+                    dropUntilKeyFrameCount_.fetch_add(1);
                     if (startupKeyFrameWait_) {
                         startupKeyFrameDroppedPacketCount_.fetch_add(1);
+                    } else {
+                        catchUpDropCount_.fetch_add(1);
                     }
                     av_packet_unref(packet_);
                     continue;
@@ -5155,7 +5212,8 @@ void NativePlayer::playbackLoop() {
         if (packet_->stream_index == videoStreamIndex_) {
             const int64_t sendStartUs = steadyNowUs();
             int result = avcodec_send_packet(videoCodecContext_, packet_);
-            lastSendPacketCostUs_.store(steadyNowUs() - sendStartUs);
+            recordCost(lastSendPacketCostUs_, totalSendPacketCostUs_, sendPacketCostSampleCount_,
+                       maxSendPacketCostUs_, steadyNowUs() - sendStartUs);
             if (result < 0) {
                 const std::string error = ffmpegErrorToString(result);
                 LOGE("avcodec_send_packet error: %s", error.c_str());
@@ -5241,6 +5299,7 @@ void NativePlayer::playbackLoop() {
                     if (hasLatestFrame) {
                         droppedVideoFrameCount_.fetch_add(1);
                         frameDropBeforeRenderCount_.fetch_add(1);
+                        latestFrameReplaceCount_.fetch_add(1);
                     }
                     av_frame_unref(latestFrame_);
                     av_frame_move_ref(latestFrame_, decodedFrame_);
@@ -6022,6 +6081,11 @@ void NativePlayer::resetStats() {
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);
+    latePacketDropCount_.store(0);
+    lateFrameDropCount_.store(0);
+    latestFrameReplaceCount_.store(0);
+    catchUpDropCount_.store(0);
+    dropUntilKeyFrameCount_.store(0);
     startupKeyFrameWaitActive_.store(false);
     startupKeyFrameDroppedPacketCount_.store(0);
     lastFrameCacheUpdateCount_.store(0);
@@ -6062,6 +6126,9 @@ void NativePlayer::resetStats() {
     readFrameCostSampleCount_.store(0);
     maxReadFrameCostUs_.store(0);
     lastSendPacketCostUs_.store(-1);
+    totalSendPacketCostUs_.store(0);
+    sendPacketCostSampleCount_.store(0);
+    maxSendPacketCostUs_.store(0);
     lastReceiveFrameCostUs_.store(-1);
     totalDecodeCostUs_.store(0);
     decodeCostSampleCount_.store(0);
@@ -6099,6 +6166,8 @@ void NativePlayer::resetStats() {
     renderedPtsBackwardCount_.store(0);
     latencyPtsResetCount_.store(0);
     stageTimingResetCount_.store(0);
+    formalDiagnosticsResetRequested_.store(false);
+    formalDiagnosticsResetCount_.store(0);
 }
 
 void NativePlayer::releaseFfmpegResources() {

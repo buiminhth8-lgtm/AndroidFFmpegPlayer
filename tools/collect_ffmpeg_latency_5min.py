@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -265,8 +266,12 @@ def make_report(output: Path, samples: list[dict], cpu_rows: list[dict], mem_row
     java_heap_values = [x.get("javaHeapUsedBytes", 0) / 1024 for x in formal if x.get("javaHeapUsedBytes")]
     pss_points = [(x["formalElapsedMs"] / 1000, float(x["pssKb"])) for x in mem_rows
                   if x.get("phase") == "FORMAL" and x.get("pssKb")]
-    delta_keys = ["hardwareDroppedFrameCount", "reconnectAttemptCount", "reconnectSuccessCount",
-                  "readTimeoutCount", "readEofCount", "readErrorCount", "videoPtsBackwardCount",
+    delta_keys = ["hardwareDroppedFrameCount", "softwareDroppedFrameCount", "droppedVideoPacketCount",
+                  "packetDropBeforeDecodeCount", "droppedVideoFrameCount", "frameDropBeforeRenderCount",
+                  "latePacketDropCount", "lateFrameDropCount", "latestFrameReplaceCount", "catchUpDropCount",
+                  "dropUntilKeyFrameCount", "startupKeyFrameDroppedPacketCount",
+                  "reconnectAttemptCount", "reconnectSuccessCount",
+                  "readTimeoutCount", "readEagainCount", "readEofCount", "readErrorCount", "videoPtsBackwardCount",
                   "decoderPtsBackwardCount", "decodedPtsBackwardCount", "renderedPtsBackwardCount",
                   "stageTimingForcedEvictionCount", "stageTimingClockAnomalyCount", "nv12GlFallbackFrameCount",
                   "nv12GlNoSurfaceFrameCount"]
@@ -293,12 +298,17 @@ def make_report(output: Path, samples: list[dict], cpu_rows: list[dict], mem_row
     pass_run = valid_elapsed >= 300 and all(counters.get(k, 0) == 0 for k in
         ["reconnectAttemptCount", "readTimeoutCount", "readEofCount", "readErrorCount",
          "stageTimingClockAnomalyCount", "nv12GlFallbackFrameCount", "nv12GlNoSurfaceFrameCount"])
+    effective_keys = ["effectiveRtspTransport", "rtspTransport", "latencyMode", "socketBufferSize",
+                      "maxDelayUs", "effectiveFmtCtxMaxDelayUs", "reorderQueueSize", "fflagsNoBuffer",
+                      "avioDirect", "enablePacketDrop", "enableFrameDrop", "enableLatestFrameOnly",
+                      "dropLatePacketThresholdUs", "dropLateFrameThresholdUs", "probesize", "analyzeduration"]
     summary = {
         "status": "PASS" if pass_run else "FAIL",
         "validFormalDurationSec": valid_elapsed,
         "sampleIntervalSec": elapsed / max(1, len(formal) - 1),
         "formalSampleCount": len(formal),
         "configuration": config,
+        "effectiveConfiguration": {key: b.get(key) for key in effective_keys},
         "source": {
             "videoCodec": b.get("videoCodec"), "audioCodec": b.get("audioCodec"),
             "audioPacketCountDelta": b.get("audioPacketCount", 0) - a.get("audioPacketCount", 0),
@@ -326,14 +336,20 @@ def make_report(output: Path, samples: list[dict], cpu_rows: list[dict], mem_row
                       "pssSlopeKbPerMinute": linear_slope_per_minute(pss_points)},
         "decoderApiCost": {
             "lastSendPacketUs": b.get("lastSendPacketCostUs"),
+            "sendAvgUs": b.get("avgSendPacketCostUs"), "sendMaxUs": b.get("maxSendPacketCostUs"),
+            "sendCount": b.get("sendPacketCostSampleCount"),
             "lastReceiveFrameUs": b.get("lastReceiveFrameCostUs"),
-            "decodeApiAvgUs": b.get("avgDecodeCostUs"), "decodeApiMaxUs": b.get("maxDecodeCostUs"),
+            "receiveAvgUs": b.get("avgReceiveFrameCostUs", b.get("avgDecodeCostUs")),
+            "receiveMaxUs": b.get("maxReceiveFrameCostUs", b.get("maxDecodeCostUs")),
+            "receiveCount": b.get("receiveFrameCostSampleCount", b.get("decodeCostSampleCount")),
         },
         "nv12Egl": {
             "uploadAvgUs": b.get("avgNv12GlUploadCostUs"), "uploadMaxUs": b.get("maxNv12GlUploadCostUs"),
             "renderAvgUs": b.get("avgNv12GlRenderCostUs"), "renderMaxUs": b.get("maxNv12GlRenderCostUs"),
             "eglContextCreateCount": b.get("nv12EglContextCreateCount"),
             "eglSurfaceCreateCount": b.get("nv12EglSurfaceCreateCount"),
+            "fallbackFrameCountDelta": counters.get("nv12GlFallbackFrameCount", 0),
+            "noSurfaceFrameCountDelta": counters.get("nv12GlNoSurfaceFrameCount", 0),
         },
         "stabilityCounterDeltas": counters,
         "logHealth": log_health,
@@ -398,9 +414,9 @@ def make_report(output: Path, samples: list[dict], cpu_rows: list[dict], mem_row
         f"- NV12 上传 avg/max：{summary['nv12Egl']['uploadAvgUs'] / 1000:.3f}/{summary['nv12Egl']['uploadMaxUs'] / 1000:.3f} ms；"
         f"NV12 GL 渲染 avg/max：{summary['nv12Egl']['renderAvgUs'] / 1000:.3f}/{summary['nv12Egl']['renderMaxUs'] / 1000:.3f} ms。",
         f"- EGL context/surface 创建次数：{summary['nv12Egl']['eglContextCreateCount']}/{summary['nv12Egl']['eglSurfaceCreateCount']}。",
-        f"- MediaCodec API：最后一次 send/receive {summary['decoderApiCost']['lastSendPacketUs']}/"
-        f"{summary['decoderApiCost']['lastReceiveFrameUs']} µs；组合 decode API avg/max "
-        f"{summary['decoderApiCost']['decodeApiAvgUs']}/{summary['decoderApiCost']['decodeApiMaxUs']} µs。",
+        f"- MediaCodec API：send avg/max {summary['decoderApiCost']['sendAvgUs']}/"
+        f"{summary['decoderApiCost']['sendMaxUs']} µs；receive avg/max "
+        f"{summary['decoderApiCost']['receiveAvgUs']}/{summary['decoderApiCost']['receiveMaxUs']} µs。",
         f"- Logcat 检查：FATAL EXCEPTION={log_health['fatalExceptionCount']}，ANR={log_health['anrCount']}，"
         f"native fatal signal={log_health['nativeFatalSignalCount']}，GC events={log_health['gcEventCount']}。",
         "", "## 口径与边界", "",
@@ -563,6 +579,13 @@ def main() -> int:
         remote = f"/sdcard/Android/data/{PACKAGE}/files/latency_5min/device"
         for name in ["samples.jsonl", "events.jsonl", "config.json", "result.json", "status.json"]:
             run(adb.base + ["pull", f"{remote}/{name}", str(output / name)], check=False, timeout=120)
+        config_path = output / "config.json"
+        device_config = json.loads(config_path.read_text(encoding="utf-8"))
+        apk_path = root / "app/build/outputs/apk/debug/app-debug.apk"
+        device_config["sourceUrlSha256"] = hashlib.sha256(args.url.encode("utf-8")).hexdigest()
+        device_config["gitHead"] = run(["git", "rev-parse", "HEAD"], timeout=30)
+        device_config["apkSha256"] = hashlib.sha256(apk_path.read_bytes()).hexdigest()
+        config_path.write_text(json.dumps(device_config, ensure_ascii=False, indent=2), encoding="utf-8")
         samples = [json.loads(line) for line in (output / "samples.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
         for sample in samples:
             if "stats" in sample and "url" in sample["stats"]: sample["stats"]["url"] = "<RTSP_URL>"

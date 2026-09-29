@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LAT6 Latency Test Pattern (external visual ground truth)</title>
+<!--
+  LAT6 Level 3 external glass-to-glass ground truth source pattern.
+
+  Usage (see RTSP_LATENCY_SLICE_LAT6_END_TO_END_TIMEBASE_REPORT.md):
+    1. Open this file fullscreen on a display and point the RTSP camera at it.
+       The camera stream then carries this pattern; the Android receiver shows
+       it on its screen.
+    2. With a second high-frame-rate camera, photograph BOTH screens (the
+       pattern display and the Android receiver screen) in the same frames.
+    3. Glass-to-glass = time between the same pattern event visible on the
+       source display and on the receiver screen, read off the frame-by-frame
+       capture.
+
+  This tool is DIAGNOSTICS ONLY. It renders real wall-clock values; it never
+  fabricates or interpolates latency numbers.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #wrap { display: flex; flex-direction: column; height: 100%;
+          font-family: monospace; color: #fff; user-select: none; }
+  #clock { font-size: 18vw; text-align: center; flex: 1;
+           display: flex; align-items: center; justify-content: center; }
+  #meta { font-size: 4vw; text-align: center; padding-bottom: 2vh; }
+  #leds { display: flex; height: 12vh; }
+  .blk { flex: 1; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="clock">--</div>
+  <div id="meta">frame=-- unixMs=--</div>
+  <div id="leds"></div>
+</div>
+<script>
+(function () {
+  var clock = document.getElementById('clock');
+  var meta = document.getElementById('meta');
+  var leds = document.getElementById('leds');
+  for (var i = 0; i < 10; ++i) {
+    var b = document.createElement('div');
+    b.className = 'blk';
+    leds.appendChild(b);
+  }
+  var blocks = leds.children;
+  var frame = 0;
+  function render() {
+    // Real wall clock only. Integer ms; no smoothing, no interpolation.
+    var unixMs = Date.now();
+    clock.textContent = String(unixMs % 100000);
+    meta.textContent = 'frame=' + frame + ' unixMs=' + unixMs;
+    // 100 ms LED block toggle: exactly one block lit, advancing every 100 ms,
+    // so a captured video sequence shows unambiguous 100 ms time steps.
+    var lit = Math.floor(unixMs / 100) % blocks.length;
+    for (var i = 0; i < blocks.length; ++i) {
+      blocks[i].style.background = (i === lit) ? '#fff' : '#000';
+    }
+    ++frame;
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>

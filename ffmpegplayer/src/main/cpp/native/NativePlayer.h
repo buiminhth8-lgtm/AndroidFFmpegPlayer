@@ -458,6 +458,15 @@ private:
     std::atomic<int64_t> videoPtsGeneration_{0};
     std::atomic<int64_t> latestVideoPacketPtsUs_{-1};
     std::atomic<bool> videoPacketPtsValid_{false};
+    // 解码器重排诊断：保留输入 DTS 与最近输出帧属性，便于区分 B 帧重排和固定硬解流水线。
+    std::atomic<int64_t> latestVideoPacketDtsUs_{-1};
+    std::atomic<bool> videoPacketDtsValid_{false};
+    std::atomic<int> videoCodecHasBFrames_{-1};
+    std::atomic<int> videoCodecDelay_{-1};
+    std::atomic<int> lastDecodedFramePictType_{0};
+    std::atomic<bool> lastDecodedFrameKeyFrame_{false};
+    std::atomic<int64_t> lastDecodedFrameDtsUs_{-1};
+    std::atomic<bool> decodedFrameDtsValid_{false};
     std::atomic<int64_t> latestDecoderInputPtsUs_{-1};
     std::atomic<bool> decoderInputPtsValid_{false};
     std::atomic<int64_t> latestDecodedFramePtsUs_{-1};

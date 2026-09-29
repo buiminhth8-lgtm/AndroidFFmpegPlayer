@@ -533,6 +533,19 @@ std::string decoderName(const AVCodec *codec) {
     return codec != nullptr && codec->name != nullptr ? codec->name : "";
 }
 
+const char *pictureTypeName(int pictureType) {
+    switch (pictureType) {
+        case AV_PICTURE_TYPE_I: return "I";
+        case AV_PICTURE_TYPE_P: return "P";
+        case AV_PICTURE_TYPE_B: return "B";
+        case AV_PICTURE_TYPE_S: return "S";
+        case AV_PICTURE_TYPE_SI: return "SI";
+        case AV_PICTURE_TYPE_SP: return "SP";
+        case AV_PICTURE_TYPE_BI: return "BI";
+        default: return "unknown";
+    }
+}
+
 bool parseBoolOption(const std::string &value, bool &out) {
     const std::string normalized = lowerTrimCopy(value);
     if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
@@ -1045,6 +1058,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         if (useHardware) {
             LOGI("avcodec_open2 hardware success decoder=%s", decoderName(decoder).c_str());
         }
+        videoCodecHasBFrames_.store(videoCodecContext_->has_b_frames);
+        videoCodecDelay_.store(videoCodecContext_->delay);
         const int64_t decoderOpenCount = videoDecoderOpenCount_.fetch_add(1) + 1;
         const int64_t hardwareOpenCount = useHardware
                                           ? hardwareDecoderOpenCount_.fetch_add(1) + 1
@@ -1958,6 +1973,11 @@ std::string NativePlayer::getStats() {
         << "\"videoCodec\":\"" << escapeJson(videoCodec) << "\","
         << "\"videoCodecName\":\"" << escapeJson(videoCodec) << "\","
         << "\"decoderName\":\"" << escapeJson(optionsSnapshot.actualDecoderName) << "\","
+        << "\"videoCodecHasBFrames\":" << videoCodecHasBFrames_.load() << ","
+        << "\"videoCodecDelay\":" << videoCodecDelay_.load() << ","
+        << "\"lastDecodedFramePictType\":\"" << pictureTypeName(lastDecodedFramePictType_.load()) << "\","
+        << "\"lastDecodedFramePictTypeValue\":" << lastDecodedFramePictType_.load() << ","
+        << "\"lastDecodedFrameKeyFrame\":" << (lastDecodedFrameKeyFrame_.load() ? "true" : "false") << ","
         << "\"frameFormat\":\"" << escapeJson(frameFormatName.empty() ? "unknown" : frameFormatName) << "\","
         << "\"enableHardwareDecode\":" << (optionsSnapshot.enableHardwareDecode ? "true" : "false") << ","
         << "\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\","
@@ -2034,10 +2054,14 @@ std::string NativePlayer::getStats() {
         << "\"videoPtsGeneration\":" << videoPtsGeneration_.load() << ","
         << "\"latestVideoPacketPtsUs\":" << latestVideoPacketPtsUs_.load() << ","
         << "\"videoPacketPtsValid\":" << (videoPacketPtsValid_.load() ? "true" : "false") << ","
+        << "\"latestVideoPacketDtsUs\":" << latestVideoPacketDtsUs_.load() << ","
+        << "\"videoPacketDtsValid\":" << (videoPacketDtsValid_.load() ? "true" : "false") << ","
         << "\"latestDecoderInputPtsUs\":" << latestDecoderInputPtsUs_.load() << ","
         << "\"decoderInputPtsValid\":" << (decoderInputPtsValid_.load() ? "true" : "false") << ","
         << "\"latestDecodedFramePtsUs\":" << latestDecodedFramePtsUs_.load() << ","
         << "\"decodedFramePtsValid\":" << (decodedFramePtsValid_.load() ? "true" : "false") << ","
+        << "\"lastDecodedFrameDtsUs\":" << lastDecodedFrameDtsUs_.load() << ","
+        << "\"decodedFrameDtsValid\":" << (decodedFrameDtsValid_.load() ? "true" : "false") << ","
         << "\"latestRenderedFramePtsUs\":" << latestRenderedFramePtsUs_.load() << ","
         << "\"renderedFramePtsValid\":" << (renderedFramePtsValid_.load() ? "true" : "false") << ","
         << "\"maxVideoPacketPtsUs\":" << maxVideoPkt << ","
@@ -3346,6 +3370,12 @@ void NativePlayer::resetVideoPtsDiagnostics() {
     videoPtsGeneration_.fetch_add(1);
     latestVideoPacketPtsUs_.store(-1);
     videoPacketPtsValid_.store(false);
+    latestVideoPacketDtsUs_.store(-1);
+    videoPacketDtsValid_.store(false);
+    lastDecodedFramePictType_.store(AV_PICTURE_TYPE_NONE);
+    lastDecodedFrameKeyFrame_.store(false);
+    lastDecodedFrameDtsUs_.store(-1);
+    decodedFrameDtsValid_.store(false);
     latestDecoderInputPtsUs_.store(-1);
     decoderInputPtsValid_.store(false);
     latestDecodedFramePtsUs_.store(-1);
@@ -5140,6 +5170,19 @@ void NativePlayer::playbackLoop() {
                 if (!packetPtsValid) {
                     latestVideoPacketPtsUs_.store(-1);
                 }
+                bool packetDtsValid = false;
+                if (packet_->dts != AV_NOPTS_VALUE) {
+                    const int64_t packetDtsUs = rescaleToUs(packet_->dts,
+                                                           formatContext_->streams[videoStreamIndex_]->time_base);
+                    if (isValidPts(packetDtsUs)) {
+                        latestVideoPacketDtsUs_.store(packetDtsUs);
+                        packetDtsValid = true;
+                    }
+                }
+                videoPacketDtsValid_.store(packetDtsValid);
+                if (!packetDtsValid) {
+                    latestVideoPacketDtsUs_.store(-1);
+                }
             }
             // LAT5: video packet return gap / PTS delta / burst detection.
             // monoUs is T0 (R1); invalid PTS never fabricates a delta.
@@ -5269,6 +5312,23 @@ void NativePlayer::playbackLoop() {
                     break;
                 }
                 recordCost(lastReceiveFrameCostUs_, totalDecodeCostUs_, decodeCostSampleCount_, maxDecodeCostUs_, receiveCostUs);
+
+                lastDecodedFramePictType_.store(static_cast<int>(decodedFrame_->pict_type));
+                lastDecodedFrameKeyFrame_.store((decodedFrame_->flags & AV_FRAME_FLAG_KEY) != 0);
+                bool frameDtsValid = false;
+                if (diagnostics_.basicEnabled() && formatContext_ != nullptr && videoStreamIndex_ >= 0
+                    && decodedFrame_->pkt_dts != AV_NOPTS_VALUE) {
+                    const int64_t frameDtsUs = rescaleToUs(decodedFrame_->pkt_dts,
+                                                          formatContext_->streams[videoStreamIndex_]->time_base);
+                    if (isValidPts(frameDtsUs)) {
+                        lastDecodedFrameDtsUs_.store(frameDtsUs);
+                        frameDtsValid = true;
+                    }
+                }
+                decodedFrameDtsValid_.store(frameDtsValid);
+                if (!frameDtsValid) {
+                    lastDecodedFrameDtsUs_.store(-1);
+                }
 
                 // LAT1 P2: decoded frame output from the decoder (media timeline us).
                 if (diagnostics_.basicEnabled() && formatContext_ != nullptr && videoStreamIndex_ >= 0) {
@@ -6159,6 +6219,8 @@ void NativePlayer::resetStats() {
     lastReconnectErrorCode_.store(0);
     lastReconnectError_.clear();
     lastFrameFormatName_.clear();
+    videoCodecHasBFrames_.store(-1);
+    videoCodecDelay_.store(-1);
     resetVideoPtsDiagnostics();
     videoPtsBackwardCount_.store(0);
     decoderPtsBackwardCount_.store(0);

@@ -13,3 +13,4 @@ local.properties
 /artifacts/latency_5min_pending*/
 __pycache__/
 /artifacts/udp_latency_ab/
+/artifacts/hevc_bframe_ab/

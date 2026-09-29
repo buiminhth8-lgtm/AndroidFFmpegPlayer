@@ -9,3 +9,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+/artifacts/latency_5min/
+/artifacts/latency_5min_pending*/
+__pycache__/

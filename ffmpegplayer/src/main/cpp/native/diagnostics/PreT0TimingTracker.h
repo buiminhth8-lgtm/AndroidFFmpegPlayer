@@ -56,6 +56,9 @@ public:
         int64_t videoReturnGapDistCount = 0;
         int64_t lastVideoPtsDeltaUs = -1;
         int64_t avgVideoPtsDeltaUs = 0;
+        int64_t videoPtsDeltaP50Us = 0;
+        int64_t videoPtsDeltaP95Us = 0;
+        int64_t videoPtsDeltaP99Us = 0;
         int64_t maxVideoPtsDeltaUs = 0;
         int64_t videoPtsDeltaSampleCount = 0;
         int64_t fastReturnPacketCount = 0;
@@ -158,6 +161,10 @@ public:
         snap.videoReturnGapP95Us = gapDist.p95;
         snap.videoReturnGapP99Us = gapDist.p99;
         snap.videoReturnGapDistCount = gapDist.count;
+        const LatencyDistribution::Snapshot ptsDeltaDist = videoPtsDeltaDist_.snapshot();
+        snap.videoPtsDeltaP50Us = ptsDeltaDist.p50;
+        snap.videoPtsDeltaP95Us = ptsDeltaDist.p95;
+        snap.videoPtsDeltaP99Us = ptsDeltaDist.p99;
         return snap;
     }
 
@@ -225,6 +232,7 @@ public:
                 lastVideoPtsDeltaUs_ = deltaUs;
                 totalVideoPtsDeltaUs_ += deltaUs;
                 ++videoPtsDeltaSampleCount_;
+                videoPtsDeltaDist_.addSample(deltaUs);
                 if (deltaUs > maxVideoPtsDeltaUs_) {
                     maxVideoPtsDeltaUs_ = deltaUs;
                 }
@@ -248,6 +256,7 @@ public:
         lastVideoPtsDeltaUs_ = -1;
         totalVideoPtsDeltaUs_ = 0;
         videoPtsDeltaSampleCount_ = 0;
+        videoPtsDeltaDist_.reset();
         maxVideoPtsDeltaUs_ = 0;
         previousVideoPacketPtsUs_ = -1;
         fastReturnPacketCount_ = 0;
@@ -284,6 +293,7 @@ private:
     int64_t lastVideoPtsDeltaUs_ = -1;
     int64_t totalVideoPtsDeltaUs_ = 0;
     int64_t videoPtsDeltaSampleCount_ = 0;
+    LatencyDistribution videoPtsDeltaDist_;
     int64_t maxVideoPtsDeltaUs_ = 0;
     int64_t previousVideoPacketPtsUs_ = -1;
     int64_t fastReturnPacketCount_ = 0;

@@ -3,5 +3,10 @@
         <!-- Debug source set only; never present in the production APK. -->
         <activity android:name=".RtspMatrixActivity" android:exported="true"
             android:launchMode="singleTop" />
+        <activity
+            android:name=".LatencyProfileActivity"
+            android:exported="true"
+            android:label="Latency profile"
+            android:theme="@style/Theme.Motro" />
     </application>
 </manifest>

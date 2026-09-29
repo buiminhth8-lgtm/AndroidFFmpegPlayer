@@ -46,6 +46,9 @@ int main() {
         CHECK(s.videoReturnGapDistCount == 2);
         CHECK(s.lastVideoPtsDeltaUs == 40);
         CHECK(s.avgVideoPtsDeltaUs == 40);
+        CHECK(s.videoPtsDeltaP50Us == 40);
+        CHECK(s.videoPtsDeltaP95Us == 40);
+        CHECK(s.videoPtsDeltaP99Us == 40);
         CHECK(s.videoPtsDeltaSampleCount == 2);
     }
 
@@ -89,6 +92,7 @@ int main() {
         CHECK(s.avgVideoReturnGapUs == 0);
         CHECK(s.videoReturnGapDistCount == 0);
         CHECK(s.lastVideoPtsDeltaUs == -1);
+        CHECK(s.videoPtsDeltaP50Us == 0);
     }
 
     // 5. invalid/error reads: no video return, no fake gap, classes counted.
@@ -138,16 +142,17 @@ int main() {
     //    the distribution counts beyond kLatencyDistributionWindow.
     {
         PreT0TimingTracker t;
-        for (int i = 0; i < 3000; ++i) {
+        const int sampleCount = static_cast<int>(kLatencyDistributionWindow) + 100;
+        for (int i = 0; i < sampleCount; ++i) {
             t.recordReadCall(40000, PreT0TimingTracker::ReadResultClass::ReadOk);
         }
-        for (int i = 0; i < 3000; ++i) {
+        for (int i = 0; i < sampleCount; ++i) {
             t.recordVideoReturn(static_cast<int64_t>(i) * 1000,
                                 static_cast<int64_t>(i) * 1000);
         }
         const PreT0TimingTracker::Snapshot s = t.snapshot();
-        CHECK(s.readCallCount == 3000);
-        CHECK(s.videoReadCallCount == 3000);
+        CHECK(s.readCallCount == sampleCount);
+        CHECK(s.videoReadCallCount == sampleCount);
         CHECK(s.readDurationDistCount == static_cast<int64_t>(kLatencyDistributionWindow));
         CHECK(s.videoReturnGapDistCount == static_cast<int64_t>(kLatencyDistributionWindow));
     }

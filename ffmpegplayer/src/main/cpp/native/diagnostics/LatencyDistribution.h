@@ -12,7 +12,9 @@
 // samples. The mutex critical sections are tiny (one slot write on add, one
 // copy on snapshot). Extracted from NativePlayer.h so the timing helpers are
 // directly host-testable; semantics are unchanged.
-constexpr size_t kLatencyDistributionWindow = 1024;
+// 8192 samples cover a little over five minutes at the measured 25 fps while
+// remaining strictly bounded (64 KiB per distribution).
+constexpr size_t kLatencyDistributionWindow = 8192;
 
 class LatencyDistribution {
 public:
@@ -25,7 +27,7 @@ public:
         int64_t max = 0;
     };
 
-    // 负值代表无效样本并被忽略；环形缓冲只保留最近 1024 个有效耗时。
+    // 负值代表无效样本并被忽略；环形缓冲只保留最近 8192 个有效耗时。
     void addSample(int64_t us) {
         if (us < 0) {
             return;

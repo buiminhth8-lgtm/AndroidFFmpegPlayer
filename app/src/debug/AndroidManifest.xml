@@ -8,5 +8,10 @@
             android:exported="true"
             android:label="Latency profile"
             android:theme="@style/Theme.Motro" />
+        <activity
+            android:name=".MediaCodecLowLatencyProbeActivity"
+            android:exported="true"
+            android:label="MediaCodec Low-Latency probe"
+            android:theme="@style/Theme.Motro" />
     </application>
 </manifest>

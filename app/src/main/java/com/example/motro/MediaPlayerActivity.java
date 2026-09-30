@@ -872,6 +872,23 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + " rendered=" + oesRendered;
             }
 
+            String diagnosticsMode = stats.optString("diagnosticsMode", "basic");
+            String mediaCodecDiagnosticsLine = "";
+            if ("latency".equals(diagnosticsMode)) {
+                mediaCodecDiagnosticsLine = "\nDecoder "
+                        + stats.optString("mediaCodecComponentName", "UNKNOWN")
+                        + " | HW Decode " + displayYesNoState(stats.opt("mediaCodecHardwareAccelerated"))
+                        + " | fallback " + (stats.optBoolean("hardwareDecodeFallbackUsed", false) ? "YES" : "NO")
+                        + "\nLow Latency Requested: "
+                        + displayOnOffState(stats.opt("mediaCodecLowLatencyRequested"))
+                        + " | Supported: "
+                        + displayCapability(stats.optString("mediaCodecLowLatencySupported", "UNKNOWN"))
+                        + "\nConfigured: "
+                        + displayYesNoState(stats.opt("mediaCodecLowLatencyConfigured"))
+                        + " | Runtime: "
+                        + stats.optString("mediaCodecLowLatencyRuntimeApplied", "UNKNOWN");
+            }
+
             playbackInfoTextView.setText(
                     "state=" + stateDisplay
                             + " | decoder=" + codec + " (" + decodeBackend + ")"
@@ -898,9 +915,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                             + " error=" + (TextUtils.isEmpty(reconnectError) ? "--" : reconnectError)
                             + "\n" + thermalDisplay
                             + oesLine
+                            + mediaCodecDiagnosticsLine
                             + windowLine);
             if (++statsLogCounter % 5 == 0) {
-                String diagnosticsMode = stats.optString("diagnosticsMode", "basic");
                 if ("latency".equals(diagnosticsMode)) {
                     Log.d(TAG_STATS, statsJson);
                     logCompactLatencyStats(stats);
@@ -1042,6 +1059,12 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 stats.optLong("packetReadyToRenderSubmitP99Us", -1),
                 stats.optLong("packetReadyToRenderSubmitDistCount", 0));
 
+        final LatencyStatsFormatter.DecoderInfo decoderInfo = new LatencyStatsFormatter.DecoderInfo(
+                stats.optLong("sendPacketCallUs", -1),
+                stats.optLong("receiveFrameCallUs", -1),
+                stats.optLong("decoderSubmitToOutputUs", -1),
+                stats.optLong("decoderBacklogUs", -1));
+
         final boolean ptsDeltaReady = stats.optLong("videoPacketPtsDeltaSampleCount", 0) > 0;
         final LatencyStatsFormatter.PreT0Info preT0Info = new LatencyStatsFormatter.PreT0Info(
                 stats.optLong("avReadFrameDurationP50Us", -1),
@@ -1100,6 +1123,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stateLine(seq, stateInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.mediaLine(seq, mediaInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.stageLine(seq, stageInfo));
+        Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.decoderLine(seq, decoderInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.preT0Line(seq, preT0Info));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.e2eLine(seq, e2eInfo));
         Log.d(LatencyStatsFormatter.TAG, LatencyStatsFormatter.healthLine(seq, healthInfo));
@@ -1163,6 +1187,22 @@ public class MediaPlayerActivity extends AppCompatActivity {
             return String.format(Locale.US, "%.2f MB/s", value / 1024.0);
         }
         return String.format(Locale.US, "%.0f KB/s", value);
+    }
+
+    private String displayCapability(String state) {
+        if ("SUPPORTED".equals(state)) return "YES";
+        if ("UNSUPPORTED".equals(state)) return "NO";
+        return TextUtils.isEmpty(state) ? "UNKNOWN" : state;
+    }
+
+    private String displayYesNoState(Object value) {
+        if (value instanceof Boolean) return (Boolean) value ? "YES" : "NO";
+        return value == null || JSONObject.NULL.equals(value) ? "UNKNOWN" : String.valueOf(value);
+    }
+
+    private String displayOnOffState(Object value) {
+        if (value instanceof Boolean) return (Boolean) value ? "ON" : "OFF";
+        return value == null || JSONObject.NULL.equals(value) ? "UNKNOWN" : String.valueOf(value);
     }
 
     private FFmpegPlayer ensurePlayer() {

@@ -44,6 +44,8 @@ public final class FFmpegPlayer implements AutoCloseable {
     private long nativeHandle;
     private boolean released;
     private final LiveAudioPcmSink audioSink;
+    // 每个播放器实例独立维护 decoder generation，防止重连或 fallback 沿用旧观测状态。
+    private final MediaCodecObservability mediaCodecObservability = new MediaCodecObservability();
     private Listener externalListener;
 
     // 过滤旧句柄事件，并在退出锁后通知业务监听器；业务侧更新界面时需要切回主线程。
@@ -114,7 +116,11 @@ public final class FFmpegPlayer implements AutoCloseable {
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.preparePlayer(nativeHandle, url, timeoutMs);
+            mediaCodecObservability.resetForPrepare();
+            String result = FFmpegNative.preparePlayer(nativeHandle, url, timeoutMs);
+            // prepare 成功后立即生成一次结构化 decoder 日志；观测失败不改变 prepare 结果。
+            mediaCodecObservability.augment(FFmpegNative.getPlayerStats(nativeHandle));
+            return result;
         }
     }
 
@@ -142,7 +148,13 @@ public final class FFmpegPlayer implements AutoCloseable {
             handle = nativeHandle;
         }
         // 原生 stop 会 join 播放线程；锁外调用，避免播放线程投递事件时反向等待 Java 锁。
-        return FFmpegNative.stopPlayer(handle);
+        String result = FFmpegNative.stopPlayer(handle);
+        synchronized (lock) {
+            if (!released && nativeHandle == handle) {
+                mediaCodecObservability.resetForStop();
+            }
+        }
+        return result;
     }
 
     public String setAudioEnabled(boolean enabled) {
@@ -304,7 +316,7 @@ public final class FFmpegPlayer implements AutoCloseable {
         synchronized (lock) {
             if (released) return errorReleased();
             if (nativeHandle == 0) return errorNoHandle();
-            return FFmpegNative.getPlayerStats(nativeHandle);
+            return mediaCodecObservability.augment(FFmpegNative.getPlayerStats(nativeHandle));
         }
     }
 
@@ -349,6 +361,7 @@ public final class FFmpegPlayer implements AutoCloseable {
             handleToRelease = nativeHandle;
             nativeHandle = 0;
             externalListener = null;
+            mediaCodecObservability.release();
         }
         if (handleToRelease != 0) {
             try {

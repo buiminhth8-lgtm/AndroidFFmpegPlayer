@@ -89,6 +89,10 @@ public class LatencyStatsFormatterTest {
                 0, 0, 0, 0);
     }
 
+    private static LatencyStatsFormatter.DecoderInfo decoderInfo() {
+        return new LatencyStatsFormatter.DecoderInfo(2516, 14, 41595, 40000);
+    }
+
     private static LatencyStatsFormatter.HealthInfo healthInfo() {
         return new LatencyStatsFormatter.HealthInfo(
                 2179, 1024, 512,
@@ -210,6 +214,15 @@ public class LatencyStatsFormatterTest {
     }
 
     @Test
+    public void decoderLineSeparatesApiCallsFromPipelineResidence() {
+        String line = LatencyStatsFormatter.decoderLine(SEQ, decoderInfo());
+        assertTrue(line, line.startsWith("seq=123 DECODER"));
+        assertTrue(line, line.contains(" callMs send=2.516 receive=0.014"));
+        assertTrue(line, line.contains(" pipelineMs submitToOutput=41.595"));
+        assertTrue(line, line.contains(" backlogMs=40.000"));
+    }
+
+    @Test
     public void healthLineShowsCounters() {
         String line = LatencyStatsFormatter.healthLine(SEQ, healthInfo());
         assertTrue(line, line.startsWith("seq=123 HEALTH"));
@@ -311,6 +324,7 @@ public class LatencyStatsFormatterTest {
                 LatencyStatsFormatter.stateLine(SEQ, stateInfo()),
                 LatencyStatsFormatter.mediaLine(SEQ, validMedia()),
                 LatencyStatsFormatter.stageLine(SEQ, validStage()),
+                LatencyStatsFormatter.decoderLine(SEQ, decoderInfo()),
                 LatencyStatsFormatter.preT0Line(SEQ, validPreT0()),
                 LatencyStatsFormatter.e2eLine(SEQ, validE2E()),
                 LatencyStatsFormatter.healthLine(SEQ, healthInfo())
@@ -324,6 +338,6 @@ public class LatencyStatsFormatterTest {
             maxLength = Math.max(maxLength, line.length());
         }
         System.out.println("MAX_COMPACT_LOG_LENGTH=" + maxLength);
-        assertEquals(7, lines.length);
+        assertEquals(8, lines.length);
     }
 }

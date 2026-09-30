@@ -2384,10 +2384,22 @@ std::string NativePlayer::getStats() {
         << "\"avgSendPacketCostUs\":" << avgSendPacketCostUs << ","
         << "\"maxSendPacketCostUs\":" << maxSendPacketCostUs_.load() << ","
         << "\"sendPacketCostSampleCount\":" << sendPacketCostSampleCount_.load() << ","
+        // 语义明确的别名：仅表示 avcodec_send_packet() 同步调用耗时，不代表解码器驻留时间。
+        << "\"sendPacketCallUs\":" << lastSendPacketCostUs_.load() << ","
+        << "\"sendPacketCallAvgUs\":" << avgSendPacketCostUs << ","
+        << "\"sendPacketCallMaxUs\":" << maxSendPacketCostUs_.load() << ","
+        << "\"sendPacketCallCount\":" << sendPacketCostSampleCount_.load() << ","
         << "\"lastReceiveFrameCostUs\":" << lastReceiveFrameCostUs_.load() << ","
         << "\"avgReceiveFrameCostUs\":" << avgDecodeCostUs << ","
         << "\"maxReceiveFrameCostUs\":" << maxDecodeCostUs_.load() << ","
         << "\"receiveFrameCostSampleCount\":" << decodeCostSampleCount_.load() << ","
+        // 语义明确的别名：仅表示 avcodec_receive_frame() 同步调用耗时。
+        << "\"receiveFrameCallUs\":" << lastReceiveFrameCostUs_.load() << ","
+        << "\"receiveFrameCallAvgUs\":" << avgDecodeCostUs << ","
+        << "\"receiveFrameCallMaxUs\":" << maxDecodeCostUs_.load() << ","
+        << "\"receiveFrameCallCount\":" << decodeCostSampleCount_.load() << ","
+        // 提交到输出是 packet/frame 关联后的 decoder pipeline residence，与 API call cost 分离。
+        << "\"decoderSubmitToOutputUs\":" << decoderTiming_.last.load() << ","
         << "\"avgDecodeCostUs\":" << avgDecodeCostUs << ","
         << "\"maxDecodeCostUs\":" << maxDecodeCostUs_.load() << ","
         << "\"lastSwsScaleCostUs\":" << lastSwsScaleCostUs_.load() << ","

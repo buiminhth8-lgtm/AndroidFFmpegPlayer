@@ -6,7 +6,7 @@ import java.util.Locale;
  * Logcat-safe production health and opt-in latency diagnostics.
  *
  * Pure Java (no android.* dependency) so the formatter is directly unit-testable
- * on the JVM. BASIC produces one health line. LATENCY produces six short
+ * on the JVM. BASIC produces one health line. LATENCY produces seven short
  * key=value lines that share one snapshot sequence number ({@code seq}) and
  * one Logcat tag:
  *
@@ -15,6 +15,7 @@ import java.util.Locale;
  *   FFmpegLatencyStats D seq=123 STATE  ...
  *   FFmpegLatencyStats D seq=123 MEDIA  ...
  *   FFmpegLatencyStats D seq=123 STAGE  ...
+ *   FFmpegLatencyStats D seq=123 DECODER ...
  *   FFmpegLatencyStats D seq=123 PRET0  ...
  *   FFmpegLatencyStats D seq=123 E2E    ...
  *   FFmpegLatencyStats D seq=123 HEALTH ...
@@ -219,6 +220,22 @@ final class LatencyStatsFormatter {
         }
     }
 
+    /** Decoder API call cost and pipeline residence are intentionally separate. */
+    static final class DecoderInfo {
+        final long sendPacketCallUs;
+        final long receiveFrameCallUs;
+        final long decoderSubmitToOutputUs;
+        final long decoderBacklogUs;
+
+        DecoderInfo(long sendPacketCallUs, long receiveFrameCallUs,
+                    long decoderSubmitToOutputUs, long decoderBacklogUs) {
+            this.sendPacketCallUs = sendPacketCallUs;
+            this.receiveFrameCallUs = receiveFrameCallUs;
+            this.decoderSubmitToOutputUs = decoderSubmitToOutputUs;
+            this.decoderBacklogUs = decoderBacklogUs;
+        }
+    }
+
     /** LAT2/LAT3 diagnostics health counters. */
     static final class HealthInfo {
         final long samples;
@@ -409,6 +426,15 @@ final class LatencyStatsFormatter {
                 + " queue=" + tripleMs(info.queueP50Us, info.queueP95Us, info.queueP99Us, info.queueCount)
                 + " render=" + tripleMs(info.renderP50Us, info.renderP95Us, info.renderP99Us, info.renderCount)
                 + " total=" + tripleMs(info.totalP50Us, info.totalP95Us, info.totalP99Us, info.totalCount);
+    }
+
+    static String decoderLine(long seq, DecoderInfo info) {
+        return "seq=" + seq
+                + " DECODER"
+                + " callMs send=" + ms3(info.sendPacketCallUs)
+                + " receive=" + ms3(info.receiveFrameCallUs)
+                + " pipelineMs submitToOutput=" + ms3(info.decoderSubmitToOutputUs)
+                + " backlogMs=" + ms3(info.decoderBacklogUs);
     }
 
     static String healthLine(long seq, HealthInfo info) {

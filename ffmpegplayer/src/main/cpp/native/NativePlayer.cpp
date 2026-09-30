@@ -44,6 +44,11 @@ namespace {
 JavaVM *g_native_player_java_vm = nullptr;
 constexpr int64_t kStartupKeyFrameWaitTimeoutMs = 4000;
 
+// 当前工程只链接 FFmpeg 8.0.1 预编译库。其公开 MediaCodec decoder option
+// 没有 configure/runtime Low-Latency 入口，不能取得内部 MediaCodec 实例。
+constexpr bool kMediaCodecLowLatencyControlAvailable = false;
+constexpr const char *kMediaCodecLowLatencyUnavailable = "LOW_LATENCY_CONTROL_UNAVAILABLE";
+
 // LAT2: bounded timing correlation capacity. Covers the ~1-2 frames in flight
 // plus decoder reorder headroom; never grows unbounded.
 constexpr size_t kStageTimingMaxRecords = 256;
@@ -1061,6 +1066,8 @@ int NativePlayer::openInput(const std::string &url, int timeoutMs, bool resetStr
         videoCodecHasBFrames_.store(videoCodecContext_->has_b_frames);
         videoCodecDelay_.store(videoCodecContext_->delay);
         const int64_t decoderOpenCount = videoDecoderOpenCount_.fetch_add(1) + 1;
+        mediaCodecLowLatencyEvaluationCount_.fetch_add(1);
+        mediaCodecLowLatencyLastDecoderGeneration_.store(decoderOpenCount);
         const int64_t hardwareOpenCount = useHardware
                                           ? hardwareDecoderOpenCount_.fetch_add(1) + 1
                                           : hardwareDecoderOpenCount_.load();
@@ -1916,6 +1923,21 @@ std::string NativePlayer::getStats() {
     const char *renderFallbackReasonValue = renderFallbackUsed
                                             ? renderFallbackReasonName(renderFallbackReasonCode)
                                             : "";
+    const bool mediaCodecLowLatencyRequested = optionsSnapshot.enableMediaCodecLowLatency;
+    const char *mediaCodecLowLatencyControlStatus = mediaCodecLowLatencyRequested
+                                                    ? kMediaCodecLowLatencyUnavailable
+                                                    : "OFF";
+    std::string mediaCodecLowLatencyReason;
+    if (!mediaCodecLowLatencyRequested) {
+        mediaCodecLowLatencyReason = "disabled; no MediaCodec parameter submitted";
+    } else if (!optionsSnapshot.usingHardwareDecoder) {
+        mediaCodecLowLatencyReason = optionsSnapshot.hardwareDecodeFallbackUsed
+                                     ? "hardware fallback; MediaCodec control unavailable"
+                                     : "no active MediaCodec decoder; control unavailable";
+    } else {
+        mediaCodecLowLatencyReason =
+                "prebuilt FFmpeg MediaCodec wrapper exposes no low-latency configure/runtime API";
+    }
 
     std::string effectiveThermalRenderMode;
     std::string thermalInputType;
@@ -1993,6 +2015,17 @@ std::string NativePlayer::getStats() {
         << "\"usingHardwareDecoder\":" << (optionsSnapshot.usingHardwareDecoder ? "true" : "false") << ","
         << "\"hardwareDecodeFallbackUsed\":" << (optionsSnapshot.hardwareDecodeFallbackUsed ? "true" : "false") << ","
         << "\"hardwareDecodeError\":\"" << escapeJson(optionsSnapshot.hardwareDecodeError) << "\","
+        << "\"mediaCodecLowLatencyRequested\":" << (mediaCodecLowLatencyRequested ? "true" : "false") << ","
+        << "\"mediaCodecLowLatencyConfigured\":false,"
+        << "\"mediaCodecLowLatencyRuntimeApplied\":\"UNKNOWN\","
+        << "\"mediaCodecLowLatencyControlAvailable\":"
+        << (kMediaCodecLowLatencyControlAvailable ? "true" : "false") << ","
+        << "\"mediaCodecLowLatencyControlStatus\":\"" << mediaCodecLowLatencyControlStatus << "\","
+        << "\"mediaCodecLowLatencyReason\":\"" << escapeJson(mediaCodecLowLatencyReason) << "\","
+        << "\"mediaCodecLowLatencyImplementationPath\":\"FFMPEG_PREBUILT_UNAVAILABLE\","
+        << "\"mediaCodecLowLatencyEvaluationCount\":" << mediaCodecLowLatencyEvaluationCount_.load() << ","
+        << "\"mediaCodecLowLatencyLastDecoderGeneration\":"
+        << mediaCodecLowLatencyLastDecoderGeneration_.load() << ","
         << "\"hardwareDecodedFrameCount\":" << hardwareDecodedFrameCount_.load() << ","
         << "\"hardwareRenderedFrameCount\":" << hardwareRenderedFrameCount_.load() << ","
         << "\"hardwareDroppedFrameCount\":" << hardwareDroppedFrameCount_.load() << ","
@@ -2673,6 +2706,14 @@ std::string NativePlayer::setOption(const std::string &key, const std::string &v
         }
         return setHardwareDecode(enabled);
     }
+    if (normalizedKey == "enable_mediacodec_low_latency"
+        || normalizedKey == "mediacodec_low_latency") {
+        bool enabled = false;
+        if (!parseBoolOption(value, enabled)) {
+            return jsonError(-1, "enable_mediacodec_low_latency must be boolean");
+        }
+        return setMediaCodecLowLatency(enabled);
+    }
     if (normalizedKey == "hardware_render_mode" || normalizedKey == "render_mode") {
         return setHardwareRenderMode(value);
     }
@@ -2849,6 +2890,42 @@ std::string NativePlayer::setHardwareRenderMode(const std::string &mode) {
          optionsSnapshot.enableHardwareDecode ? 1 : 0, renderModeName(optionsSnapshot.renderMode).c_str());
     std::ostringstream out;
     out << "{\"success\":true,\"renderMode\":\"" << renderModeName(optionsSnapshot.renderMode) << "\"}";
+    return out.str();
+}
+
+std::string NativePlayer::setMediaCodecLowLatency(bool enabled) {
+    if (isReleased()) {
+        return jsonError(-1, "player is released");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == PlayerState::Preparing || state_ == PlayerState::Prepared
+            || state_ == PlayerState::Playing || state_ == PlayerState::Paused
+            || state_ == PlayerState::Reconnecting) {
+            return jsonError(-1,
+                             "MediaCodec Low-Latency can only be changed before prepare; recreate decoder");
+        }
+        playerOptions_.enableMediaCodecLowLatency = enabled;
+    }
+
+    // OFF 不触碰任何 MediaCodec 参数；ON 被保留为请求，但不能越过预编译 FFmpeg wrapper。
+    LOGI("setMediaCodecLowLatency requested=%d controlAvailable=%d status=%s",
+         enabled ? 1 : 0, kMediaCodecLowLatencyControlAvailable ? 1 : 0,
+         enabled ? kMediaCodecLowLatencyUnavailable : "OFF");
+    std::ostringstream out;
+    out << "{\"success\":true,"
+        << "\"requested\":" << (enabled ? "true" : "false") << ","
+        << "\"configured\":false,"
+        << "\"runtimeApplied\":\"UNKNOWN\","
+        << "\"controlAvailable\":false,"
+        << "\"controlStatus\":\""
+        << (enabled ? kMediaCodecLowLatencyUnavailable : "OFF") << "\","
+        << "\"reason\":\""
+        << (enabled
+            ? "prebuilt FFmpeg MediaCodec wrapper exposes no low-latency control"
+            : "disabled; no MediaCodec parameter submitted")
+        << "\"}";
     return out.str();
 }
 
@@ -6186,6 +6263,8 @@ void NativePlayer::resetStats() {
     inputOpenCount_.store(0);
     videoDecoderOpenCount_.store(0);
     hardwareDecoderOpenCount_.store(0);
+    mediaCodecLowLatencyEvaluationCount_.store(0);
+    mediaCodecLowLatencyLastDecoderGeneration_.store(0);
     realtimeStartInputReuseCount_.store(0);
     startupFreshnessFlushCount_.store(0);
     startupFreshnessFlushErrorCount_.store(0);

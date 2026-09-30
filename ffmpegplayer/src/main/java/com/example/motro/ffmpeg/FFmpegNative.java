@@ -144,6 +144,9 @@ public final class FFmpegNative {
 
     public static native String setHardwareDecode(long handle, boolean enabled);
 
+    /** Stores the request before prepare; current prebuilt FFmpeg may report control unavailable. */
+    public static native String setMediaCodecLowLatency(long handle, boolean enabled);
+
     public static native String setHardwareRenderMode(long handle, String mode);
 
     public static native String setThermalEnabled(long handle, boolean enabled);

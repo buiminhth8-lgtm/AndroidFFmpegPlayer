@@ -199,6 +199,11 @@
                 style="@style/ControlSwitch"
                 android:text="Hardware Decode" />
 
+            <Switch
+                android:id="@+id/mediaCodecLowLatencySwitch"
+                style="@style/ControlSwitch"
+                android:text="MediaCodec Low Latency (next Prepare)" />
+
             <TextView
                 style="@style/ControlSectionHeader"
                 android:text="THERMAL" />

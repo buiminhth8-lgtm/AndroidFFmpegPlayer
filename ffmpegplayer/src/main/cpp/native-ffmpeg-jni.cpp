@@ -715,6 +715,16 @@ jstring nativeSetHardwareDecode(JNIEnv *env, jclass, jlong handle, jboolean enab
     return toJString(env, player->setHardwareDecode(enabled == JNI_TRUE));
 }
 
+jstring nativeSetMediaCodecLowLatency(JNIEnv *env, jclass, jlong handle, jboolean enabled) {
+    std::string error;
+    PlayerOperationGuard guard = acquirePlayer(handle, error);
+    NativePlayer *player = guard.player();
+    if (player == nullptr) {
+        return toJString(env, jsonError(-1, error));
+    }
+    return toJString(env, player->setMediaCodecLowLatency(enabled == JNI_TRUE));
+}
+
 jstring nativeSetHardwareRenderMode(JNIEnv *env, jclass, jlong handle, jstring mode) {
     std::string error;
     PlayerOperationGuard guard = acquirePlayer(handle, error);
@@ -1223,6 +1233,7 @@ bool registerNativeMethods(JNIEnv *env) {
             {"setPlayerLatencyMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerLatencyMode)},
             {"setPlayerOption", "(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetPlayerOption)},
             {"setHardwareDecode", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareDecode)},
+            {"setMediaCodecLowLatency", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetMediaCodecLowLatency)},
             {"setHardwareRenderMode", "(JLjava/lang/String;)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetHardwareRenderMode)},
             {"setThermalEnabled", "(JZ)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalEnabled)},
             {"setThermalPalette", "(JI)Ljava/lang/String;", reinterpret_cast<void *>(nativeSetThermalPalette)},

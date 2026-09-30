@@ -56,6 +56,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
     public static final String EXTRA_RTSP_TRANSPORT = "com.example.motro.extra.RTSP_TRANSPORT";
     public static final String EXTRA_LATENCY_MODE = "com.example.motro.extra.LATENCY_MODE";
     public static final String EXTRA_RENDER_MODE = "com.example.motro.extra.RENDER_MODE";
+    public static final String EXTRA_MEDIA_CODEC_LOW_LATENCY =
+            "com.example.motro.extra.MEDIA_CODEC_LOW_LATENCY";
 
     private ActivityMediaPlayerBinding binding;
     private ViewMediaPlayerControlsBinding controlsBinding;
@@ -81,6 +83,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
     private Switch audioSwitch;
     private Switch reconnectSwitch;
     private Switch hardwareDecodeSwitch;
+    private Switch mediaCodecLowLatencySwitch;
     private RadioGroup transportRadioGroup;
     private RadioGroup latencyModeRadioGroup;
     private RadioGroup diagnosticsModeRadioGroup;
@@ -149,6 +152,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         audioSwitch = findViewById(R.id.audioSwitch);
         reconnectSwitch = findViewById(R.id.reconnectSwitch);
         hardwareDecodeSwitch = findViewById(R.id.hardwareDecodeSwitch);
+        mediaCodecLowLatencySwitch = findViewById(R.id.mediaCodecLowLatencySwitch);
         transportRadioGroup = findViewById(R.id.transportRadioGroup);
         latencyModeRadioGroup = findViewById(R.id.latencyModeRadioGroup);
         diagnosticsModeRadioGroup = findViewById(R.id.diagnosticsModeRadioGroup);
@@ -163,6 +167,8 @@ public class MediaPlayerActivity extends AppCompatActivity {
         audioSwitch.setChecked(false);
         reconnectSwitch.setChecked(true);
         hardwareDecodeSwitch.setChecked(getIntent().getBooleanExtra(EXTRA_HARDWARE_DECODE, false));
+        mediaCodecLowLatencySwitch.setChecked(
+                getIntent().getBooleanExtra(EXTRA_MEDIA_CODEC_LOW_LATENCY, false));
         transportRadioGroup.check(R.id.tcpTransportRadio);
         latencyModeRadioGroup.check(R.id.balancedLatencyRadio);
         diagnosticsModeRadioGroup.check(R.id.diagnosticsBasicRadio);
@@ -186,6 +192,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
         currentRenderMode = "";
         updateThermalValueTexts();
         updateThermalControlsEnabledState();
+        updateMediaCodecLowLatencyControlEnabledState();
     }
 
     private void applyIntentPlaybackDefaults() {
@@ -265,6 +272,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String decodeResult = newlyCreated
                     ? applyDecodeModeOption(p)
                     : "{\"success\":true,\"message\":\"player already exists, decode mode unchanged until next prepare\"}";
+            String mediaCodecLowLatencyResult = newlyCreated
+                    ? applyMediaCodecLowLatencyOption(p)
+                    : "{\"success\":true,\"message\":\"player already exists, Low-Latency request unchanged until next prepare\"}";
             String thermalResult = newlyCreated
                     ? applyThermalOptionsToPlayer(p)
                     : "{\"success\":true,\"message\":\"player already exists, thermal config unchanged\"}";
@@ -276,6 +286,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
+                    + "\nmediaCodecLowLatency=" + mediaCodecLowLatencyResult
                     + "\nthermal=" + thermalResult;
         }));
 
@@ -302,6 +313,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
             String reconnectResult = applyReconnectOptions(p);
             String audioResult = applyAudioOption(p);
             String decodeResult = applyDecodeModeOption(p);
+            String mediaCodecLowLatencyResult = applyMediaCodecLowLatencyOption(p);
             String thermalResult = applyThermalOptionsToPlayer(p);
             String prepareResult = p.prepare(requireUrl(), readTimeoutMs());
             return "surface=" + surfaceResult
@@ -311,6 +323,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                     + "\nreconnect=" + reconnectResult
                     + "\naudio=" + audioResult
                     + "\ndecode=" + decodeResult
+                    + "\nmediaCodecLowLatency=" + mediaCodecLowLatencyResult
                     + "\nthermal=" + thermalResult
                     + "\nprepare=" + prepareResult;
         }));
@@ -391,6 +404,7 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return;
             }
             updateThermalControlsEnabledState();
+            updateMediaCodecLowLatencyControlEnabledState();
         });
         transportRadioGroup.setOnCheckedChangeListener((group, checkedId) -> {
             FFmpegPlayer p = getPlayer();
@@ -702,6 +716,15 @@ public class MediaPlayerActivity extends AppCompatActivity {
                 return;
             }
 
+            String lowLatencyControlStatus = stats.optString(
+                    "mediaCodecLowLatencyControlStatus", "UNKNOWN");
+            String lowLatencyCapability = stats.optString(
+                    "mediaCodecLowLatencySupported", "UNKNOWN");
+            String lowLatencyLabel = "UNSUPPORTED".equals(lowLatencyCapability)
+                    ? "UNSUPPORTED" : lowLatencyControlStatus;
+            mediaCodecLowLatencySwitch.setText(
+                    "MediaCodec Low Latency (" + lowLatencyLabel + ")");
+
             long nowMs = System.currentTimeMillis();
             long renderedFrames = stats.optLong("renderedFrameCount", 0);
             long decodedFrames = stats.optLong("hardwareDecodedFrameCount", 0)
@@ -886,7 +909,9 @@ public class MediaPlayerActivity extends AppCompatActivity {
                         + "\nConfigured: "
                         + displayYesNoState(stats.opt("mediaCodecLowLatencyConfigured"))
                         + " | Runtime: "
-                        + stats.optString("mediaCodecLowLatencyRuntimeApplied", "UNKNOWN");
+                        + stats.optString("mediaCodecLowLatencyRuntimeApplied", "UNKNOWN")
+                        + " | Control: "
+                        + stats.optString("mediaCodecLowLatencyControlStatus", "UNKNOWN");
             }
 
             playbackInfoTextView.setText(
@@ -1313,6 +1338,27 @@ public class MediaPlayerActivity extends AppCompatActivity {
         currentRenderMode = renderMode;
         return "hardwareDecode=" + decodeResult
                 + "\nrenderMode=" + renderModeResult;
+    }
+
+    private String applyMediaCodecLowLatencyOption(FFmpegPlayer player) {
+        if (player == null) {
+            return jsonError("player is not ready");
+        }
+        return player.setMediaCodecLowLatencyEnabled(mediaCodecLowLatencySwitch.isChecked());
+    }
+
+    private void updateMediaCodecLowLatencyControlEnabledState() {
+        boolean hardwareMediaCodec = hardwareDecodeSwitch.isChecked()
+                || "mediacodec_oes".equals(intentRenderMode)
+                || "mediacodec_surface".equals(intentRenderMode)
+                || "mediacodec_nv12_gl".equals(intentRenderMode);
+        mediaCodecLowLatencySwitch.setEnabled(hardwareMediaCodec);
+        if (!hardwareMediaCodec) {
+            mediaCodecLowLatencySwitch.setChecked(false);
+            mediaCodecLowLatencySwitch.setText("MediaCodec Low Latency (hardware only)");
+        } else {
+            mediaCodecLowLatencySwitch.setText("MediaCodec Low Latency (next Prepare)");
+        }
     }
 
     private String selectedRtspTransport() {

@@ -173,6 +173,18 @@ public final class FFmpegPlayer implements AutoCloseable {
         }
     }
 
+    /**
+     * Requests MediaCodec decoder Low-Latency for the next decoder creation.
+     * The returned JSON distinguishes a stored request from actual configure/runtime application.
+     */
+    public String setMediaCodecLowLatencyEnabled(boolean enabled) {
+        synchronized (lock) {
+            if (released) return errorReleased();
+            if (nativeHandle == 0) return errorNoHandle();
+            return FFmpegNative.setMediaCodecLowLatency(nativeHandle, enabled);
+        }
+    }
+
     public String setHardwareRenderMode(String mode) {
         synchronized (lock) {
             if (released) return errorReleased();

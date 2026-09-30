@@ -9,8 +9,8 @@ import android.util.Log;
 import org.json.JSONObject;
 
 /**
- * 将 Android 只读 capability 查询合并到播放器 Stats。不会创建 codec、配置 codec、
- * 设置 KEY_LOW_LATENCY 或调用 MediaCodec.setParameters()。
+ * 将 Android capability 与 NativePlayer 的真实控制结果合并到播放器 Stats。
+ * 此 observer 自身不会创建 codec 或下发参数。
  */
 final class MediaCodecObservability {
 
@@ -43,14 +43,17 @@ final class MediaCodecObservability {
             final String playerState = root.optString("playerState", root.optString("state", ""));
             final String actualDecoder = root.optString("actualDecoderName", "");
             final long generation = root.optLong("videoDecoderOpenCount", 0);
+            final boolean requested = root.optBoolean("mediaCodecLowLatencyRequested", false);
+            final String controlStatus = root.optString("mediaCodecLowLatencyControlStatus",
+                    requested ? MediaCodecLowLatencyState.UNKNOWN : MediaCodecLowLatencyState.OFF);
+            final String nativeReason = root.optString("mediaCodecLowLatencyReason",
+                    requested ? "control result unavailable" : "disabled; no parameter submitted");
             final boolean decoderAlive = generation > 0 && !actualDecoder.isEmpty()
                     && !"STOPPED".equalsIgnoreCase(playerState)
                     && !"IDLE".equalsIgnoreCase(playerState);
             if (!decoderAlive) {
-                if (!decoderIdentity.isEmpty()) {
-                    decoderIdentity = "";
-                    state.onDecoderReleased("decoder released");
-                }
+                decoderIdentity = "";
+                state.onDecoderUnavailable(requested, controlStatus, nativeReason);
             } else {
                 final String identity = generation + "|" + actualDecoder + "|"
                         + root.optString("decodeBackend", "unknown") + "|"
@@ -86,17 +89,24 @@ final class MediaCodecObservability {
             capability = probe(mime, root.optInt("videoWidth", 0), root.optInt("videoHeight", 0));
         }
 
-        // Slice 2 只观测：PlayerOptions 尚未请求，配置链未写入参数，硬件运行态无读回 API。
-        final boolean requested = false;
-        final boolean configured = false;
-        final String runtimeApplied = MediaCodecLowLatencyState.UNKNOWN;
-        String reason = capability.reason;
-        if (MediaCodecLowLatencyState.SUPPORTED.equals(capability.supported)) {
-            reason = "not requested; runtime readback unavailable";
+        final boolean requested = root.optBoolean("mediaCodecLowLatencyRequested", false);
+        final boolean configured = root.optBoolean("mediaCodecLowLatencyConfigured", false);
+        final String runtimeApplied = root.optString("mediaCodecLowLatencyRuntimeApplied",
+                MediaCodecLowLatencyState.UNKNOWN);
+        final String controlStatus = root.optString("mediaCodecLowLatencyControlStatus",
+                requested ? MediaCodecLowLatencyState.UNKNOWN : MediaCodecLowLatencyState.OFF);
+        final String nativeReason = root.optString("mediaCodecLowLatencyReason", capability.reason);
+        String reason = nativeReason;
+        if (!requested) {
+            reason = "disabled; no MediaCodec parameter submitted";
+        } else if (hardwareFallback || !hardwareDecode) {
+            reason = nativeReason;
         } else if (MediaCodecLowLatencyState.UNSUPPORTED.equals(capability.supported)) {
-            reason = "unsupported";
+            reason = "UNSUPPORTED; " + nativeReason;
         } else if (MediaCodecLowLatencyState.UNAVAILABLE_API_LEVEL.equals(capability.supported)) {
-            reason = "api unavailable";
+            reason = "API_UNAVAILABLE; " + nativeReason;
+        } else if (configured && MediaCodecLowLatencyState.UNKNOWN.equals(runtimeApplied)) {
+            reason = "configure parameter accepted; hardware runtime readback unavailable";
         }
         state.onDecoderCreated(generation, requestedDecoder, actualDecoder, backend,
                 hardwareDecode, hardwareFallback,
@@ -104,7 +114,7 @@ final class MediaCodecObservability {
                 root.optString("renderer", "unknown"),
                 capability.component, capability.componentSource, capability.mime,
                 capability.hardware, capability.vendor, requested, capability.supported,
-                configured, runtimeApplied, reason);
+                configured, runtimeApplied, controlStatus, reason);
     }
 
     private static Capability probe(String mime, int width, int height) {
@@ -172,6 +182,7 @@ final class MediaCodecObservability {
         root.put("mediaCodecLowLatencySupported", snapshot.lowLatencySupported);
         root.put("mediaCodecLowLatencyConfigured", snapshot.lowLatencyConfigured);
         root.put("mediaCodecLowLatencyRuntimeApplied", snapshot.runtimeApplied);
+        root.put("mediaCodecLowLatencyControlStatus", snapshot.controlStatus);
         root.put("mediaCodecLowLatencyReason", snapshot.reason);
 
         JSONObject lowLatency = new JSONObject();
@@ -179,6 +190,7 @@ final class MediaCodecObservability {
         lowLatency.put("supported", snapshot.lowLatencySupported);
         lowLatency.put("configured", snapshot.lowLatencyConfigured);
         lowLatency.put("runtimeApplied", snapshot.runtimeApplied);
+        lowLatency.put("controlStatus", snapshot.controlStatus);
         lowLatency.put("reason", snapshot.reason);
         JSONObject mediaCodec = new JSONObject();
         mediaCodec.put("component", snapshot.component);
@@ -214,6 +226,7 @@ final class MediaCodecObservability {
                 + " supported=" + snapshot.lowLatencySupported
                 + " configured=" + snapshot.lowLatencyConfigured
                 + " runtimeApplied=" + snapshot.runtimeApplied
+                + " controlStatus=" + snapshot.controlStatus
                 + " reason=" + snapshot.reason);
     }
 

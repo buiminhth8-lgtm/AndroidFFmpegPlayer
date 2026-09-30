@@ -35,6 +35,11 @@ foreach(test NetworkIoDeadlineTest DiagnosticsModeTest E2ETimebaseTest PreT0Timi
         add_test(NAME ${test} COMMAND ${test})
     endif()
 endforeach()
+add_executable(MediaCodecLowLatencyOptionsTest
+    MediaCodecLowLatencyOptionsTest.cpp
+    "${PLAYER_SOURCE_DIR}/native/PlayerOptions.cpp")
+target_include_directories(MediaCodecLowLatencyOptionsTest PRIVATE "${PLAYER_SOURCE_DIR}")
+add_test(NAME MediaCodecLowLatencyOptionsTest COMMAND MediaCodecLowLatencyOptionsTest)
 foreach(enabled 0 1)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/TestHookPolicyTest.cpp")
         add_executable(TestHookPolicyTest${enabled} TestHookPolicyTest.cpp)

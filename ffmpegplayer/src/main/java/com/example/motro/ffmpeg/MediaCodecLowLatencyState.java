@@ -13,6 +13,8 @@ public final class MediaCodecLowLatencyState {
     public static final String UNAVAILABLE_API_LEVEL = "UNAVAILABLE_API_LEVEL";
     public static final String YES = "YES";
     public static final String NO = "NO";
+    public static final String OFF = "OFF";
+    public static final String CONTROL_UNAVAILABLE = "LOW_LATENCY_CONTROL_UNAVAILABLE";
 
     private Snapshot current = Snapshot.unavailable("decoder unavailable");
 
@@ -46,6 +48,7 @@ public final class MediaCodecLowLatencyState {
             String lowLatencySupported,
             boolean lowLatencyConfigured,
             String runtimeApplied,
+            String controlStatus,
             String reason) {
         current = new Snapshot(generation,
                 value(requestedDecoder), value(actualDecoder), value(decodeBackend),
@@ -53,7 +56,14 @@ public final class MediaCodecLowLatencyState {
                 value(component), value(componentSource), value(mime),
                 value(hardwareAccelerated), value(vendor), lowLatencyRequested,
                 value(lowLatencySupported), lowLatencyConfigured,
-                value(runtimeApplied), value(reason));
+                value(runtimeApplied), value(controlStatus), value(reason));
+        return current;
+    }
+
+    /** Decoder 尚未创建或已释放时仍保留 PlayerOptions 的请求，不沿用旧 decoder 结果。 */
+    public synchronized Snapshot onDecoderUnavailable(
+            boolean lowLatencyRequested, String controlStatus, String reason) {
+        current = Snapshot.unavailable(lowLatencyRequested, controlStatus, reason);
         return current;
     }
 
@@ -90,6 +100,7 @@ public final class MediaCodecLowLatencyState {
         public final String lowLatencySupported;
         public final boolean lowLatencyConfigured;
         public final String runtimeApplied;
+        public final String controlStatus;
         public final String reason;
 
         Snapshot(long generation, String requestedDecoder, String actualDecoder,
@@ -97,7 +108,8 @@ public final class MediaCodecLowLatencyState {
                  String frameOutputType, String renderer, String component,
                  String componentSource, String mime, String hardwareAccelerated,
                  String vendor, boolean lowLatencyRequested, String lowLatencySupported,
-                 boolean lowLatencyConfigured, String runtimeApplied, String reason) {
+                 boolean lowLatencyConfigured, String runtimeApplied, String controlStatus,
+                 String reason) {
             this.generation = generation;
             this.requestedDecoder = requestedDecoder;
             this.actualDecoder = actualDecoder;
@@ -115,14 +127,19 @@ public final class MediaCodecLowLatencyState {
             this.lowLatencySupported = lowLatencySupported;
             this.lowLatencyConfigured = lowLatencyConfigured;
             this.runtimeApplied = runtimeApplied;
+            this.controlStatus = controlStatus;
             this.reason = reason;
         }
 
         static Snapshot unavailable(String reason) {
+            return unavailable(false, OFF, reason);
+        }
+
+        static Snapshot unavailable(boolean requested, String controlStatus, String reason) {
             return new Snapshot(0, UNKNOWN, UNKNOWN, UNKNOWN,
                     false, false, UNKNOWN, UNKNOWN, UNAVAILABLE, UNAVAILABLE,
-                    UNAVAILABLE, UNKNOWN, UNKNOWN, false, UNAVAILABLE, false, UNKNOWN,
-                    value(reason));
+                    UNAVAILABLE, UNKNOWN, UNKNOWN, requested, UNAVAILABLE, false, UNKNOWN,
+                    value(controlStatus), value(reason));
         }
 
         /** 供 Stats observer 生成嵌套 mediaCodec JSON，也便于 JVM 测试固定字段契约。 */
@@ -138,6 +155,7 @@ public final class MediaCodecLowLatencyState {
                     + "\"supported\":\"" + escape(lowLatencySupported) + "\","
                     + "\"configured\":" + lowLatencyConfigured + ","
                     + "\"runtimeApplied\":\"" + escape(runtimeApplied) + "\","
+                    + "\"controlStatus\":\"" + escape(controlStatus) + "\","
                     + "\"reason\":\"" + escape(reason) + "\"}}";
         }
 

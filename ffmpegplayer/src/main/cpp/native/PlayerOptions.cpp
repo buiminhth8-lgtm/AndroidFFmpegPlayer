@@ -77,6 +77,7 @@ void appendOptionsJson(std::ostringstream &out, const PlayerOptions &options) {
         << "\"enableHardwareDecode\":" << (options.enableHardwareDecode ? "true" : "false") << ","
         << "\"renderMode\":\"" << renderModeName(options.renderMode) << "\","
         << "\"hardwareDecodeAllowFallback\":" << (options.hardwareDecodeAllowFallback ? "true" : "false") << ","
+        << "\"enableMediaCodecLowLatency\":" << (options.enableMediaCodecLowLatency ? "true" : "false") << ","
         << "\"infiniteReconnect\":" << (options.infiniteReconnect ? "true" : "false") << ","
         << "\"reconnectOnEof\":" << (options.reconnectOnEof ? "true" : "false") << ","
         << "\"reconnectOn404\":" << (options.reconnectOn404 ? "true" : "false") << ","
@@ -298,6 +299,7 @@ void applyLatencyProfile(PlayerOptions &options) {
     const bool enableHardwareDecode = options.enableHardwareDecode;
     const RenderMode renderMode = options.renderMode;
     const bool hardwareDecodeAllowFallback = options.hardwareDecodeAllowFallback;
+    const bool enableMediaCodecLowLatency = options.enableMediaCodecLowLatency;
     const std::string requestedDecoderName = options.requestedDecoderName;
     const std::string actualDecoderName = options.actualDecoderName;
     const bool usingHardwareDecoder = options.usingHardwareDecoder;
@@ -316,6 +318,7 @@ void applyLatencyProfile(PlayerOptions &options) {
     options.enableHardwareDecode = enableHardwareDecode;
     options.renderMode = renderMode;
     options.hardwareDecodeAllowFallback = hardwareDecodeAllowFallback;
+    options.enableMediaCodecLowLatency = enableMediaCodecLowLatency;
     options.requestedDecoderName = requestedDecoderName;
     options.actualDecoderName = actualDecoderName;
     options.usingHardwareDecoder = usingHardwareDecoder;
@@ -470,6 +473,15 @@ bool setPlayerOptionValue(PlayerOptions &options, const std::string &key, const 
             return false;
         }
         options.hardwareDecodeAllowFallback = parsedBool;
+        return true;
+    }
+    if (normalizedKey == "enable_mediacodec_low_latency"
+        || normalizedKey == "mediacodec_low_latency") {
+        if (!parseBool(value, parsedBool)) {
+            errorMessage = "enable_mediacodec_low_latency must be boolean";
+            return false;
+        }
+        options.enableMediaCodecLowLatency = parsedBool;
         return true;
     }
     if (normalizedKey == "infinite_reconnect") {

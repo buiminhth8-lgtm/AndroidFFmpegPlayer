@@ -129,6 +129,7 @@ public:
     std::string setOption(const std::string &key, const std::string &value);
     std::string setHardwareDecode(bool enabled);
     std::string setHardwareRenderMode(const std::string &mode);
+    std::string setMediaCodecLowLatency(bool enabled);
     std::string setThermalEnabled(bool enabled);
     std::string setThermalPalette(int palette);
     std::string setThermalAgcEnabled(bool enabled);
@@ -306,6 +307,9 @@ private:
     std::atomic<int64_t> inputOpenCount_{0};
     std::atomic<int64_t> videoDecoderOpenCount_{0};
     std::atomic<int64_t> hardwareDecoderOpenCount_{0};
+    // 每个成功创建的 decoder session 都重新评估一次 Low-Latency 请求。
+    std::atomic<int64_t> mediaCodecLowLatencyEvaluationCount_{0};
+    std::atomic<int64_t> mediaCodecLowLatencyLastDecoderGeneration_{0};
     std::atomic<int64_t> realtimeStartInputReuseCount_{0};
     std::atomic<int64_t> startupFreshnessFlushCount_{0};
     std::atomic<int64_t> startupFreshnessFlushErrorCount_{0};

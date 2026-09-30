@@ -49,6 +49,8 @@ struct PlayerOptions {
     RenderMode renderMode = RenderMode::SOFTWARE_RGBA;
     // 硬件解码初始化失败时是否允许改用软件解码。
     bool hardwareDecodeAllowFallback = true;
+    // 仅表示用户请求；当前预编译 FFmpeg wrapper 是否能下发由运行态状态另行报告。
+    bool enableMediaCodecLowLatency = false;
 
     bool infiniteReconnect = true;
     bool reconnectOnEof = true;

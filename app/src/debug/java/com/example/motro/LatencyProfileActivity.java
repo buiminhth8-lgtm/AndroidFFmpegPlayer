@@ -111,6 +111,8 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
             if (renderMode == null || renderMode.isEmpty()) renderMode = "mediacodec_nv12_gl";
             boolean hardware = getIntent().getBooleanExtra(EXTRA_PREFIX + "HARDWARE", true);
             boolean audio = getIntent().getBooleanExtra(EXTRA_PREFIX + "AUDIO", false);
+            boolean mediaCodecLowLatency = getIntent().getBooleanExtra(
+                    EXTRA_PREFIX + "MEDIA_CODEC_LOW_LATENCY", false);
 
             outputDir = new File(getExternalFilesDir(null), "latency_5min/device");
             deleteChildren(outputDir);
@@ -137,11 +139,16 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
             requireSuccess("audio", player.setAudioEnabled(audio));
             requireSuccess("hardware", player.setHardwareDecodeEnabled(hardware));
             requireSuccess("renderMode", player.setHardwareRenderMode(renderMode));
+            requireSuccess("mediaCodecLowLatency",
+                    player.setMediaCodecLowLatencyEnabled(mediaCodecLowLatency));
             requireSuccess("prepare", player.prepare(url, 5000));
             requireSuccess("start", player.start());
             playbackStartMs = SystemClock.elapsedRealtime();
-            writeConfig(transport, latencyMode, renderMode, hardware, audio);
-            Log.i(TAG, "PROFILE_STARTED warmupSec=" + warmupSec + " durationSec=" + durationSec);
+            writeConfig(transport, latencyMode, renderMode, hardware, audio,
+                    mediaCodecLowLatency);
+            Log.i(TAG, "PROFILE_STARTED warmupSec=" + warmupSec
+                    + " durationSec=" + durationSec
+                    + " mediaCodecLowLatency=" + mediaCodecLowLatency);
             worker.scheduleWithFixedDelay(this::sampleOnce, 0, 1, TimeUnit.SECONDS);
         } catch (Throwable t) {
             fail("START_FAILED", t);
@@ -280,13 +287,15 @@ public final class LatencyProfileActivity extends Activity implements SurfaceHol
     }
 
     private void writeConfig(String transport, String latencyMode, String renderMode,
-                             boolean hardware, boolean audio) throws Exception {
+                             boolean hardware, boolean audio,
+                             boolean mediaCodecLowLatency) throws Exception {
         JSONObject config = new JSONObject();
         config.put("transport", transport);
         config.put("latencyMode", latencyMode);
         config.put("renderMode", renderMode);
         config.put("hardwareDecode", hardware);
         config.put("audio", audio);
+        config.put("mediaCodecLowLatency", mediaCodecLowLatency);
         config.put("warmupSec", warmupSec);
         config.put("durationSec", durationSec);
         atomicWrite(new File(outputDir, "config.json"), config.toString(2));

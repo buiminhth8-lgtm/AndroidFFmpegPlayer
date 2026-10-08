@@ -196,6 +196,7 @@ private:
                            const std::string &errorMessage);
     void beginStartupKeyFrameWait(const char *reason);
     void finishStartupKeyFrameWait(const char *reason);
+    void beginVideoDecodeRecovery(const char *reason);
     bool commitDecodedVideoFormatIfChanged(int frameWidth, int frameHeight, int frameFormat,
                                            int yStride, int colorRange);
     void resetRealtimeClockForFormatDiscontinuity();
@@ -427,6 +428,9 @@ private:
     std::atomic<int64_t> droppedVideoPacketCount_{0};
     std::atomic<int64_t> packetDropBeforeDecodeCount_{0};
     std::atomic<int64_t> frameDropBeforeRenderCount_{0};
+    std::atomic<int64_t> corruptVideoPacketCount_{0};
+    std::atomic<int64_t> corruptVideoFrameCount_{0};
+    std::atomic<int64_t> videoDecodeRecoveryCount_{0};
     std::atomic<int64_t> latePacketDropCount_{0};
     std::atomic<int64_t> lateFrameDropCount_{0};
     std::atomic<int64_t> latestFrameReplaceCount_{0};

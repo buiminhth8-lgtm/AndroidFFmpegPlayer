@@ -2463,6 +2463,9 @@ std::string NativePlayer::getStats() {
         << "\"droppedVideoPacketCount\":" << droppedVideoPacketCount_.load() << ","
         << "\"packetDropBeforeDecodeCount\":" << packetDropBeforeDecodeCount_.load() << ","
         << "\"frameDropBeforeRenderCount\":" << frameDropBeforeRenderCount_.load() << ","
+        << "\"corruptVideoPacketCount\":" << corruptVideoPacketCount_.load() << ","
+        << "\"corruptVideoFrameCount\":" << corruptVideoFrameCount_.load() << ","
+        << "\"videoDecodeRecoveryCount\":" << videoDecodeRecoveryCount_.load() << ","
         << "\"softwareDroppedFrameCount\":"
         << std::max<int64_t>(0, droppedVideoFrameCount_.load() - hardwareDroppedFrameCount_.load()) << ","
         << "\"latePacketDropCount\":" << latePacketDropCount_.load() << ","
@@ -3360,6 +3363,29 @@ void NativePlayer::finishStartupKeyFrameWait(const char *reason) {
     }
     LOGI("finish first video keyframe wait reason=%s",
          reason == nullptr ? "unknown" : reason);
+}
+
+void NativePlayer::beginVideoDecodeRecovery(const char *reason) {
+    if (!isRealtimeInput_ || videoStreamIndex_ < 0) {
+        return;
+    }
+    dropUntilKeyFrame_ = true;
+    startupKeyFrameWait_ = false;
+    startupKeyFrameWaitStartMs_ = 0;
+    startupKeyFrameWaitActive_.store(false);
+    if (videoCodecContext_ != nullptr) {
+        avcodec_flush_buffers(videoCodecContext_);
+    }
+    if (decodedFrame_ != nullptr) {
+        av_frame_unref(decodedFrame_);
+    }
+    if (latestFrame_ != nullptr) {
+        av_frame_unref(latestFrame_);
+    }
+    const int64_t recoveryCount = videoDecodeRecoveryCount_.fetch_add(1) + 1;
+    LOGE("video decode recovery: drop until keyframe reason=%s count=%lld",
+         reason == nullptr ? "unknown" : reason,
+         static_cast<long long>(recoveryCount));
 }
 
 bool NativePlayer::commitDecodedVideoFormatIfChanged(int frameWidth, int frameHeight, int frameFormat,
@@ -5310,6 +5336,16 @@ void NativePlayer::playbackLoop() {
             continue;
         }
 
+        if (packet_->stream_index == videoStreamIndex_
+            && (packet_->flags & AV_PKT_FLAG_CORRUPT) != 0) {
+            corruptVideoPacketCount_.fetch_add(1);
+            droppedVideoPacketCount_.fetch_add(1);
+            packetDropBeforeDecodeCount_.fetch_add(1);
+            beginVideoDecodeRecovery("corrupt_packet");
+            av_packet_unref(packet_);
+            continue;
+        }
+
         if (shouldDropRealtimePacket(packet_)) {
             av_packet_unref(packet_);
             continue;
@@ -5359,6 +5395,7 @@ void NativePlayer::playbackLoop() {
             if (result < 0) {
                 const std::string error = ffmpegErrorToString(result);
                 LOGE("avcodec_send_packet error: %s", error.c_str());
+                beginVideoDecodeRecovery("send_packet_error");
                 av_packet_unref(packet_);
                 continue;
             }
@@ -5408,9 +5445,19 @@ void NativePlayer::playbackLoop() {
                 if (result < 0) {
                     const std::string error = ffmpegErrorToString(result);
                     LOGE("avcodec_receive_frame error: %s", error.c_str());
+                    beginVideoDecodeRecovery("receive_frame_error");
                     break;
                 }
                 recordCost(lastReceiveFrameCostUs_, totalDecodeCostUs_, decodeCostSampleCount_, maxDecodeCostUs_, receiveCostUs);
+
+                if ((decodedFrame_->flags & AV_FRAME_FLAG_CORRUPT) != 0) {
+                    corruptVideoFrameCount_.fetch_add(1);
+                    droppedVideoFrameCount_.fetch_add(1);
+                    frameDropBeforeRenderCount_.fetch_add(1);
+                    av_frame_unref(decodedFrame_);
+                    beginVideoDecodeRecovery("corrupt_frame");
+                    break;
+                }
 
                 lastDecodedFramePictType_.store(static_cast<int>(decodedFrame_->pict_type));
                 lastDecodedFrameKeyFrame_.store((decodedFrame_->flags & AV_FRAME_FLAG_KEY) != 0);
@@ -6240,6 +6287,9 @@ void NativePlayer::resetStats() {
     droppedVideoPacketCount_.store(0);
     packetDropBeforeDecodeCount_.store(0);
     frameDropBeforeRenderCount_.store(0);
+    corruptVideoPacketCount_.store(0);
+    corruptVideoFrameCount_.store(0);
+    videoDecodeRecoveryCount_.store(0);
     latePacketDropCount_.store(0);
     lateFrameDropCount_.store(0);
     latestFrameReplaceCount_.store(0);

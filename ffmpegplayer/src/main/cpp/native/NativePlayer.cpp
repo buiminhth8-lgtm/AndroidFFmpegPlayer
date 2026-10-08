@@ -3,6 +3,7 @@
 #include "SnapshotManager.h"
 
 #include <android/log.h>
+#include <android/native_window_jni.h>
 
 #include <algorithm>
 #include <chrono>
@@ -617,9 +618,18 @@ std::string NativePlayer::setSurface(JNIEnv *env, jobject surface) {
         return jsonError(-1, "Surface is null");
     }
 
-    int width = 0;
-    int height = 0;
-    {
+    // Renderer viewport dimensions belong to the current output Surface, not to the source video.
+    // Passing videoWidth_/videoHeight_ here leaves a full-screen Surface with a source-sized
+    // viewport and makes a PIP Surface show only the clipped corner of that viewport.
+    ANativeWindow *surfaceWindow = ANativeWindow_fromSurface(env, surface);
+    if (surfaceWindow == nullptr) {
+        return jsonError(-1, "ANativeWindow_fromSurface failed");
+    }
+    int width = ANativeWindow_getWidth(surfaceWindow);
+    int height = ANativeWindow_getHeight(surfaceWindow);
+    ANativeWindow_release(surfaceWindow);
+    if (width <= 0 || height <= 0) {
+        // Keep the historical early-bind behavior for a Surface that has not been laid out yet.
         std::lock_guard<std::mutex> lock(mutex_);
         width = videoWidth_;
         height = videoHeight_;

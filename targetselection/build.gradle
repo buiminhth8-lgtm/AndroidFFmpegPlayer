@@ -46,3 +46,12 @@ dependencies {
     androidTestImplementation 'androidx.test:runner:1.5.2'
     androidTestImplementation 'androidx.test:rules:1.5.0'
 }
+
+// 真实采样帧的离线验证是**按需**跑的：样本体积大且不进版本库，所以默认不设这两个属性，
+// BlueMaskSampleSmokeTest 会自动跳过（Assume）。需要时显式传入：
+//   ./gradlew :targetselection:testDebugUnitTest --tests '*BlueMaskSampleSmokeTest*' \
+//       -Dtargetselection.sampleDir=artifacts/roi_blue_mask_samples
+tasks.withType(Test).configureEach {
+    systemProperty 'targetselection.sampleDir', System.getProperty('targetselection.sampleDir', '')
+    systemProperty 'targetselection.sampleReport', System.getProperty('targetselection.sampleReport', '')
+}

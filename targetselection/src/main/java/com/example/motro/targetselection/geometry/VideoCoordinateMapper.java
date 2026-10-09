@@ -286,6 +286,90 @@ public final class VideoCoordinateMapper {
                 (float) clamp(rawViewY, 0.0, geometry.viewHeight)};
     }
 
+    // ------------------------------------------------------------------ 视频坐标 → 分析帧坐标
+
+    /**
+     * 视频像素坐标 → <b>分析帧</b>像素坐标。这是「点击点」与「像素」之间缺失的那一步：
+     * {@link #map} 给出的 videoX/videoY 是以 {@code geometry.videoWidth/videoHeight}
+     * 为尺度的解码帧坐标，而 {@code CapturedFrame} 是从承载 View 回读、并可能被
+     * {@code maxFrameLongSidePx} 缩小过的<b>另一幅图</b>。直接把视频坐标当帧内下标去裁像素，
+     * 会在「View 有黑边」「回读被缩小」时系统性取错区域 —— 而且错得很隐蔽
+     * （ROI 依然在画面里，只是位置/大小不对）。</p>
+     *
+     * <p><b>推导方式</b>：先复用 {@link #mapVideoToView} 把视频点正推回 View 坐标，
+     * 再把 View 坐标按「帧 / View」的等比缩放折算到帧上：</p>
+     * <pre>
+     *   viewPoint = mapVideoToView(videoX, videoY)
+     *   frameX    = viewPoint.x · frameWidth  / viewWidth
+     *   frameY    = viewPoint.y · frameHeight / viewHeight
+     * </pre>
+     * <p><b>为什么是除以 View 尺寸而不是内容区尺寸</b>：回读帧是<b>整个 View</b>的等比缩放副本
+     * （SurfaceView 的 PixelCopy、TextureView 的 getBitmap 都是；回读尺寸也正来自
+     * {@code FrameSize.forCapture(view.getWidth(), view.getHeight(), ...)}）。
+     * FIT_CENTER 时黑边<b>也在帧里</b>，所以必须按 View 尺寸折算 ——
+     * 若按内容区折算，黑边会把自己"吃掉"，落点在纵向（或横向）系统性偏移。
+     * 旋转、镜像、裁切全部由上一步解除，本方法只做一次线性缩放，
+     * 不引入任何独立于 {@link #mapVideoToView} 的几何假设。</p>
+     *
+     * <p><b>为什么不像 {@link #map} 那样对越界硬失败</b>：这里的调用方是 ROI 裁剪，
+     * 它本身就能容忍边界上的取整误差（会在帧范围内夹取矩形）。因此结果被夹在
+     * [0, frameWidth] × [0, frameHeight]；调用方应把返回的点视为「落在了帧边缘」。</p>
+     *
+     * @param geometry    几何快照；为 null 或不可用时返回 null（调用方应退化为 1:1 假设）
+     * @param frameWidth  分析帧宽度，&gt; 0
+     * @param frameHeight 分析帧高度，&gt; 0
+     * @param videoX      视频像素 x
+     * @param videoY      视频像素 y
+     * @return {@code float[2]} = {frameX, frameY}；几何/尺寸不可用或输入非有限值时返回 null
+     */
+    public static float[] mapVideoToFrame(VideoGeometry geometry,
+                                          int frameWidth, int frameHeight,
+                                          float videoX, float videoY) {
+        if (geometry == null || !geometry.isUsable()) {
+            return null;
+        }
+        if (frameWidth <= 0 || frameHeight <= 0) {
+            return null;
+        }
+        if (!Float.isFinite(videoX) || !Float.isFinite(videoY)) {
+            return null;
+        }
+        final float[] viewPoint = mapVideoToView(geometry, videoX, videoY);
+        if (viewPoint == null) {
+            return null;
+        }
+        final double frameX = (double) viewPoint[0] * frameWidth / geometry.viewWidth;
+        final double frameY = (double) viewPoint[1] * frameHeight / geometry.viewHeight;
+        return new float[]{
+                (float) clamp(frameX, 0.0, frameWidth),
+                (float) clamp(frameY, 0.0, frameHeight)};
+    }
+
+    /**
+     * 视频像素<b>长度</b> → 分析帧像素长度的比例，用于把 ROI 半径从视频尺度换算到帧尺度
+     * （例如配置里写「200 视频像素」，回读帧被缩小到三分之一时要跟着缩三分之一）。
+     *
+     * <p>它是两段等比缩放的乘积：<b>视频 → 内容区</b>（{@code contentWidth / 显示宽度}）
+     * 与 <b>View → 帧</b>（{@code frameWidth / viewWidth}）。两段都保持宽高比，
+     * 所以合成后依然是单一标量，横向与纵向在取整误差内相等 ——
+     * 正因如此这里只返回一个数，调用方不必（也不该）自己写除法。</p>
+     *
+     * <p>旋转 90/270 时显示宽度与解码帧宽度对调，用 {@link #isAxisSwapped} 校正，
+     * 与 {@link #map} / {@link #mapVideoToView} 使用同一套推导。</p>
+     *
+     * @return 比例，恒 &gt; 0；几何不可用或帧尺寸非法时返回 {@link Float#NaN}
+     */
+    public static float videoToFrameScale(VideoGeometry geometry, int frameWidth, int frameHeight) {
+        if (geometry == null || !geometry.isUsable() || frameWidth <= 0 || frameHeight <= 0) {
+            return Float.NaN;
+        }
+        final boolean swapped = isAxisSwapped(geometry.rotationDegrees);
+        final double displayedWidth = swapped ? geometry.videoHeight : geometry.videoWidth;
+        final double videoToView = geometry.contentWidth() / displayedWidth;
+        final double viewToFrame = (double) frameWidth / geometry.viewWidth;
+        return (float) (videoToView * viewToFrame);
+    }
+
     private static double clamp01(double value) {
         return clamp(value, 0.0, 1.0);
     }

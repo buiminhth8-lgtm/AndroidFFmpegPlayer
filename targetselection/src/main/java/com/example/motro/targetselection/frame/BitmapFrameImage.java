@@ -90,6 +90,30 @@ public final class BitmapFrameImage implements FrameImage {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>直接委托 {@code Bitmap.getPixels}：一次调用即完成整块拷贝，没有逐像素 JNI 往返 ——
+     * 这正是 ROI 只裁「点击附近一小块」而不是整帧的原因（整帧 {@code getPixels} 在
+     * 1080p 上就是 8MB 级别的搬运，而 400×400 的 ROI 只要 640KB）。</p>
+     *
+     * <p>读取前先在锁内取出位图引用：与 {@link #release()} 竞争时，要么读到有效位图，
+     * 要么明确返回 false，不会拿到已回收的对象去读。</p>
+     */
+    @Override
+    public boolean readArgbRegion(int x, int y, int width, int height,
+                                  int[] out, int offset, int stride) {
+        final Bitmap target;
+        synchronized (lock) {
+            target = released ? null : bitmap;
+        }
+        if (target == null || target.isRecycled()) {
+            return false;
+        }
+        target.getPixels(out, offset, stride, x, y, width, height);
+        return true;
+    }
+
     @Override
     public String toString() {
         return "BitmapFrameImage{" + width + "x" + height

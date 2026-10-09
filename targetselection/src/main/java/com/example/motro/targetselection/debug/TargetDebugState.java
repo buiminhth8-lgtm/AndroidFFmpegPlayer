@@ -6,6 +6,8 @@ import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
 import com.example.motro.targetselection.geometry.VideoPointMappingResult;
 import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.geometry.VideoScaleType;
+import com.example.motro.targetselection.vision.BlueMaskResult;
+import com.example.motro.targetselection.vision.BlueMaskStatus;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -39,6 +41,11 @@ public final class TargetDebugState {
     /** 无对应坐标时的哨兵值。0 是合法坐标，所以不能用 0 表示「没有」。 */
     public static final float NO_COORDINATE = Float.NaN;
 
+    /**
+     * {@link #bluePixelRatio} 的哨兵值：本次没有可用的 ROI（Ratio 本身落在 [0,1]，负数安全）。
+     */
+    public static final float NO_RATIO = -1f;
+
     /** 核心映射结果：状态、触摸点、视频坐标、归一化坐标、几何快照。 */
     public final VideoPointMappingResult mapping;
 
@@ -58,12 +65,30 @@ public final class TargetDebugState {
      */
     public final float roundTripErrorPx;
 
-    // ---------------------------------------------------------------- 预留字段（本 Slice 不产生）
+    // ---------------------------------------------------------------- 视觉阶段（Slice 4）
 
-    /** 预留：检索 ROI（视频坐标）。本 Slice 恒为 null。 */
+    /**
+     * 检索 ROI（视频坐标）：点击点附近被裁剪出来做颜色分析的区域。
+     * 由 {@link #withBlueMask(BlueMaskResult)} 或 {@link Builder#searchRoi} 填充；
+     * 未做视觉分析时为 null（此时叠加层不画 ROI 框）。
+     */
     public final TargetBoundingBox searchRoi;
 
-    /** 预留：识别出的候选框（视频坐标）。本 Slice 恒为空列表。 */
+    /** 蓝色掩码分析的状态；未做视觉分析时为 null。 */
+    public final BlueMaskStatus roiStatus;
+
+    /** ROI 内判定为蓝色的像素数；未做视觉分析时为 0。 */
+    public final int bluePixelCount;
+
+    /**
+     * 蓝色像素占 ROI 的比例 [0,1]；没有可用 ROI 时为 {@link #NO_RATIO}。
+     * <b>不</b>用 0 表示「没有」—— 0 是「ROI 里确实一个蓝像素都没有」这个有意义的结论。
+     */
+    public final float bluePixelRatio;
+
+    // ---------------------------------------------------------------- 预留字段（后续 Slice 产生）
+
+    /** 预留：识别出的候选框（视频坐标）。矩形恢复之前恒为空列表。 */
     public final List<TargetBoundingBox> detectedBoxes;
 
     /** 预留：最终选中的框（视频坐标）。本 Slice 恒为 null。 */
@@ -78,13 +103,19 @@ public final class TargetDebugState {
     /** 预留：置信度 [0,1]。本 Slice 恒为 0。 */
     public final float confidence;
 
-    /** 预留：识别耗时（毫秒）。本 Slice 恒为 0。 */
+    /**
+     * 本次点击的处理耗时（毫秒）。视觉阶段由 {@link #withBlueMask(BlueMaskResult)} 填入
+     * （ROI 裁剪 + 颜色分析的总耗时）；未做视觉分析时为 0。
+     */
     public final long processingMs;
 
     private TargetDebugState(Builder builder) {
         this.mapping = builder.mapping;
         this.eventTimeNs = builder.eventTimeNs;
         this.searchRoi = builder.searchRoi;
+        this.roiStatus = builder.roiStatus;
+        this.bluePixelCount = builder.bluePixelCount;
+        this.bluePixelRatio = builder.bluePixelRatio;
         this.detectedBoxes = Collections.unmodifiableList(new ArrayList<>(builder.detectedBoxes));
         this.selectedBox = builder.selectedBox;
         this.labelRoi = builder.labelRoi;
@@ -139,6 +170,9 @@ public final class TargetDebugState {
     public Builder toBuilder() {
         return new Builder(mapping, eventTimeNs)
                 .searchRoi(searchRoi)
+                .roiStatus(roiStatus)
+                .bluePixelCount(bluePixelCount)
+                .bluePixelRatio(bluePixelRatio)
                 .detectedBoxes(detectedBoxes)
                 .selectedBox(selectedBox)
                 .labelRoi(labelRoi)
@@ -146,6 +180,27 @@ public final class TargetDebugState {
                 .confidence(confidence)
                 .processingMs(processingMs);
     }
+
+    /**
+     * 复制并挂上一次蓝色掩码分析的结果 —— 视觉阶段的标准接法。
+     *
+     * <p>它把 {@link BlueMaskResult} 里<b>叠加层真正需要的那几项</b>翻成可视化字段：
+     * ROI 矩形（{@link #searchRoi}）、状态（{@link #roiStatus}）、蓝像素计数与占比、
+     * 以及处理耗时。掩码本体（{@link BlueMaskResult#mask}）<b>不</b>进本对象：
+     * 叠加层不逐像素画掩码（那是后续"矩形恢复"阶段的可视化任务），
+     * 在这里挂上去只会让状态对象多背一份几十 KB 的数据。</p>
+     *
+     * <p>失败结果同样接受：{@code roiStatus} 会如实反映失败原因（例如 {@code OUTSIDE_VIDEO}），
+     * 于是调试层能显示"为什么没有 ROI"，而不是简单地空着让人猜。</p>
+     *
+     * @param result 分析结果，非 null
+     * @return 新的状态对象（本对象不变）
+     * @throws IllegalArgumentException result 为 null
+     */
+    public TargetDebugState withBlueMask(BlueMaskResult result) {
+        return toBuilder().blueMask(result).build();
+    }
+
 
     // ---------------------------------------------------------------- 几何代理（不解引用 null）
 
@@ -244,19 +299,60 @@ public final class TargetDebugState {
         return !Float.isNaN(mappedViewX) && !Float.isNaN(mappedViewY);
     }
 
+    /** 是否做过视觉分析（即 {@link #roiStatus} 有值，无论成功还是失败）。 */
+    public boolean hasVisionResult() {
+        return roiStatus != null;
+    }
+
+    /** 是否有可绘制的 ROI 矩形。 */
+    public boolean hasSearchRoi() {
+        return searchRoi != null;
+    }
+
+    /** 是否有可显示的蓝像素占比。 */
+    public boolean hasBlueRatio() {
+        return bluePixelRatio != NO_RATIO;
+    }
+
+    /** 蓝色掩码分析的状态；未做视觉分析时为 null。 */
+    public BlueMaskStatus roiStatus() {
+        return roiStatus;
+    }
+
+    /** ROI 内判定为蓝色的像素数；未做视觉分析时为 0。 */
+    public int bluePixelCount() {
+        return bluePixelCount;
+    }
+
+    /** 蓝像素占 ROI 的比例 [0,1]；没有可用 ROI 时为 {@link #NO_RATIO}。 */
+    public float bluePixelRatio() {
+        return bluePixelRatio;
+    }
+
     /**
      * 单行调试摘要（与 {@link VideoPointMappingResult#debugString()} 同风格，追加回投影信息）：
      * <pre>
      * status=SUCCESS touch=960.0,540.0 video=1280x720 content=[0,180,1920,900]
      * rotation=0 mirror=false,false scale=FIT_CENTER mappedVideo=640.0,360.0
      * mappedView=960.0,540.0 roundTripErrPx=0.0 inside=true eventTimeNs=...
+     * roi=SUCCESS rect=[...] blue=1832 ratio=0.01145 ms=3
      * </pre>
+     * <p>未做视觉分析时最后一段整体不出现，保持与 Slice 3 完全一致的输出（旧日志仍然可比）。</p>
      */
     public String debugString() {
-        return mapping.debugString()
-                + " mappedView=" + mappedViewX + "," + mappedViewY
-                + " roundTripErrPx=" + roundTripErrorPx
-                + " eventTimeNs=" + eventTimeNs;
+        final StringBuilder b = new StringBuilder(256);
+        b.append(mapping.debugString())
+                .append(" mappedView=").append(mappedViewX).append(',').append(mappedViewY)
+                .append(" roundTripErrPx=").append(roundTripErrorPx)
+                .append(" eventTimeNs=").append(eventTimeNs);
+        if (hasVisionResult()) {
+            b.append(" roi=").append(roiStatus)
+                    .append(" rect=").append(searchRoi)
+                    .append(" blue=").append(bluePixelCount)
+                    .append(" ratio=").append(hasBlueRatio() ? bluePixelRatio : "n/a")
+                    .append(" ms=").append(processingMs);
+        }
+        return b.toString();
     }
 
     /** 回投影：{@code float[3]} = {viewX, viewY, 往返误差px}；无法正推时返回 null。 */
@@ -288,6 +384,9 @@ public final class TargetDebugState {
         private final VideoPointMappingResult mapping;
         private long eventTimeNs;
         private TargetBoundingBox searchRoi;
+        private BlueMaskStatus roiStatus;
+        private int bluePixelCount;
+        private float bluePixelRatio = NO_RATIO;
         private List<TargetBoundingBox> detectedBoxes = Collections.emptyList();
         private TargetBoundingBox selectedBox;
         private TargetBoundingBox labelRoi;
@@ -307,9 +406,56 @@ public final class TargetDebugState {
             this.eventTimeNs = eventTimeNs;
         }
 
-        /** 预留：检索 ROI。 */
+        /** 检索 ROI（视频坐标）；null 表示本次没有 ROI 可画。 */
         public Builder searchRoi(TargetBoundingBox searchRoi) {
             this.searchRoi = searchRoi;
+            return this;
+        }
+
+        /** 蓝色掩码分析状态；null 表示本次没做视觉分析。 */
+        public Builder roiStatus(BlueMaskStatus roiStatus) {
+            this.roiStatus = roiStatus;
+            return this;
+        }
+
+        /**
+         * 一次性把 {@link BlueMaskResult} 的几项可视信息并进来：ROI 矩形、状态、
+         * 蓝像素计数与占比、处理耗时（见 {@link TargetDebugState#withBlueMask(BlueMaskResult)}）。
+         *
+         * @throws IllegalArgumentException result 为 null
+         */
+        public Builder blueMask(BlueMaskResult result) {
+            if (result == null) {
+                throw new IllegalArgumentException("result must not be null");
+            }
+            return searchRoi(result.roiRectInVideo)
+                    .roiStatus(result.status)
+                    .bluePixelCount(result.bluePixelCount)
+                    .bluePixelRatio(result.hasRoi() ? result.bluePixelRatio : NO_RATIO)
+                    .processingMs(result.processingMs);
+        }
+
+        /** ROI 内蓝像素数。@throws IllegalArgumentException 为负 */
+        public Builder bluePixelCount(int bluePixelCount) {
+            if (bluePixelCount < 0) {
+                throw new IllegalArgumentException("bluePixelCount must be >= 0 but was " + bluePixelCount);
+            }
+            this.bluePixelCount = bluePixelCount;
+            return this;
+        }
+
+        /**
+         * 蓝像素占比。
+         *
+         * @throws IllegalArgumentException 既不是 {@link #NO_RATIO}，也不在 [0,1] 内
+         */
+        public Builder bluePixelRatio(float bluePixelRatio) {
+            if (bluePixelRatio != NO_RATIO
+                    && (Float.isNaN(bluePixelRatio) || bluePixelRatio < 0f || bluePixelRatio > 1f)) {
+                throw new IllegalArgumentException("bluePixelRatio must be within [0,1] or NO_RATIO but was "
+                        + bluePixelRatio);
+            }
+            this.bluePixelRatio = bluePixelRatio;
             return this;
         }
 

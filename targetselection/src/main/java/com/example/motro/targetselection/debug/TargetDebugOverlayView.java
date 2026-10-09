@@ -19,7 +19,9 @@ import java.util.List;
  *
  * <p><b>它不是业务组件</b>：不取帧、不识别、不做命中测试，只负责把
  * {@link TargetDebugState} 画出来。因此它不会、也不该影响播放：不消费触摸、不持有 Bitmap、
- * 不在每帧重绘。</p>
+ * 不在每帧重绘。Slice 4 起它多画两样东西 —— <b>检索 ROI 矩形</b>（紫色描边，
+ * 表示"这次点击后真正被分析过的区域"）与<b>视觉阶段的状态/蓝像素占比/耗时</b>文本
+ * （ROI 或掩码数据缺失时这两项自动不画，因此旧场景的观感与 Slice 3 完全一致）。</p>
  *
  * <p><b>叠加方式（由 app 层决定，本类不关心父容器）</b>：</p>
  * <pre>
@@ -59,11 +61,13 @@ public class TargetDebugOverlayView extends View {
     private static final int COLOR_TOUCH_INVALID = 0xFFFF3D00;
     private static final int COLOR_MAPPED_POINT = 0xFFFF4081;
     private static final int COLOR_RESERVED_BOX = 0xFFFFFF00;
+    private static final int COLOR_ROI_RECT = 0xFF7C4DFF;
     private static final int COLOR_TEXT = 0xFFF5F5F5;
     private static final int COLOR_TEXT_BG = 0xB3000000;
 
     /** 以下尺寸均以 dp 为单位，构造时按屏幕密度换算成像素。 */
     private static final float DP_CONTENT_STROKE = 2f;
+    private static final float DP_ROI_STROKE = 3f;
     private static final float DP_TOUCH_RADIUS = 9f;
     private static final float DP_TOUCH_CROSS_ARM = 16f;
     private static final float DP_MAPPED_RADIUS = 6f;
@@ -79,6 +83,7 @@ public class TargetDebugOverlayView extends View {
     private final Paint mappedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint linkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint boxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint roiPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textBgPaint = new Paint();
 
@@ -140,6 +145,12 @@ public class TargetDebugOverlayView extends View {
         boxPaint.setStyle(Paint.Style.STROKE);
         boxPaint.setStrokeWidth(strokePx);
         boxPaint.setColor(COLOR_RESERVED_BOX);
+
+        // ROI 用独立颜色与更粗的描边：它是「本次真正分析过的区域」，
+        // 和「后续阶段才会填上的候选框」不是一回事，不该混成同一个视觉编码。
+        roiPaint.setStyle(Paint.Style.STROKE);
+        roiPaint.setStrokeWidth(DP_ROI_STROKE * density);
+        roiPaint.setColor(COLOR_ROI_RECT);
 
         textPaint.setTextSize(DP_TEXT_SIZE * density);
         textPaint.setColor(COLOR_TEXT);
@@ -245,10 +256,14 @@ public class TargetDebugOverlayView extends View {
                     current.contentRight(), current.contentBottom(), rectPaint);
         }
 
-        // 2) 预留的 ROI / 候选框（本 Slice 恒为空，直接返回）
+        // 2) 检索 ROI（视频坐标 → 经 mapper 正推回 View 再画，因此旋转/镜像/黑边都自动正确）
+        //    本框代表「点击后真正被分析过的那块区域」，是 Slice 4 最直接的调试证据。
+        drawVideoBox(canvas, current.mapping.geometry, current.searchRoi, roiPaint);
+
+        // 3) 后续阶段才会填上的候选框（本 Slice 恒为空，直接返回）
         drawReservedBoxes(canvas, current);
 
-        // 3) 原始触摸点：状态色 + 十字
+        // 4) 原始触摸点：状态色 + 十字
         final int touchColor = colorForStatus(current.status());
         touchFillPaint.setColor(touchColor);
         touchStrokePaint.setColor(touchColor);
@@ -258,13 +273,13 @@ public class TargetDebugOverlayView extends View {
         canvas.drawLine(touchX - crossArmPx, touchY, touchX + crossArmPx, touchY, touchStrokePaint);
         canvas.drawLine(touchX, touchY - crossArmPx, touchX, touchY + crossArmPx, touchStrokePaint);
 
-        // 4) 映射后的视频点在 View 上的落点（经 mapper 正推）+ 往返连线
+        // 5) 映射后的视频点在 View 上的落点（经 mapper 正推）+ 往返连线
         if (current.hasMappedViewPoint()) {
             canvas.drawLine(touchX, touchY, current.mappedViewX, current.mappedViewY, linkPaint);
             canvas.drawCircle(current.mappedViewX, current.mappedViewY, mappedRadiusPx, mappedPaint);
         }
 
-        // 5) 文本信息
+        // 6) 文本信息
         drawText(canvas, current);
     }
 
@@ -284,25 +299,26 @@ public class TargetDebugOverlayView extends View {
      * 预留路径：把识别阶段的框（视频坐标）正推回 View 再画。
      * 本 Slice 不会被触发（{@link TargetDebugState} 里这些字段恒为 null/空），
      * 但绘制入口先备好，后续 Slice 填上数据即可复用，不必再改本类结构。
+     *
+     * <p>注意 {@code searchRoi} 不在这里 —— 它从 Slice 4 起就是<b>真实</b>数据，
+     * 由 {@link #onDraw(Canvas)} 用独立的 {@link #roiPaint} 画，视觉上与"候选框"区分开。</p>
      */
     private void drawReservedBoxes(Canvas canvas, TargetDebugState current) {
         final List<TargetBoundingBox> boxes = current.detectedBoxes;
         if (boxes.isEmpty()
-                && current.searchRoi == null
                 && current.selectedBox == null
                 && current.labelRoi == null) {
             return;
         }
         for (int i = 0; i < boxes.size(); i++) {
-            drawVideoBox(canvas, current.mapping.geometry, boxes.get(i));
+            drawVideoBox(canvas, current.mapping.geometry, boxes.get(i), boxPaint);
         }
-        drawVideoBox(canvas, current.mapping.geometry, current.searchRoi);
-        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi);
-        drawVideoBox(canvas, current.mapping.geometry, current.selectedBox);
+        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, boxPaint);
+        drawVideoBox(canvas, current.mapping.geometry, current.selectedBox, boxPaint);
     }
 
     /** 把一个视频坐标下的矩形画到 View 上：四个角各自经 mapper 正推（旋转/镜像因此自动正确）。 */
-    private void drawVideoBox(Canvas canvas, VideoGeometry geometry, TargetBoundingBox box) {
+    private void drawVideoBox(Canvas canvas, VideoGeometry geometry, TargetBoundingBox box, Paint paint) {
         if (box == null) {
             return;
         }
@@ -313,10 +329,10 @@ public class TargetDebugOverlayView extends View {
         if (topLeft == null || topRight == null || bottomRight == null || bottomLeft == null) {
             return;
         }
-        canvas.drawLine(topLeft[0], topLeft[1], topRight[0], topRight[1], boxPaint);
-        canvas.drawLine(topRight[0], topRight[1], bottomRight[0], bottomRight[1], boxPaint);
-        canvas.drawLine(bottomRight[0], bottomRight[1], bottomLeft[0], bottomLeft[1], boxPaint);
-        canvas.drawLine(bottomLeft[0], bottomLeft[1], topLeft[0], topLeft[1], boxPaint);
+        canvas.drawLine(topLeft[0], topLeft[1], topRight[0], topRight[1], paint);
+        canvas.drawLine(topRight[0], topRight[1], bottomRight[0], bottomRight[1], paint);
+        canvas.drawLine(bottomRight[0], bottomRight[1], bottomLeft[0], bottomLeft[1], paint);
+        canvas.drawLine(bottomLeft[0], bottomLeft[1], topLeft[0], topLeft[1], paint);
     }
 
     /**
@@ -368,6 +384,32 @@ public class TargetDebugOverlayView extends View {
             b.append("video=-   mapped=-");
         }
 
+        // Slice 4：视觉阶段的结果。没做过就整段不输出，保持与 Slice 3 日志逐字兼容。
+        if (current.hasVisionResult()) {
+            b.append('\n').append("roi=").append(current.roiStatus());
+            if (current.hasSearchRoi()) {
+                b.append("  rect=[");
+                appendFixed1(b, current.searchRoi.left);
+                b.append(',');
+                appendFixed1(b, current.searchRoi.top);
+                b.append(',');
+                appendFixed1(b, current.searchRoi.right);
+                b.append(',');
+                appendFixed1(b, current.searchRoi.bottom);
+                b.append(']');
+            } else {
+                b.append("  rect=-");
+            }
+            if (current.hasBlueRatio()) {
+                b.append("  blue=").append(current.bluePixelCount).append(" (");
+                appendFixed(b, current.bluePixelRatio, 4);
+                b.append(')');
+            } else {
+                b.append("  blue=-");
+            }
+            b.append("  ms=").append(current.processingMs);
+        }
+
         // 量出块尺寸：逐行测量（换行符不参与宽度）
         final int length = b.length();
         int lines = 1;
@@ -412,6 +454,16 @@ public class TargetDebugOverlayView extends View {
      * （{@code StringBuilder.append(float)} 内部会 {@code FloatingDecimal} 出一个 String）。
      */
     private static void appendFixed1(StringBuilder out, float value) {
+        appendFixed(out, value, 1);
+    }
+
+    /**
+     * 固定小数位输出（同样不走 {@code append(float)}）。{@code bluePixelRatio} 这类
+     * 量级很小的比例（常见 0.01 上下）必须保留 4 位才有信息量，1 位会全部显示成 0.0。
+     *
+     * @param decimals 小数位数，&ge; 0
+     */
+    private static void appendFixed(StringBuilder out, float value, int decimals) {
         if (Float.isNaN(value)) {
             out.append("NaN");
             return;
@@ -421,11 +473,26 @@ public class TargetDebugOverlayView extends View {
             return;
         }
         final boolean negative = value < 0f;
-        final int scaled = Math.round(Math.abs(value) * 10f);
+        int scale = 1;
+        for (int i = 0; i < decimals; i++) {
+            scale *= 10;
+        }
+        final long scaled = Math.round(Math.abs(value) * scale);
         if (negative) {
             out.append('-');
         }
-        out.append(scaled / 10).append('.').append((char) ('0' + scaled % 10));
+        out.append(scaled / scale);
+        if (decimals > 0) {
+            out.append('.');
+            final long fraction = scaled % scale;
+            for (int i = decimals - 1; i >= 0; i--) {
+                long divisor = 1L;
+                for (int k = 0; k < i; k++) {
+                    divisor *= 10L;
+                }
+                out.append((char) ('0' + (int) ((fraction / divisor) % 10)));
+            }
+        }
     }
 
     /** 供调试日志使用；不参与绘制。 */

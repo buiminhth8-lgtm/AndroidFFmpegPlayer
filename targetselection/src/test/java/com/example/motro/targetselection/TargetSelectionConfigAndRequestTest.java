@@ -8,6 +8,7 @@ import static org.junit.Assert.fail;
 
 import com.example.motro.targetselection.api.TargetSelectionConfig;
 import com.example.motro.targetselection.frame.FrameCaptureRequest;
+import com.example.motro.targetselection.vision.BlueColorThresholds;
 
 import org.junit.Test;
 
@@ -25,6 +26,25 @@ public class TargetSelectionConfigAndRequestTest {
         assertTrue(config.reportUnknownTargetId);
     }
 
+    /** Slice 4 的视觉调参必须有确定默认值 —— 它们直接决定"什么算蓝"，不能留空。 */
+    @Test
+    public void visionDefaultsAreTunedAndExplicit() {
+        TargetSelectionConfig config = TargetSelectionConfig.defaults();
+        assertEquals(TargetSelectionConfig.DEFAULT_ROI_RADIUS, config.roiRadiusX);
+        assertEquals(TargetSelectionConfig.DEFAULT_ROI_RADIUS, config.roiRadiusY);
+        assertEquals(BlueColorThresholds.DEFAULT_HUE_MIN_DEGREES, config.blueHueMinDegrees, 0.0001f);
+        assertEquals(BlueColorThresholds.DEFAULT_HUE_MAX_DEGREES, config.blueHueMaxDegrees, 0.0001f);
+        assertEquals(BlueColorThresholds.DEFAULT_MIN_SATURATION, config.minSaturation, 0.0001f);
+        assertEquals(BlueColorThresholds.DEFAULT_MIN_VALUE, config.minValue, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BLUE_PIXEL_COUNT, config.minBluePixelCount);
+        assertEquals(TargetSelectionConfig.DEFAULT_MASK_DENOISE_MIN_NEIGHBORS, config.maskDenoiseMinNeighbors);
+        assertFalse("调试开关默认关闭，生产路径不留额外大数组", config.debugMaskEnabled);
+
+        // 默认值本身必须能通过 BlueColorThresholds 的校验（配置与检测器共用一套校验）
+        BlueColorThresholds.of(config.blueHueMinDegrees, config.blueHueMaxDegrees,
+                config.minSaturation, config.minValue);
+    }
+
     @Test
     public void toBuilderProducesIndependentCopy() {
         TargetSelectionConfig original = TargetSelectionConfig.defaults();
@@ -35,6 +55,15 @@ public class TargetSelectionConfigAndRequestTest {
                 .maxFrameAgeNs(50_000_000L)
                 .minConfidence(0.6f)
                 .reportUnknownTargetId(false)
+                .roiRadiusX(150)
+                .roiRadiusY(250)
+                .blueHueMinDegrees(210f)
+                .blueHueMaxDegrees(260f)
+                .minSaturation(0.4f)
+                .minValue(0.25f)
+                .minBluePixelCount(40)
+                .maskDenoiseMinNeighbors(2)
+                .debugMaskEnabled(true)
                 .build();
 
         assertNotSame(original, changed);
@@ -43,6 +72,9 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(300L, original.captureTimeoutMs);
         assertEquals(640, original.maxFrameLongSidePx);
         assertTrue(original.reportUnknownTargetId);
+        assertEquals(TargetSelectionConfig.DEFAULT_ROI_RADIUS, original.roiRadiusX);
+        assertEquals(BlueColorThresholds.DEFAULT_HUE_MIN_DEGREES, original.blueHueMinDegrees, 0.0001f);
+        assertFalse(original.debugMaskEnabled);
 
         assertFalse(changed.enabled);
         assertEquals(1200L, changed.captureTimeoutMs);
@@ -50,6 +82,15 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(50_000_000L, changed.maxFrameAgeNs);
         assertEquals(0.6f, changed.minConfidence, 0.0001f);
         assertFalse(changed.reportUnknownTargetId);
+        assertEquals(150, changed.roiRadiusX);
+        assertEquals(250, changed.roiRadiusY);
+        assertEquals(210f, changed.blueHueMinDegrees, 0.0001f);
+        assertEquals(260f, changed.blueHueMaxDegrees, 0.0001f);
+        assertEquals(0.4f, changed.minSaturation, 0.0001f);
+        assertEquals(0.25f, changed.minValue, 0.0001f);
+        assertEquals(40, changed.minBluePixelCount);
+        assertEquals(2, changed.maskDenoiseMinNeighbors);
+        assertTrue(changed.debugMaskEnabled);
     }
 
     @Test
@@ -60,6 +101,24 @@ public class TargetSelectionConfigAndRequestTest {
         assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minConfidence(1.5f));
         assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minConfidence(-0.1f));
         assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minConfidence(Float.NaN));
+    }
+
+    /** 视觉参数非法必须在 <b>build()</b> 处失败，而不是等到点击时分析器才抛。 */
+    @Test
+    public void invalidVisionValuesAreRejectedAtBuildTime() {
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().roiRadiusX(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().roiRadiusX(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().roiRadiusY(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().blueHueMinDegrees(-1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().blueHueMinDegrees(360f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().blueHueMaxDegrees(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minSaturation(1.5f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minValue(-0.01f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBluePixelCount(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maskDenoiseMinNeighbors(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maskDenoiseMinNeighbors(9));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder()
+                .blueHueMinDegrees(200f).blueHueMaxDegrees(400f).build());
     }
 
     @Test

@@ -15,3 +15,7 @@ __pycache__/
 /artifacts/udp_latency_ab/
 /artifacts/hevc_bframe_ab/
 /artifacts/mediacodec_low_latency_ab/
+# Slice 4（Touch ROI + Blue Mask）的样本与探针产物：由 tools/roi_blue_mask/build_samples.sh
+# 现场生成，体积大且含采集素材内容，不入版本库（脚本本身要提交）
+/artifacts/roi_blue_mask_samples/
+/artifacts/roi_blue_mask_probe/

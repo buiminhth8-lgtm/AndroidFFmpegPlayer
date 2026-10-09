@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -259,6 +260,136 @@ public class ModuleBoundaryTest {
         assertTrue("状态对象也必须经 mapper 做回投影", state.contains("VideoCoordinateMapper.mapVideoToView("));
         assertFalse("TargetDebugState 必须保持纯 JVM（否则状态推导无法单测）",
                 state.contains("import android."));
+    }
+
+    /**
+     * 视觉层必须保持<b>纯 JVM</b>：ROI 裁剪与颜色分析是这个模块里最需要被穷举测试的部分
+     * （边界裁剪、阈值、去噪），一旦引用 {@code android.graphics} 就只能靠真机验证，
+     * 覆盖率和回归速度都会塌掉。像素经 {@code FrameImage} 抽象进来，
+     * 因此这里可以断言"vision 包一行 android 都不引"。
+     */
+    @Test
+    public void visionLayerStaysPureJvm() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        List<File> sources = javaSourcesIn(visionDir.toString());
+        assertTrue("未找到 vision 包源码", sources.size() >= 8);
+
+        List<String> offenders = new ArrayList<>();
+        for (File source : sources) {
+            int lineNumber = 0;
+            for (String line : Files.readAllLines(source.toPath(), StandardCharsets.UTF_8)) {
+                lineNumber++;
+                if (line.trim().startsWith("import android.")) {
+                    offenders.add(source.getName() + ":" + lineNumber + " -> " + line.trim());
+                }
+            }
+        }
+        if (!offenders.isEmpty()) {
+            fail("vision 包必须保持纯 JVM（不得 import android.*），但发现：\n"
+                    + String.join("\n", offenders));
+        }
+    }
+
+    /**
+     * 像素回读只允许有一条落点：{@link com.example.motro.targetselection.frame.BitmapFrameImage}
+     * 里的 {@code Bitmap.getPixels}。
+     *
+     * <p>判据取 {@code getPixels} 这个平台 API 名 —— 它只可能出现在真实代码里。
+     * 一旦有人在别处再写一次逐像素回读，就会出现第二份缓冲管理/回收责任，
+     * 而"谁负责 recycle"正是这类代码最容易泄漏的地方。</p>
+     */
+    @Test
+    public void pixelReadoutHasASinglePlatformCallSite() throws IOException {
+        List<File> sources = javaSourcesIn(moduleDir("targetselection") + "/src/main/java");
+        List<String> holders = new ArrayList<>();
+        for (File source : sources) {
+            if (read(source).contains("getPixels(")) {
+                holders.add(source.getName());
+            }
+        }
+        assertEquals("Bitmap.getPixels 只应出现在 BitmapFrameImage",
+                Collections.singletonList("BitmapFrameImage.java"), holders);
+
+        // 抽象层必须显式声明像素回读契约，否则 ROI 裁剪只能靠 instanceof 猜
+        String frameImage = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/frame/FrameImage.java"));
+        assertTrue("FrameImage 必须声明 readArgbRegion 契约",
+                frameImage.contains("readArgbRegion"));
+
+        String extractor = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision/TouchRoiExtractor.java"));
+        assertTrue("ROI 裁剪必须经 FrameImage.readArgbRegion 取像素",
+                extractor.contains("readArgbRegion"));
+    }
+
+    /**
+     * 蓝色阈值必须全部来自 {@code TargetSelectionConfig}，不许在算法里留下实验魔数。
+     *
+     * <p>现场调参（换推流端、换码率、换光照）只应改配置对象；如果阈值散落在检测器里，
+     * 调参就会变成"改代码 + 重新编译 + 重新验证"三件事。</p>
+     */
+    @Test
+    public void blueThresholdsAreOwnedByTheConfigObject() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String analyzer = read(new File(visionDir, "BlueMaskAnalyzer.java"));
+
+        for (String knob : new String[]{
+                "roiRadiusX", "roiRadiusY",
+                "blueHueMinDegrees", "blueHueMaxDegrees",
+                "minSaturation", "minValue",
+                "minBluePixelCount", "maskDenoiseMinNeighbors", "debugMaskEnabled"}) {
+            assertTrue("BlueMaskAnalyzer 必须从配置读取 " + knob, analyzer.contains("config." + knob));
+        }
+
+        // 默认值只有一份定义：配置类只引用 BlueColorThresholds 的常量，不再抄一遍数字
+        String config = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetSelectionConfig.java"));
+        assertTrue("色调/饱和度/明度默认值必须来自 BlueColorThresholds",
+                config.contains("BlueColorThresholds.DEFAULT_HUE_MIN_DEGREES")
+                        && config.contains("BlueColorThresholds.DEFAULT_MIN_SATURATION"));
+
+        String thresholds = read(new File(visionDir, "BlueColorThresholds.java"));
+        assertTrue("BlueColorThresholds 必须提供默认值常量",
+                thresholds.contains("DEFAULT_HUE_MIN_DEGREES")
+                        && thresholds.contains("DEFAULT_HUE_MAX_DEGREES")
+                        && thresholds.contains("DEFAULT_MIN_SATURATION")
+                        && thresholds.contains("DEFAULT_MIN_VALUE"));
+    }
+
+    /**
+     * 视觉实现不得引入 OpenCV / ML Kit / TFLite —— 本 Slice 刻意只用轻量位运算。
+     *
+     * <p>判据只看 <b>import 行</b>：注释里提到 OpenCV（例如解释"本模块的色调是角度制，
+     * 与 OpenCV 的 [0,180] 不同"）是<b>有价值的文档</b>，把它判成违规只会逼人删掉说明 ——
+     * 这与本类开头写的"不检查注释散文"是同一条原则。</p>
+     */
+    @Test
+    public void visionLayerAvoidsHeavyVisionDependencies() throws IOException {
+        List<File> sources = javaSourcesIn(moduleDir("targetselection")
+                + "/src/main/java/com/example/motro/targetselection/vision");
+        List<String> banned = Arrays.asList("org.opencv", "com.google.mlkit",
+                "org.tensorflow", "tflite", "opencv");
+        List<String> offenders = new ArrayList<>();
+        for (File source : sources) {
+            int lineNumber = 0;
+            for (String line : Files.readAllLines(source.toPath(), StandardCharsets.UTF_8)) {
+                lineNumber++;
+                final String trimmed = line.trim();
+                if (!trimmed.startsWith("import ")) {
+                    continue;
+                }
+                for (String needle : banned) {
+                    if (trimmed.toLowerCase(Locale.ROOT).contains(needle)) {
+                        offenders.add(source.getName() + ":" + lineNumber + " -> " + trimmed);
+                    }
+                }
+            }
+        }
+        if (!offenders.isEmpty()) {
+            fail("vision 包不得依赖重型视觉库：\n" + String.join("\n", offenders));
+        }
     }
 
     // ---------------------------------------------------------------- utils

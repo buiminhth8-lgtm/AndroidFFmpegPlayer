@@ -20,6 +20,7 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.example.motro.ffmpeg.FFmpegPlayer;
+import com.example.motro.targetselection.api.TargetSelectionConfig;
 import com.example.motro.targetselection.api.TouchSelectionRequest;
 import com.example.motro.targetselection.debug.TargetDebugOverlayView;
 import com.example.motro.targetselection.debug.TargetDebugState;
@@ -30,7 +31,11 @@ import com.example.motro.targetselection.frame.SurfaceViewFrameSource;
 import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
 import com.example.motro.targetselection.geometry.VideoGeometry;
 import com.example.motro.targetselection.geometry.VideoPointMappingResult;
+import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.geometry.VideoScaleType;
+import com.example.motro.targetselection.vision.BlueMaskAnalyzer;
+import com.example.motro.targetselection.vision.BlueMaskResult;
+import com.example.motro.targetselection.vision.TouchRoiRequest;
 
 import org.json.JSONObject;
 
@@ -59,6 +64,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 这条链路在真机上跑通 —— 点击画面即可看到触摸点、内容区、映射后的视频坐标与状态。
  * 几何由本 Activity 自己算（探针拿不到渲染器的真实 contentRect，用 FIT_CENTER 兜底），
  * 这在正式接入时应当换成播放器/渲染层汇报的真实几何。仍然是调试入口，不是正式业务。</p>
+ *
+ * <p>Slice 4 增加：点击后在工作线程上跑一次
+ * 「取帧 → {@link TouchRoiRequest} → {@link BlueMaskAnalyzer}」，把结果并进
+ * {@link TargetDebugState}，于是叠加层能显示检索 ROI 框、ROI 状态、蓝像素数与占比、耗时。
+ * 三点刻意为之：<b>只分析点击附近</b>（ROI 半径来自配置）、<b>只在点击时跑一次</b>
+ * （不随帧刷新）、<b>只在工作线程跑</b>（不碰 UI / 解码 / 渲染线程）。
+ * 取到的帧用完立即释放，叠加层只拿紧凑位掩码的统计量、不持有任何 Bitmap。
+ * 本探针显式打开 {@code debugMaskEnabled} 以便在真机上核对 ROI 原始像素；
+ * 这是调试入口的 opt-in，正式路径默认关闭。</p>
  */
 public final class FrameCaptureProbeActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -73,6 +87,15 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
             runnable -> new Thread(runnable, "FrameCaptureProbeWorker"));
     private final AtomicBoolean capturing = new AtomicBoolean(false);
     private final AtomicBoolean released = new AtomicBoolean(false);
+    /** 视觉分析的去重开关：连续点击时丢掉后来的请求，而不是排队等一串旧帧。 */
+    private final AtomicBoolean analyzing = new AtomicBoolean(false);
+
+    /**
+     * 蓝色掩码分析器（播放器无关）。ROI 半径与蓝阈值全部来自
+     * {@link TargetSelectionConfig}，本探针只额外打开 debug 像素保留以便真机核对。
+     */
+    private final BlueMaskAnalyzer blueMaskAnalyzer = new BlueMaskAnalyzer(
+            TargetSelectionConfig.defaults().toBuilder().debugMaskEnabled(true).build());
 
     private SurfaceView surfaceView;
     private TextView statusView;
@@ -208,7 +231,8 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
     // ------------------------------------------------------------------ 调试叠加层
 
     /**
-     * {@code ACTION_DOWN} 的最小验证链路：View 坐标 → 视频坐标 → 叠加层。
+     * {@code ACTION_DOWN} 的最小验证链路：View 坐标 → 视频坐标 → 叠加层，
+     * 随后异步补上「ROI + 蓝色掩码」。
      *
      * <p>用 {@code ACTION_DOWN} 而不是 UP：目标选择要的是「按下那一刻的画面」，
      * 等 UP 会引入手指悬停/滑动带来的时间不确定性。</p>
@@ -217,6 +241,10 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
      * {@code MotionEvent.getEventTime()}（uptimeMillis 基准）换算到本模块的
      * {@code System.nanoTime()} 基准 —— 这样它才能和取帧时刻对齐。直接把毫秒当纳秒
      * 塞进去，或者用墙上时间，都会对齐到完全错误的帧。</p>
+     *
+     * <p><b>两段式更新是有意的</b>：坐标映射是纯几何运算，可以立刻在按压瞬间画出来，
+     * 让用户马上看到"我点到哪了"；而取帧 + 颜色分析要回读像素，只能在工作线程做，
+     * 结果稍后并进来。首帧反馈不受分析耗时影响。</p>
      */
     private void handleDebugTouch(MotionEvent event) {
         final TargetDebugOverlayView target = overlay;
@@ -227,12 +255,82 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
                 event.getX(), event.getY(), event.getEventTime(),
                 SystemClock.uptimeMillis(), System.nanoTime());
 
+        // 几何只取一次快照：映射与后续 ROI 裁剪必须用同一份几何，否则两次调用之间
+        // 若 View 尺寸/旋转变了，ROI 会落在与触摸点不同的坐标系上。
+        final VideoGeometry geometry = currentGeometry();
         final VideoPointMappingResult mapping =
-                VideoCoordinateMapper.map(currentGeometry(), request.viewX, request.viewY);
+                VideoCoordinateMapper.map(geometry, request.viewX, request.viewY);
+
+        // 1) 立即反馈：先把「触摸 → 视频坐标」画出来，视觉分析是异步补上的
         final TargetDebugState state = TargetDebugState.of(mapping, request.eventTimeNs);
         target.setDebugState(state);
-
         Log.i(TAG, "debugTouch " + state.debugString());
+
+        // 2) 只有拿到有效视频坐标才值得取帧分析（点在黑边上时不要浪费一次帧回读）
+        if (mapping.status == VideoPointMappingStatus.SUCCESS) {
+            startBlueMaskAnalysis(geometry, mapping, request.eventTimeNs);
+        }
+    }
+
+    /**
+     * 在<b>工作线程</b>上跑一次「取帧 → ROI → 蓝色掩码」，结果并进调试状态。
+     *
+     * <p>刻意做成「点击时一次」而不是「每帧一次」：视觉分析的目的是回答"我刚才点的那块区域
+     * 是不是蓝色"，它天然是事件驱动的。每帧跑会让分析器和解码器抢 CPU，正是要避免的事。</p>
+     */
+    private void startBlueMaskAnalysis(VideoGeometry geometry,
+                                       VideoPointMappingResult mapping,
+                                       long eventTimeNs) {
+        final SurfaceViewFrameSource source = frameSource;
+        if (source == null || released.get()) {
+            Log.w(TAG, "blueMask skipped: frame source not ready");
+            return;
+        }
+        if (!analyzing.compareAndSet(false, true)) {
+            Log.w(TAG, "blueMask skipped: previous analysis still running");
+            return;
+        }
+        captureWorker.execute(() -> {
+            try {
+                final FrameCaptureResult result =
+                        source.capture(FrameCaptureRequest.latestFrame(CAPTURE_TIMEOUT_MS));
+                try {
+                    final CapturedFrame frame = result.frame();
+                    if (frame == null || !frame.hasImage()) {
+                        Log.w(TAG, "blueMask skipped: capture " + result.status
+                                + (result.debugReason == null ? "" : " " + result.debugReason));
+                        return;
+                    }
+                    final TouchRoiRequest roiRequest = TouchRoiRequest.forMapping(frame, geometry, mapping);
+                    if (roiRequest == null) {
+                        Log.w(TAG, "blueMask skipped: mapping carries no video coordinates");
+                        return;
+                    }
+                    final BlueMaskResult mask = blueMaskAnalyzer.analyze(roiRequest);
+                    Log.i(TAG, "blueMask " + mask.debugString()
+                            + (mask.debugRoiArgb == null
+                                    ? "" : " debugPixels=" + mask.debugRoiArgb.length));
+
+                    final TargetDebugState updated = TargetDebugState
+                            .builder(mapping, eventTimeNs)
+                            .blueMask(mask)
+                            .build();
+                    mainHandler.post(() -> {
+                        final TargetDebugOverlayView current = overlay;
+                        if (current != null) {
+                            current.setDebugState(updated);
+                        }
+                    });
+                } finally {
+                    // 无论成功失败都立刻释放回读位图 —— 探针不缓存任何帧
+                    result.release();
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "blueMask failed", t);
+            } finally {
+                analyzing.set(false);
+            }
+        });
     }
 
     /**

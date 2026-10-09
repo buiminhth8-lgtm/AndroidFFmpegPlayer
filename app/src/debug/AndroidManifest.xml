@@ -13,5 +13,11 @@
             android:exported="true"
             android:label="MediaCodec Low-Latency probe"
             android:theme="@style/Theme.Motro" />
+        <!-- 抓帧探针：验证「任意播放器 -> SurfaceView -> #SurfaceViewFrameSource」链路。仅 debug 构建可见。 -->
+        <activity
+            android:name=".FrameCaptureProbeActivity"
+            android:exported="true"
+            android:label="Frame capture probe"
+            android:theme="@style/Theme.Motro" />
     </application>
 </manifest>

@@ -1,7 +1,7 @@
 package com.example.motro.targetselection.frame;
 
 /**
- * 一次帧获取的结果：模块统一的图像载体 + 尺寸 + 采集时间戳。不可变（图像句柄可释放）。
+ * 一次帧获取的结果：模块统一的图像载体 + 尺寸 + 采集时间戳 + 来源类型。不可变（图像句柄可释放）。
  *
  * <p><b>图像载体</b>：用 {@link FrameImage} 作为统一载体，平台默认实现是
  * {@link BitmapFrameImage}。这样做的好处是：核心 API 不被 {@code Bitmap} 绑死
@@ -17,6 +17,11 @@ package com.example.motro.targetselection.frame;
  *   <li>释放后 {@link #image()} 返回 null、{@link #hasImage()} 为 false；
  *       尺寸与时间戳字段仍可读（它们是历史记录，不随释放失效）。</li>
  * </ul>
+ *
+ * <p><b>时间戳不做伪造成本承诺</b>：{@link #ptsUs} / {@link #frameTimestampNs} 只有在
+ * 来源**确实**知道该值时才填写。像 PixelCopy 这种“只看当前合成缓冲”的通道拿不到
+ * 解码帧时间轴，一律填哨兵值，绝不拿墙上时间冒充 PTS —— 否则后续做
+ * “点击时刻对齐帧”的算法会被系统性误导。</p>
  *
  * <p>线程约定：时间戳/尺寸字段为 final，可安全跨线程读；图像句柄读写受内部锁保护。</p>
  */
@@ -50,9 +55,15 @@ public final class CapturedFrame {
     /** 帧时间戳（纳秒，媒体时间轴），无则 {@link #NO_TIMESTAMP_NS}。 */
     public final long frameTimestampNs;
 
+    /**
+     * 本帧的取像通道来源，未知为 {@link FrameSourceType#UNKNOWN}。
+     * 只用于诊断与上层策略（不同通道的帧龄/时效特性不同），不参与识别算法。
+     */
+    public final FrameSourceType sourceType;
+
     private CapturedFrame(FrameImage image, int width, int height,
                           long captureRequestNs, long captureCompletedNs,
-                          long ptsUs, long frameTimestampNs) {
+                          long ptsUs, long frameTimestampNs, FrameSourceType sourceType) {
         this.image = image;
         this.width = width;
         this.height = height;
@@ -60,10 +71,11 @@ public final class CapturedFrame {
         this.captureCompletedNs = captureCompletedNs;
         this.ptsUs = ptsUs;
         this.frameTimestampNs = frameTimestampNs;
+        this.sourceType = sourceType == null ? FrameSourceType.UNKNOWN : sourceType;
     }
 
     /**
-     * 创建帧。
+     * 创建帧（不标注来源）。
      *
      * @param image             图像载荷，可为 null（表示本次没有可用画面 → {@code NO_FRAME}）
      * @param width             宽度；&lt;= 0 时回退为 {@code image.width()}（无 image 则为 0）
@@ -76,10 +88,22 @@ public final class CapturedFrame {
     public static CapturedFrame of(FrameImage image, int width, int height,
                                    long captureRequestNs, long captureCompletedNs,
                                    long ptsUs, long frameTimestampNs) {
+        return of(image, width, height, captureRequestNs, captureCompletedNs,
+                ptsUs, frameTimestampNs, FrameSourceType.UNKNOWN);
+    }
+
+    /**
+     * 创建帧并标注来源。各参数语义同 {@link #of(FrameImage, int, int, long, long, long, long)}。
+     *
+     * @param sourceType 取像通道；null 视为 {@link FrameSourceType#UNKNOWN}
+     */
+    public static CapturedFrame of(FrameImage image, int width, int height,
+                                   long captureRequestNs, long captureCompletedNs,
+                                   long ptsUs, long frameTimestampNs, FrameSourceType sourceType) {
         int resolvedWidth = width > 0 ? width : (image != null ? image.width() : 0);
         int resolvedHeight = height > 0 ? height : (image != null ? image.height() : 0);
         return new CapturedFrame(image, resolvedWidth, resolvedHeight,
-                captureRequestNs, captureCompletedNs, ptsUs, frameTimestampNs);
+                captureRequestNs, captureCompletedNs, ptsUs, frameTimestampNs, sourceType);
     }
 
     /** 便捷重载：尺寸取自载体，不带 PTS / 帧时间戳。 */
@@ -87,10 +111,17 @@ public final class CapturedFrame {
         return of(image, 0, 0, captureRequestNs, captureCompletedNs, NO_PTS_US, NO_TIMESTAMP_NS);
     }
 
+    /** 便捷重载：尺寸取自载体，标注来源，不带 PTS / 帧时间戳。 */
+    public static CapturedFrame ofImage(FrameImage image, long captureRequestNs, long captureCompletedNs,
+                                       FrameSourceType sourceType) {
+        return of(image, 0, 0, captureRequestNs, captureCompletedNs,
+                NO_PTS_US, NO_TIMESTAMP_NS, sourceType);
+    }
+
     /** 无图像载荷的“空帧”，用于显式表达 {@code NO_FRAME}。 */
     public static CapturedFrame empty(long captureRequestNs, long captureCompletedNs) {
         return new CapturedFrame(null, 0, 0, captureRequestNs, captureCompletedNs,
-                NO_PTS_US, NO_TIMESTAMP_NS);
+                NO_PTS_US, NO_TIMESTAMP_NS, FrameSourceType.UNKNOWN);
     }
 
     /** 图像载荷；已释放或无载荷时返回 null。 */
@@ -118,6 +149,12 @@ public final class CapturedFrame {
         return frameTimestampNs != NO_TIMESTAMP_NS;
     }
 
+    /** 采集耗时（毫秒）；时钟异常导致负值时返回 0。 */
+    public long captureDurationMs() {
+        long deltaNs = captureCompletedNs - captureRequestNs;
+        return deltaNs <= 0L ? 0L : deltaNs / 1_000_000L;
+    }
+
     /**
      * 释放图像载荷。幂等；具体回收策略由 {@link FrameImage} 实现决定。
      * 释放后 {@link #image()} 返回 null，尺寸/时间戳仍可读。
@@ -141,6 +178,7 @@ public final class CapturedFrame {
     @Override
     public String toString() {
         return "CapturedFrame{" + width + "x" + height
+                + ", sourceType=" + sourceType
                 + ", released=" + isReleased()
                 + ", captureMs=" + (captureCompletedNs - captureRequestNs) / 1_000_000.0
                 + ", ptsUs=" + ptsUs + ", frameTimestampNs=" + frameTimestampNs + "}";

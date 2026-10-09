@@ -38,4 +38,11 @@ android {
 dependencies {
     // 核心 API 是纯逻辑 + 单一 Bitmap 载体，零第三方运行时依赖。
     testImplementation 'junit:junit:4.13.2'
+
+    // 真机冒烟测试：PixelCopy / TextureView.getBitmap 这两条平台路径无法在 JVM 里覆盖，
+    // 需要在设备上跑。以下依赖只参与测试 APK 的构建，不会进入发布的 AAR。
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
+    androidTestImplementation 'androidx.test:core:1.5.0'
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+    androidTestImplementation 'androidx.test:rules:1.5.0'
 }

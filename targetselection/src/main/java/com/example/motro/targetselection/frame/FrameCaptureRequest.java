@@ -7,6 +7,10 @@ package com.example.motro.targetselection.frame;
  * 本类描述“本次调用要什么”。控制器按配置构造本请求后传给 {@link VideoFrameSource}，
  * 因此实现方只需理解本类。</p>
  *
+ * <p><b>刻意保持最小</b>：裁剪/ROI/目标框等在“点击取帧”场景里用不到（分析的是整帧画面，
+ * 坐标映射由 geometry 层负责），所以不在这里预留矩形参数 —— 等到真有 ROI 需求时再加，
+ * 避免现在就把一条没人走的代码路径固化进 API。</p>
+ *
  * <p>线程约定：不可变对象，可跨线程安全共享。</p>
  */
 public final class FrameCaptureRequest {
@@ -19,6 +23,9 @@ public final class FrameCaptureRequest {
 
     /** {@link #maxLongSidePx} 的哨兵值：不缩放，按原始分辨率分析。 */
     public static final int NO_SCALE_LIMIT = 0;
+
+    /** {@link #requestTimeNs} 的哨兵值：未由调用方标注发起时刻。 */
+    public static final long NO_REQUEST_TIME_NS = 0L;
 
     /** 常用的“取最新帧、不缩放、不限帧龄”请求，timeout 由调用方给出。 */
     public static FrameCaptureRequest latestFrame(long timeoutMs) {
@@ -49,7 +56,26 @@ public final class FrameCaptureRequest {
      */
     public final long maxFrameAgeNs;
 
+    /**
+     * 请求**发起**时刻（{@code System.nanoTime()} 基准），未知为 {@link #NO_REQUEST_TIME_NS}。
+     *
+     * <p>用途：让“请求时刻”与实现内部的“实际开始取帧时刻”可区分 ——
+     * 请求可能在队列里等过一小会儿，把两者都记下来才能解释端到端延迟。
+     * 不填时实现方会在自己进入取帧流程处打点（见
+     * {@link CapturedFrame#captureRequestNs}），因此这是可选项而非必填项。</p>
+     */
+    public final long requestTimeNs;
+
     public FrameCaptureRequest(long targetPtsUs, long timeoutMs, int maxLongSidePx, long maxFrameAgeNs) {
+        this(targetPtsUs, timeoutMs, maxLongSidePx, maxFrameAgeNs, NO_REQUEST_TIME_NS);
+    }
+
+    /**
+     * @param requestTimeNs 请求发起时刻（{@code System.nanoTime()}），未知传 {@link #NO_REQUEST_TIME_NS}
+     * @throws IllegalArgumentException timeoutMs / maxLongSidePx / maxFrameAgeNs / requestTimeNs 为负数
+     */
+    public FrameCaptureRequest(long targetPtsUs, long timeoutMs, int maxLongSidePx, long maxFrameAgeNs,
+                               long requestTimeNs) {
         if (timeoutMs < 0) {
             throw new IllegalArgumentException("timeoutMs must be >= 0 but was " + timeoutMs);
         }
@@ -59,10 +85,19 @@ public final class FrameCaptureRequest {
         if (maxFrameAgeNs < 0) {
             throw new IllegalArgumentException("maxFrameAgeNs must be >= 0 but was " + maxFrameAgeNs);
         }
+        if (requestTimeNs < 0) {
+            throw new IllegalArgumentException("requestTimeNs must be >= 0 but was " + requestTimeNs);
+        }
         this.targetPtsUs = targetPtsUs;
         this.timeoutMs = timeoutMs;
         this.maxLongSidePx = maxLongSidePx;
         this.maxFrameAgeNs = maxFrameAgeNs;
+        this.requestTimeNs = requestTimeNs;
+    }
+
+    /** 复制一份并标注请求发起时刻。 */
+    public FrameCaptureRequest withRequestTimeNs(long requestTimeNs) {
+        return new FrameCaptureRequest(targetPtsUs, timeoutMs, maxLongSidePx, maxFrameAgeNs, requestTimeNs);
     }
 
     public boolean hasTargetPts() {
@@ -77,11 +112,16 @@ public final class FrameCaptureRequest {
         return maxFrameAgeNs != NO_FRAME_AGE_LIMIT_NS;
     }
 
+    public boolean hasRequestTimeNs() {
+        return requestTimeNs != NO_REQUEST_TIME_NS;
+    }
+
     @Override
     public String toString() {
         return "FrameCaptureRequest{targetPtsUs=" + targetPtsUs
                 + ", timeoutMs=" + timeoutMs
                 + ", maxLongSidePx=" + maxLongSidePx
-                + ", maxFrameAgeNs=" + maxFrameAgeNs + "}";
+                + ", maxFrameAgeNs=" + maxFrameAgeNs
+                + ", requestTimeNs=" + requestTimeNs + "}";
     }
 }

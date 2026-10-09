@@ -106,6 +106,77 @@ public class ModuleBoundaryTest {
         assertTrue("app 仍需保留 :ffmpegplayer", deps.contains(":ffmpegplayer"));
     }
 
+    /**
+     * 取帧实现不得引用任何具体的解码/原生帧类型 —— 这正是「播放器无关」的判据：
+     * 一旦某个实现开始引用它们，复用就断了（换个播放器就得改这个模块）。
+     *
+     * <p>检查范围刻意收窄到「真实代码」：{@code android.media.} 这类全限定串只可能出现在
+     * 代码里；原生帧类型只可能出现在 import 里。这样注释中“不得暴露 AVFrame”这类
+     * 边界声明不会被误判成违规（否则测试会逼着人删掉有价值的文档）。</p>
+     */
+    @Test
+    public void frameSourcesDoNotReferenceNativeOrCodecFrameTypes() throws IOException {
+        File frameDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/frame");
+        List<File> sources = javaSourcesIn(frameDir.toString());
+        assertTrue("未找到 frame 包源码", sources.size() >= 8);
+
+        String[] forbiddenImports = {"avcodec", "avformat", "avutil", "AVFrame", "libav", "SurfaceTexture"};
+        List<String> offenders = new ArrayList<>();
+        for (File source : sources) {
+            int lineNumber = 0;
+            for (String line : Files.readAllLines(source.toPath(), StandardCharsets.UTF_8)) {
+                lineNumber++;
+                if (line.contains("android.media.")) {
+                    offenders.add(source.getName() + ":" + lineNumber + " -> 引用 android.media.* " + line.trim());
+                }
+                if (!line.trim().startsWith("import ")) {
+                    continue;
+                }
+                for (String needle : forbiddenImports) {
+                    if (line.contains(needle)) {
+                        offenders.add(source.getName() + ":" + lineNumber
+                                + " -> 引入原生帧类型 [" + needle + "] " + line.trim());
+                    }
+                }
+            }
+        }
+        if (!offenders.isEmpty()) {
+            fail("取帧实现不得引用解码/原生帧类型，但发现：\n" + String.join("\n", offenders));
+        }
+    }
+
+    /** 两个通用取帧实现必须各自只认自己那种 View，别粘在一起。 */
+    @Test
+    public void eachViewFrameSourceStaysBoundToOneViewType() throws IOException {
+        File frameDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/frame");
+
+        String surfaceSource = read(new File(frameDir, "SurfaceViewFrameSource.java"));
+        assertTrue("SurfaceView 实现不得依赖 TextureView",
+                !surfaceSource.contains("android.view.TextureView"));
+
+        String textureSource = read(new File(frameDir, "TextureViewFrameSource.java"));
+        assertTrue("TextureView 实现不得依赖 SurfaceView / Surface / SurfaceHolder",
+                !textureSource.contains("android.view.SurfaceView")
+                        && !textureSource.contains("android.view.SurfaceHolder")
+                        && !textureSource.contains("android.view.Surface;"));
+    }
+
+    /** 两个通用取帧实现必须共用同一个 API 契约，否则 app 层换承载 View 时要改调用代码。 */
+    @Test
+    public void bothViewFrameSourcesShareTheSameContract() throws IOException {
+        File frameDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/frame");
+        for (String name : new String[] {"SurfaceViewFrameSource.java", "TextureViewFrameSource.java"}) {
+            String source = read(new File(frameDir, name));
+            assertTrue(name + " 必须继承共享骨架 AbstractFrameSource",
+                    source.contains("extends AbstractFrameSource"));
+        }
+        String base = read(new File(frameDir, "AbstractFrameSource.java"));
+        assertTrue("共享骨架必须实现 VideoFrameSource", base.contains("implements VideoFrameSource"));
+    }
+
     // ---------------------------------------------------------------- utils
 
     private static void assertNoDependency(String deps, String needle) {

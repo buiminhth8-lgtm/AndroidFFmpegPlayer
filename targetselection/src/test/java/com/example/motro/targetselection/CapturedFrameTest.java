@@ -7,6 +7,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 import com.example.motro.targetselection.frame.CapturedFrame;
+import com.example.motro.targetselection.frame.FrameSourceType;
 
 import org.junit.Test;
 
@@ -76,5 +77,43 @@ public class CapturedFrameTest {
         assertFalse(frame.hasImage());
         assertEquals(64, frame.width);
         assertEquals(48, frame.height);
+    }
+
+    // ------------------------------------------------- Slice 1：来源类型与耗时可观测
+
+    @Test
+    public void sourceTypeDefaultsToUnknownWhenNotStated() {
+        CapturedFrame frame = CapturedFrame.ofImage(new FakeFrameImage(8, 8), 0L, 1L);
+        assertEquals(FrameSourceType.UNKNOWN, frame.sourceType);
+        assertEquals(FrameSourceType.UNKNOWN, CapturedFrame.empty(0L, 1L).sourceType);
+    }
+
+    @Test
+    public void sourceTypeIsCarriedThroughAndNullBecomesUnknown() {
+        CapturedFrame fromSurface = CapturedFrame.of(
+                new FakeFrameImage(8, 8), 8, 8, 0L, 1L, -1L, -1L, FrameSourceType.SURFACE_VIEW);
+        assertEquals(FrameSourceType.SURFACE_VIEW, fromSurface.sourceType);
+        assertTrue(fromSurface.toString(), fromSurface.toString().contains("SURFACE_VIEW"));
+
+        CapturedFrame explicitNull = CapturedFrame.of(
+                new FakeFrameImage(8, 8), 8, 8, 0L, 1L, -1L, -1L, null);
+        assertEquals(FrameSourceType.UNKNOWN, explicitNull.sourceType);
+
+        CapturedFrame texture = CapturedFrame.ofImage(
+                new FakeFrameImage(8, 8), 0L, 1L, FrameSourceType.TEXTURE_VIEW);
+        assertEquals(FrameSourceType.TEXTURE_VIEW, texture.sourceType);
+        assertEquals(8, texture.width);
+        assertEquals(8, texture.height);
+    }
+
+    @Test
+    public void captureDurationIsDerivedAndNeverNegative() {
+        CapturedFrame frame = CapturedFrame.of(new FakeFrameImage(4, 4), 4, 4,
+                1_000_000L, 13_000_000L, -1L, -1L);
+        assertEquals(12L, frame.captureDurationMs());
+
+        // 时钟异常（完成时刻早于发起时刻）时收敛为 0，不要出现负耗时污染统计
+        CapturedFrame skewed = CapturedFrame.of(new FakeFrameImage(4, 4), 4, 4, 9L, 1L, -1L, -1L);
+        assertEquals(0L, skewed.captureDurationMs());
     }
 }

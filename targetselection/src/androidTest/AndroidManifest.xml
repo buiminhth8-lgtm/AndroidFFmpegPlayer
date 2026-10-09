@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      仅用于 androidTest 的宿主组件：它们只存在于测试 APK 中，不会进入发布的 AAR。
+      存在理由是「真实设备上的取帧冒烟测试」需要一个带真实 Surface 的 Activity ——
+      纯 JVM 单测无法覆盖 PixelCopy / TextureView.getBitmap 这两条平台路径。
+    -->
+    <application>
+        <activity
+            android:name="com.example.motro.targetselection.frame.GlSurfaceViewSmokeTestActivity"
+            android:exported="false" />
+        <activity
+            android:name="com.example.motro.targetselection.frame.TextureViewSmokeTestActivity"
+            android:exported="false" />
+    </application>
+
+</manifest>

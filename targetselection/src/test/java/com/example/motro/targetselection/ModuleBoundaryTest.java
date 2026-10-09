@@ -1,5 +1,7 @@
 package com.example.motro.targetselection;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -12,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Stream;
@@ -175,6 +178,47 @@ public class ModuleBoundaryTest {
         }
         String base = read(new File(frameDir, "AbstractFrameSource.java"));
         assertTrue("共享骨架必须实现 VideoFrameSource", base.contains("implements VideoFrameSource"));
+    }
+
+    /**
+     * 坐标换算公式只允许存在一份 —— {@code VideoCoordinateMapper}。
+     *
+     * <p>判据取「旋转反解开关」：{@code case 90:} 与 {@code case 270:} 必须同时出现在
+     * 同一个文件里，且只能有一个这样的文件。若哪天有人在别处再写一份坐标公式，
+     * 这里会立刻红掉 —— 两份公式最典型的坏结果是 rotation / mirror 顺序只在一份里写对。</p>
+     */
+    @Test
+    public void coordinateFormulaLivesOnlyInTheMapper() throws IOException {
+        File geometryDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/geometry");
+
+        List<String> holders = new ArrayList<>();
+        for (File source : javaSourcesIn(geometryDir.toString())) {
+            String text = read(source);
+            if (text.contains("case 90:") && text.contains("case 270:")) {
+                holders.add(source.getName());
+            }
+        }
+        assertEquals("旋转反解开关只应出现在 VideoCoordinateMapper，实际：" + holders,
+                Collections.singletonList("VideoCoordinateMapper.java"), holders);
+
+        // VideoGeometry 只做委托，不再自持公式
+        String geometry = read(new File(geometryDir, "VideoGeometry.java"));
+        assertTrue("VideoGeometry 必须把坐标系换算委托给 VideoCoordinateMapper.map(...)",
+                geometry.contains("VideoCoordinateMapper.map("));
+        assertFalse("VideoGeometry 不得再自带一份旋转反解实现",
+                geometry.contains("case 90:") || geometry.contains("case 270:"));
+    }
+
+    /** 控制器必须走同一个 mapper（不许另抄一份映射），否则两条路径的语义会分叉。 */
+    @Test
+    public void controllerDelegatesMappingToTheMapper() throws IOException {
+        String controller = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetSelectionController.java"));
+        assertTrue("控制器必须调用 VideoCoordinateMapper.map(...)",
+                controller.contains("VideoCoordinateMapper.map("));
+        assertFalse("控制器不得绕过 mapper 自行反解坐标",
+                controller.contains("case 90:") || controller.contains("case 270:"));
     }
 
     // ---------------------------------------------------------------- utils

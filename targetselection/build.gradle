@@ -1,0 +1,41 @@
+plugins {
+    id 'com.android.library'
+}
+
+// 模块边界（硬约束）：
+//   :targetselection  不依赖 :ffmpegplayer
+//   :ffmpegplayer     不依赖 :targetselection
+//   app 层负责把播放器实现与 targetselection 组装起来
+// 因此这里只声明 Android framework 与测试依赖，不引入 OpenCV / ML Kit / TFLite，
+// 也不接入任何播放器 SDK。日后由 app 层实现 VideoFrameSource / TargetProvider 并注入。
+android {
+    namespace 'com.example.motro.targetselection'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // 核心 API 是纯逻辑 + 单一 Bitmap 载体，零第三方运行时依赖。
+    testImplementation 'junit:junit:4.13.2'
+}

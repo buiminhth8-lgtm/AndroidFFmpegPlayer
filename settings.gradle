@@ -34,3 +34,5 @@ dependencyResolutionManagement {
 rootProject.name = "AndroidFFmpegPlayer"
 include ':app'
 include ':ffmpegplayer'
+// 播放器无关的目标选择核心模块；app 层负责把播放器与它组装起来。
+include ':targetselection'

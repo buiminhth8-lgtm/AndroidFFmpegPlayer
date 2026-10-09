@@ -6,8 +6,10 @@ import android.graphics.Color;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -18,10 +20,17 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import com.example.motro.ffmpeg.FFmpegPlayer;
+import com.example.motro.targetselection.api.TouchSelectionRequest;
+import com.example.motro.targetselection.debug.TargetDebugOverlayView;
+import com.example.motro.targetselection.debug.TargetDebugState;
 import com.example.motro.targetselection.frame.CapturedFrame;
 import com.example.motro.targetselection.frame.FrameCaptureRequest;
 import com.example.motro.targetselection.frame.FrameCaptureResult;
 import com.example.motro.targetselection.frame.SurfaceViewFrameSource;
+import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
+import com.example.motro.targetselection.geometry.VideoGeometry;
+import com.example.motro.targetselection.geometry.VideoPointMappingResult;
+import com.example.motro.targetselection.geometry.VideoScaleType;
 
 import org.json.JSONObject;
 
@@ -44,6 +53,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>刻意保持最小：没有 Target Selection UI、不落盘、不长期持有位图。
  * 日志只输出 width/height、耗时与结果状态，供 {@code adb logcat} 核对。</p>
+ *
+ * <p>Slice 3 增加的最小接入：叠一层 {@link TargetDebugOverlayView}，把
+ * 「ACTION_DOWN → {@link VideoCoordinateMapper} → {@link TargetDebugState} → 叠加层」
+ * 这条链路在真机上跑通 —— 点击画面即可看到触摸点、内容区、映射后的视频坐标与状态。
+ * 几何由本 Activity 自己算（探针拿不到渲染器的真实 contentRect，用 FIT_CENTER 兜底），
+ * 这在正式接入时应当换成播放器/渲染层汇报的真实几何。仍然是调试入口，不是正式业务。</p>
  */
 public final class FrameCaptureProbeActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -61,6 +76,7 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
 
     private SurfaceView surfaceView;
     private TextView statusView;
+    private TargetDebugOverlayView overlay;
     private FFmpegPlayer player;
     private SurfaceViewFrameSource frameSource;
     private Thread patternThread;
@@ -74,6 +90,16 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
         surfaceView = new SurfaceView(this);
         root.addView(surfaceView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // 叠在播放器 SurfaceView 之上：只观察触摸、绝不消费（onTouchEvent 恒 false），
+        // 所以播放器的手势不受影响。放在面板之前加，保证面板仍在最上层可点。
+        overlay = new TargetDebugOverlayView(this);
+        root.addView(overlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        overlay.setOnTouchListener((view, event) -> {
+            handleDebugTouch(event);
+            return false;   // 只观察不截获：事件继续传给下方的播放器
+        });
 
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
@@ -89,6 +115,14 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
         captureButton.setText("Capture frame");
         captureButton.setOnClickListener(view -> captureOnce("manual"));
         panel.addView(captureButton);
+
+        Button clearOverlayButton = new Button(this);
+        clearOverlayButton.setText("Clear overlay");
+        clearOverlayButton.setOnClickListener(view -> {
+            overlay.clearDebugState();
+            Log.i(TAG, "debugTouch cleared");
+        });
+        panel.addView(clearOverlayButton);
 
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -169,6 +203,68 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
                 capturing.set(false);
             }
         });
+    }
+
+    // ------------------------------------------------------------------ 调试叠加层
+
+    /**
+     * {@code ACTION_DOWN} 的最小验证链路：View 坐标 → 视频坐标 → 叠加层。
+     *
+     * <p>用 {@code ACTION_DOWN} 而不是 UP：目标选择要的是「按下那一刻的画面」，
+     * 等 UP 会引入手指悬停/滑动带来的时间不确定性。</p>
+     *
+     * <p>时刻用 {@link TouchSelectionRequest#downFromUptimeMillis} 从
+     * {@code MotionEvent.getEventTime()}（uptimeMillis 基准）换算到本模块的
+     * {@code System.nanoTime()} 基准 —— 这样它才能和取帧时刻对齐。直接把毫秒当纳秒
+     * 塞进去，或者用墙上时间，都会对齐到完全错误的帧。</p>
+     */
+    private void handleDebugTouch(MotionEvent event) {
+        final TargetDebugOverlayView target = overlay;
+        if (target == null || event.getActionMasked() != MotionEvent.ACTION_DOWN) {
+            return;
+        }
+        final TouchSelectionRequest request = TouchSelectionRequest.downFromUptimeMillis(
+                event.getX(), event.getY(), event.getEventTime(),
+                SystemClock.uptimeMillis(), System.nanoTime());
+
+        final VideoPointMappingResult mapping =
+                VideoCoordinateMapper.map(currentGeometry(), request.viewX, request.viewY);
+        final TargetDebugState state = TargetDebugState.of(mapping, request.eventTimeNs);
+        target.setDebugState(state);
+
+        Log.i(TAG, "debugTouch " + state.debugString());
+    }
+
+    /**
+     * 探针用的几何：优先用播放器汇报的视频尺寸，拿不到就认为「视频尺寸 == View 尺寸」。
+     *
+     * <p>缩放方式固定 {@code FIT_CENTER} —— 探针拿不到渲染器的真实 contentRect，
+     * 这里只是兜底推导。正式接入时应由播放器/渲染层直接汇报真实可见区域
+     * （{@code VideoGeometry.create(...)} 那条路），而不是在这里猜。</p>
+     */
+    private VideoGeometry currentGeometry() {
+        final SurfaceView view = surfaceView;
+        final int viewWidth = view == null ? 0 : view.getWidth();
+        final int viewHeight = view == null ? 0 : view.getHeight();
+
+        int videoWidth = 0;
+        int videoHeight = 0;
+        final FFmpegPlayer current = player;
+        if (current != null) {
+            try {
+                JSONObject stats = new JSONObject(current.getStats());
+                videoWidth = stats.optInt("width");
+                videoHeight = stats.optInt("height");
+            } catch (Throwable ignored) {
+                // 拿不到统计就退回“视频尺寸 == View 尺寸”
+            }
+        }
+        if (videoWidth <= 0 || videoHeight <= 0) {
+            videoWidth = viewWidth;
+            videoHeight = viewHeight;
+        }
+        return VideoGeometry.createWithScale(videoWidth, videoHeight,
+                viewWidth, viewHeight, VideoScaleType.FIT_CENTER);
     }
 
     private String formatPlayerState() {

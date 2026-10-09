@@ -30,6 +30,11 @@ package com.example.motro.targetselection.geometry;
  * [0, videoWidth] × [0, videoHeight] 内。落点是否“在画面上”由
  * {@link VideoPointMappingStatus} 表达，绝不靠越界坐标去暗示。</p>
  *
+ * <p><b>正反两个方向都在本类里</b>：{@link #map} 反解（View → 视频），
+ * {@link #mapVideoToView} 正推（视频 → View，是前者的严格逆）。之所以两个方向都要有，
+ * 是因为调试可视化必须把「映射后的视频点」「识别出的目标框」画回屏幕上 ——
+ * 那是个视频坐标，直接当 View 坐标画是错的（尺度、原点都不同）。</p>
+ *
  * <p>线程约定：本类无状态（无字段、无缓存），所有方法均为纯函数，可任意线程并发调用。</p>
  */
 public final class VideoCoordinateMapper {
@@ -170,6 +175,115 @@ public final class VideoCoordinateMapper {
         return VideoPointMappingResult.success(geometry, viewX, viewY,
                 videoX, videoY,
                 (float) (videoX / width), (float) (videoY / height));
+    }
+
+    // ------------------------------------------------------------------ 正向映射
+
+    /**
+     * {@link #map} 的<b>严格逆</b>：把视频像素坐标正推回承载 View 的坐标。纯几何运算，
+     * 不接触任何 Android 类型，任意线程可调用。
+     *
+     * <p><b>存在意义有两个</b>：</p>
+     * <ol>
+     *   <li><b>可视化</b>：调试层要把「映射后的视频点」「识别出的目标框」画回屏幕上。
+     *       视频坐标不能直接当 View 坐标画 —— 尺度、原点、以及旋转/裁切都还没解除。</li>
+     *   <li><b>自洽性检查</b>：{@code mapVideoToView(map(p))} 必须还原出 {@code p}。
+     *       这把「反解有没有写错」变成可断言的事实，而不是靠肉眼看图猜。</li>
+     * </ol>
+     *
+     * <p><b>顺序是 {@link #map} 的逆</b>：</p>
+     * <pre>
+     *   source video coordinate     (videoX, videoY)  ∈ [0, videoWidth] × [0, videoHeight]
+     *     → forward rotation         按 0/90/180/270 映射到显示方向
+     *     → forward mirror           mirrorX/mirrorY 时 u′ = 1 − u′（与反解同一操作，它是对合的）
+     *     → restore visible window   u = (u′ − startU) / visibleFrac   （CENTER_CROP 在此加回裁切偏移）
+     *     → display / view coordinate viewX = contentLeft + u · visibleWidth
+     * </pre>
+     *
+     * <p>与反解共用同一套 {@code contentRect / visibleFrac / scale} 推导，因此正反必然自洽 ——
+     * 这也是「坐标公式只有一份」的实际含义：不是指一个方法，而是指一套推导。</p>
+     *
+     * <p><b>越界处理</b>：输入先夹到视频范围内；若该点落在 CENTER_CROP 被裁掉的区域
+     * （或旋转后被移出可见窗口），结果再夹到 [0, viewWidth] × [0, viewHeight] ——
+     * 此时它没有真实的屏幕对应位置，返回值只是「最近的可见点」，
+     * 往返误差会立刻暴露这种失真，不会伪装成正常落点。</p>
+     *
+     * @param geometry 几何快照，可为 null
+     * @param videoX   视频（解码帧）像素 x
+     * @param videoY   视频（解码帧）像素 y
+     * @return {@code float[2]} = {viewX, viewY}；几何不可用或输入非有限值时返回 {@code null}
+     */
+    public static float[] mapVideoToView(VideoGeometry geometry, float videoX, float videoY) {
+        if (geometry == null || !geometry.isUsable()) {
+            return null;
+        }
+        if (!Float.isFinite(videoX) || !Float.isFinite(videoY)) {
+            return null;
+        }
+
+        final double width = geometry.videoWidth;
+        final double height = geometry.videoHeight;
+        final double sourceX = clamp(videoX, 0.0, width);
+        final double sourceY = clamp(videoY, 0.0, height);
+
+        // 1) 正向旋转：源视频坐标 → 显示画面归一化坐标（u 沿显示画面水平，v 垂直）
+        double u;
+        double v;
+        switch (geometry.rotationDegrees) {
+            case 90:
+                // map() 里是 videoX = v·W, videoY = (1−u)·H，此处取逆
+                u = 1.0 - sourceY / height;
+                v = sourceX / width;
+                break;
+            case 180:
+                u = 1.0 - sourceX / width;
+                v = 1.0 - sourceY / height;
+                break;
+            case 270:
+                // map() 里是 videoX = (1−v)·W, videoY = u·H，此处取逆
+                u = sourceY / height;
+                v = 1.0 - sourceX / width;
+                break;
+            case 0:
+            default:
+                u = sourceX / width;
+                v = sourceY / height;
+                break;
+        }
+
+        // 2) 正向镜像（与反解同一式子：该操作是对合的，两次即还原）
+        if (geometry.mirrorX) {
+            u = 1.0 - u;
+        }
+        if (geometry.mirrorY) {
+            v = 1.0 - v;
+        }
+
+        // 3) 还原可见窗口：把显示画面坐标折回可见区域内（与 map() 完全同一套推导）
+        final boolean swapped = isAxisSwapped(geometry.rotationDegrees);
+        final double displayedWidth = swapped ? height : width;
+        final double displayedHeight = swapped ? width : height;
+        final double visibleWidth = geometry.contentWidth();
+        final double visibleHeight = geometry.contentHeight();
+        final double scaleX = visibleWidth / displayedWidth;
+        final double scaleY = visibleHeight / displayedHeight;
+        final double scale = geometry.scaleType.isCrop()
+                ? Math.max(scaleX, scaleY)
+                : Math.min(scaleX, scaleY);
+        final double visibleFracU = clamp01(visibleWidth / (displayedWidth * scale));
+        final double visibleFracV = clamp01(visibleHeight / (displayedHeight * scale));
+        final double startU = (1.0 - visibleFracU) * 0.5;
+        final double startV = (1.0 - visibleFracV) * 0.5;
+
+        // 4) 显示画面坐标 → View 坐标
+        final double localU = (u - startU) / visibleFracU;
+        final double localV = (v - startV) / visibleFracV;
+        final double rawViewX = geometry.contentLeft + localU * visibleWidth;
+        final double rawViewY = geometry.contentTop + localV * visibleHeight;
+
+        return new float[]{
+                (float) clamp(rawViewX, 0.0, geometry.viewWidth),
+                (float) clamp(rawViewY, 0.0, geometry.viewHeight)};
     }
 
     private static double clamp01(double value) {

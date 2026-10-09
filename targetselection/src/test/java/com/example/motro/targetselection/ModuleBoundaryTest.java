@@ -221,6 +221,46 @@ public class ModuleBoundaryTest {
                 controller.contains("case 90:") || controller.contains("case 270:"));
     }
 
+    /**
+     * 调试可视化层不得自带坐标公式 —— 这是本 Slice 最容易踩的坑。
+     *
+     * <p>叠加层要把「映射后的视频点」画出来，直觉做法是在里面写
+     * {@code viewX = videoX * getWidth() / videoWidth}。一旦这么写，调试层就和正式映射算法
+     * 变成两套逻辑：调试图"看起来对"而实际命中判定是错的（黑边、旋转、镜像任一项都会让它偏），
+     * 而调试图的全部价值恰恰是"帮我判断正式算法对不对" —— 逻辑一分为二，这个价值就没了。
+     * 所以这里断言：视频坐标必须经 {@link com.example.motro.targetselection.geometry.VideoCoordinateMapper}
+     * 正推回 View，debug 包里不许出现任何旋转开关或按 View 尺寸的缩放式。</p>
+     */
+    @Test
+    public void debugOverlayNeverReimplementsTheCoordinateFormula() throws IOException {
+        File debugDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/debug");
+        List<File> sources = javaSourcesIn(debugDir.toString());
+        assertTrue("未找到 debug 包源码", sources.size() >= 2);
+
+        for (File source : sources) {
+            String text = read(source);
+            assertFalse(source.getName() + " 不得自带旋转公式（只允许 VideoCoordinateMapper 持有）",
+                    text.contains("case 90:") || text.contains("case 270:"));
+            assertFalse(source.getName() + " 不得直接按 View 尺寸缩放视频坐标",
+                    text.contains("* viewWidth") || text.contains("/ viewWidth")
+                            || text.contains("* viewHeight") || text.contains("/ viewHeight"));
+        }
+
+        String overlay = read(new File(debugDir, "TargetDebugOverlayView.java"));
+        assertTrue("叠加层必须经 VideoCoordinateMapper.mapVideoToView(...) 正推回 View 坐标",
+                overlay.contains("VideoCoordinateMapper.mapVideoToView("));
+        assertFalse("叠加层不该自行反解（反解只属于点击路径）",
+                overlay.contains("VideoCoordinateMapper.map("));
+        assertFalse("调试层不得持有 Bitmap（只画矢量标记）",
+                overlay.contains("import android.graphics.Bitmap"));
+
+        String state = read(new File(debugDir, "TargetDebugState.java"));
+        assertTrue("状态对象也必须经 mapper 做回投影", state.contains("VideoCoordinateMapper.mapVideoToView("));
+        assertFalse("TargetDebugState 必须保持纯 JVM（否则状态推导无法单测）",
+                state.contains("import android."));
+    }
+
     // ---------------------------------------------------------------- utils
 
     private static void assertNoDependency(String deps, String needle) {

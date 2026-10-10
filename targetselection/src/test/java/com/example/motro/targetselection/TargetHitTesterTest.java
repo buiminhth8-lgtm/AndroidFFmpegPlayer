@@ -2,7 +2,6 @@ package com.example.motro.targetselection;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -22,10 +21,15 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * {@link TargetHitTester} 的命中判定与多候选选择顺序。
+ * {@link TargetHitTester} 的<b>过滤</b>行为：哪些框被点到了。
  *
- * <p>这些用例是纯几何的：命中测试不依赖掩码、颜色、ROI，因此可以把每条优先级规则
+ * <p>这些用例是纯几何的：命中过滤不依赖掩码、颜色、ROI，因此可以把每条规则
  * 单独钉住，而不必去构造一张恰好满足条件的图片。</p>
+ *
+ * <p><b>多候选的排序与选择不在这里测</b> —— 那是
+ * {@code TargetCandidateSelector} 的职责，见 {@code TargetCandidateSelectorTest}。
+ * 本类只保证"过滤结果如实、完整、不排序"，边界划清以后，调选择权重就不会
+ * 顺手动到这里已经很稳的几何判定。</p>
  */
 public class TargetHitTesterTest {
 
@@ -39,10 +43,11 @@ public class TargetHitTesterTest {
         TargetHitTestResult result = new TargetHitTester(0).hitTest(150f, 150f, one(box));
 
         assertTrue(result.isHit());
-        assertSame(box, result.selectedBox);
         assertEquals(1, result.hitCount());
+        assertSame(box, result.hitCandidates.get(0));
         assertEquals(1, result.candidateCount);
         assertEquals(0, result.tolerancePx);
+        assertTrue(result.isUnambiguousHit());
     }
 
     @Test
@@ -51,7 +56,7 @@ public class TargetHitTesterTest {
         TargetHitTestResult result = new TargetHitTester(10).hitTest(260f, 150f, one(box));
 
         assertFalse(result.isHit());
-        assertNull(result.selectedBox);
+        assertTrue(result.hitCandidates.isEmpty());
         assertEquals(1, result.candidateCount);
         assertEquals(0, result.hitCount());
     }
@@ -111,7 +116,7 @@ public class TargetHitTesterTest {
 
         assertTrue(result.isHit());
         assertEquals(50, result.tolerancePx);
-        final TargetBoundingBox returned = result.selectedBox.rectInVideo;
+        final TargetBoundingBox returned = result.hitCandidates.get(0).rectInVideo;
         assertEquals(100f, returned.left, EPS);
         assertEquals(100f, returned.top, EPS);
         assertEquals(200f, returned.right, EPS);
@@ -125,99 +130,46 @@ public class TargetHitTesterTest {
         assertTrue(new TargetHitTester(0).hitTest(200f, 200f, one(box)).isHit());
     }
 
-    // ---------------------------------------------------------------- 多候选优先级
-
-    /**
-     * 优先级 1：严格包含（不看容差）胜过"靠容差勉强够到" —— 即使后者面积小得多。
-     */
     @Test
-    public void strictContainmentBeatsToleranceEvenWhenTheOtherBoxIsSmaller() {
-        DetectedTargetBox big = box(100, 100, 200, 200, 0.5f);      // 严格包含 (150,150)，面积大
-        DetectedTargetBox small = box(160, 140, 180, 160, 0.5f);    // 面积小，但不严格包含
-        TargetHitTestResult result = new TargetHitTester(20).hitTest(150f, 150f,
-                Arrays.asList(small, big));
-
-        assertTrue(result.isHit());
-        assertEquals(2, result.hitCount());
-        assertSame("严格包含者必须优先", big, result.selectedBox);
+    public void zeroToleranceRejectsAPointJustOutsideTheBorder() {
+        DetectedTargetBox box = box(100, 100, 200, 200, 0.8f);
+        assertFalse("容差为 0 时边界外 1px 不该命中",
+                new TargetHitTester(0).hitTest(201f, 150f, one(box)).isHit());
     }
 
-    /**
-     * 优先级 2：都没有严格包含时，触摸点到框中心更近者优先。
-     */
-    @Test
-    public void closerCenterWinsWhenNeitherContainsTheTouch() {
-        DetectedTargetBox near = box(120, 80, 200, 120, 0.5f);      // 中心 (160,100)，距 (100,100) = 60
-        DetectedTargetBox far = box(140, 80, 220, 120, 0.5f);       // 中心 (180,100)，距 (100,100) = 80
-        TargetHitTestResult result = new TargetHitTester(50).hitTest(100f, 100f,
-                Arrays.asList(far, near));
-
-        assertEquals(2, result.hitCount());
-        assertSame("中心更近者必须优先", near, result.selectedBox);
-    }
+    // ---------------------------------------------------------------- 顺序与完整性
 
     /**
-     * 优先级 3：同为中心距离、都严格包含时，面积更小者优先。
+     * 过滤结果<b>保持输入顺序</b>：排序是选择器的职责，过滤层不该带任何倾向。
+     * 若这里偷偷排一次，就等于把"哪个更好"的知识塞进了过滤层 ——
+     * 而选择权重明明配在另一处，于是两套优先级会各自漂移、逐渐不一致。
      */
     @Test
-    public void smallerAreaWinsWhenCentersAndContainmentTie() {
-        DetectedTargetBox outer = box(100, 100, 200, 200, 0.5f);    // 中心 (150,150)，面积 10000
-        DetectedTargetBox inner = box(120, 120, 180, 180, 0.5f);    // 中心 (150,150)，面积 3600
-        TargetHitTestResult result = new TargetHitTester(0).hitTest(150f, 150f,
-                Arrays.asList(outer, inner));
-
-        assertEquals(2, result.hitCount());
-        assertSame("中心重合时面积更小者优先", inner, result.selectedBox);
-    }
-
-    /**
-     * 优先级 4：前三级全部打平时，置信度更高者优先。
-     */
-    @Test
-    public void higherConfidenceWinsWhenEverythingElseTies() {
-        DetectedTargetBox low = box(100, 100, 200, 200, 0.3f);
-        DetectedTargetBox high = box(100, 100, 200, 200, 0.9f);
-        TargetHitTestResult result = new TargetHitTester(0).hitTest(150f, 150f,
-                Arrays.asList(low, high));
-
-        assertSame("置信度更高者优先", high, result.selectedBox);
-    }
-
-    /**
-     * 顺序必须<b>确定</b>：同样的输入换一下列表顺序，结果仍然一致。
-     * 这是"复杂重叠策略留到 Slice 6"的前提 —— 本 Slice 至少不能是不确定的。
-     */
-    @Test
-    public void selectionIsIndependentOfInputOrder() {
-        DetectedTargetBox a = box(100, 100, 200, 200, 0.5f);
-        DetectedTargetBox b = box(120, 120, 180, 180, 0.5f);
-        DetectedTargetBox c = box(140, 140, 160, 160, 0.5f);
-
-        DetectedTargetBox first = new TargetHitTester(0)
-                .hitTest(150f, 150f, Arrays.asList(a, b, c)).selectedBox;
-        DetectedTargetBox second = new TargetHitTester(0)
-                .hitTest(150f, 150f, Arrays.asList(c, a, b)).selectedBox;
-        DetectedTargetBox third = new TargetHitTester(0)
-                .hitTest(150f, 150f, Arrays.asList(b, c, a)).selectedBox;
-
-        assertSame(first, second);
-        assertSame(first, third);
-        assertSame("三者都严格包含，面积最小的 c 应当胜出", c, first);
-    }
-
-    @Test
-    public void allHitsAreReturnedSortedByPriority() {
-        DetectedTargetBox outer = box(100, 100, 300, 300, 0.5f);    // 面积 40000
-        DetectedTargetBox middle = box(120, 120, 240, 240, 0.5f);   // 面积 14400
-        DetectedTargetBox inner = box(140, 140, 180, 180, 0.5f);    // 面积 1600
+    public void allHitsAreReturnedInInputOrder() {
+        DetectedTargetBox outer = box(100, 100, 300, 300, 0.5f);
+        DetectedTargetBox middle = box(120, 120, 240, 240, 0.5f);
+        DetectedTargetBox inner = box(140, 140, 180, 180, 0.5f);
         TargetHitTestResult result = new TargetHitTester(0).hitTest(160f, 160f,
                 Arrays.asList(outer, middle, inner));
 
         assertEquals(3, result.hitCount());
-        List<DetectedTargetBox> hits = result.hitCandidates;
-        assertSame(inner, hits.get(0));
-        assertSame(middle, hits.get(1));
-        assertSame(outer, hits.get(2));
+        assertSame(outer, result.hitCandidates.get(0));
+        assertSame(middle, result.hitCandidates.get(1));
+        assertSame(inner, result.hitCandidates.get(2));
+        assertFalse("三个都命中，不该号称「唯一命中」", result.isUnambiguousHit());
+    }
+
+    @Test
+    public void nonHitsAreExcludedFromTheHitList() {
+        DetectedTargetBox hit = box(100, 100, 200, 200, 0.5f);
+        DetectedTargetBox far = box(400, 400, 500, 500, 0.5f);
+        TargetHitTestResult result = new TargetHitTester(5).hitTest(150f, 150f,
+                Arrays.asList(far, hit));
+
+        assertEquals(2, result.candidateCount);
+        assertEquals(1, result.hitCount());
+        assertSame(hit, result.hitCandidates.get(0));
+        assertTrue(result.isUnambiguousHit());
     }
 
     @Test
@@ -237,6 +189,19 @@ public class TargetHitTesterTest {
     public void toleranceComesFromTheConfigByDefault() {
         TargetSelectionConfig config = TargetSelectionConfig.defaults();
         assertEquals(config.touchTolerancePx, new TargetHitTester(config).tolerancePx());
+    }
+
+    @Test
+    public void missKeepsTheTouchPointAndToleranceForDiagnostics() {
+        TargetHitTestResult result = new TargetHitTester(7).hitTest(11f, 22f,
+                one(box(100, 100, 200, 200, 0.5f)));
+
+        assertFalse(result.isHit());
+        assertTrue("MISS 时命中列表必须为空", result.hitCandidates.isEmpty());
+        assertEquals(11f, result.touchVideoX, EPS);
+        assertEquals(22f, result.touchVideoY, EPS);
+        assertEquals(7, result.tolerancePx);
+        assertTrue(result.debugString(), result.debugString().contains("hits=0"));
     }
 
     // ---------------------------------------------------------------- 辅助

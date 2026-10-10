@@ -4,13 +4,18 @@ import com.example.motro.targetselection.api.TargetSelectionConfig;
 import com.example.motro.targetselection.geometry.TargetBoundingBox;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 
 /**
- * 「触摸点 vs 候选框」的命中测试。<b>独立于检测</b>：它只吃
- * {@link DetectedTargetBox} 列表与一个视频坐标点，不知道掩码、ROI、颜色阈值的存在，
- * 因此可以在纯 JVM 里穷举验证，也不会因为检测算法改动而失效。
+ * 「触摸点 vs 候选框」的命中<b>过滤</b>。<b>独立于检测、也独立于选择</b>：
+ * 它只吃 {@link DetectedTargetBox} 列表与一个视频坐标点，不知道掩码、ROI、颜色阈值的存在，
+ * 因此可以在纯 JVM 里穷举验证，也不会因为检测算法或选择策略改动而失效。
+ *
+ * <h2>职责边界（与 {@link TargetCandidateSelector} 的分工）</h2>
+ * 本类只回答一个问题：<b>哪些框被点到了</b>。给一个点和一个框，答案唯一，与策略无关。
+ * 「其中哪个才是用户想点的」由 {@link TargetCandidateSelector} 负责 ——
+ * 因此这里返回的 {@link TargetHitTestResult#hitCandidates} <b>不排序</b>，
+ * 保持输入顺序（确定但无倾向），排序与选择只有一处实现。
  *
  * <h2>容差</h2>
  * 判定用的是把框向外扩 {@code touchTolerancePx} 之后的矩形（见
@@ -20,16 +25,9 @@ import java.util.List;
  * 又会让绘制、对齐、后续 Label ROI 全部外扩一圈 —— 这是最难被发现的一类错误，
  * 因为画面"看起来还行"。所以容差<b>只进不出</b>。
  *
- * <h2>多候选选择顺序（本 Slice 有意保持简单、确定）</h2>
- * <ol>
- *   <li><b>严格包含</b>触摸点的优先（不看容差的那一层判定）—— 点真正落在框内，
- *       比"靠容差勉强够到"可信得多；</li>
- *   <li>触摸点到框<b>中心</b>距离更小者优先；</li>
- *   <li><b>面积更小</b>者优先（点在大小重叠的两框里时，小框通常是更具体的那个目标）；</li>
- *   <li>置信度更高者优先；</li>
- *   <li>最后按上边界、左边界排序，纯粹为了让<b>同分情况下结果也唯一确定</b>。</li>
- * </ol>
- * <p>复杂的重叠消歧（例如"框中有框"该选谁）留给 Slice 6，这里不引入任何随机性与启发式权重。</p>
+ * <p>「点在框里」与「靠容差够到」的区别由
+ * {@link TargetCandidateSelector} 在分级时重新判定（{@link TargetHitType}）——
+ * 那属于排序信息，不是过滤信息，所以不在这里产出。</p>
  *
  * <p>线程约定：不可变（只有容差一个配置值），可跨线程调用。</p>
  */
@@ -60,12 +58,13 @@ public final class TargetHitTester {
     }
 
     /**
-     * 判定触摸点是否落在某个候选框上。
+     * 过滤出被触摸点命中的候选框。
      *
      * @param touchVideoX 触摸点视频像素 x，必须有限
      * @param touchVideoY 触摸点视频像素 y，必须有限
-     * @param candidates  候选框；null 或空视为没有候选
-     * @return 非 null 的结果；命中时 {@code selectedBox} 为优先级最高的那个
+     * @param candidates  候选框；null 或空视为没有候选；元素为 null 时跳过但计入
+     *                    {@link TargetHitTestResult#candidateCount}
+     * @return 非 null 的结果；命中时 {@code hitCandidates} 为<b>输入顺序</b>的全部命中框
      * @throws IllegalArgumentException 触摸坐标非有限值
      */
     public TargetHitTestResult hitTest(float touchVideoX, float touchVideoY,
@@ -80,7 +79,7 @@ public final class TargetHitTester {
             return TargetHitTestResult.miss(touchVideoX, touchVideoY, 0, tolerancePx, elapsedMs(startNs));
         }
 
-        final List<DetectedTargetBox> hits = new ArrayList<>();
+        final List<DetectedTargetBox> hits = new ArrayList<>(total);
         for (int i = 0; i < total; i++) {
             final DetectedTargetBox box = candidates.get(i);
             if (box == null) {
@@ -93,55 +92,13 @@ public final class TargetHitTester {
         if (hits.isEmpty()) {
             return TargetHitTestResult.miss(touchVideoX, touchVideoY, total, tolerancePx, elapsedMs(startNs));
         }
-
-        hits.sort(byPriority(touchVideoX, touchVideoY));
-        return TargetHitTestResult.hit(hits.get(0), hits, touchVideoX, touchVideoY,
+        return TargetHitTestResult.hits(hits, touchVideoX, touchVideoY,
                 total, tolerancePx, elapsedMs(startNs));
     }
 
     /** 当前生效的容差（视频像素）。 */
     public int tolerancePx() {
         return tolerancePx;
-    }
-
-    // ------------------------------------------------------------------ 优先级
-
-    private static Comparator<DetectedTargetBox> byPriority(float touchX, float touchY) {
-        return (a, b) -> {
-            // 1) 严格包含（不含容差）优先
-            final boolean insideA = a.rectInVideo.contains(touchX, touchY);
-            final boolean insideB = b.rectInVideo.contains(touchX, touchY);
-            if (insideA != insideB) {
-                return insideA ? -1 : 1;
-            }
-            // 2) 到中心的距离更小优先（用平方距离，省掉开方）
-            int result = Float.compare(centerDistanceSq(a, touchX, touchY), centerDistanceSq(b, touchX, touchY));
-            if (result != 0) {
-                return result;
-            }
-            // 3) 面积更小优先
-            result = Float.compare(a.videoArea(), b.videoArea());
-            if (result != 0) {
-                return result;
-            }
-            // 4) 置信度更高优先
-            result = Float.compare(b.confidence, a.confidence);
-            if (result != 0) {
-                return result;
-            }
-            // 5) 兜底：让结果唯一确定，而不是依赖排序算法的稳定性
-            result = Float.compare(a.rectInVideo.top, b.rectInVideo.top);
-            if (result != 0) {
-                return result;
-            }
-            return Float.compare(a.rectInVideo.left, b.rectInVideo.left);
-        };
-    }
-
-    private static float centerDistanceSq(DetectedTargetBox box, float touchX, float touchY) {
-        final float dx = box.rectInVideo.centerX() - touchX;
-        final float dy = box.rectInVideo.centerY() - touchY;
-        return dx * dx + dy * dy;
     }
 
     private static long elapsedMs(long startNs) {

@@ -57,7 +57,11 @@ public final class BlueBoxTargetProvider implements TargetProvider {
             return null;
         }
         final DetectedTargetBox box = result.selectedBox;
-        return TargetCandidate.withoutId(box.rectInVideo, box.confidence);
+        // 顺带把命中分级（EXACT/TOLERANCE）与候选总数带上去：它们是 Slice 6 之后
+        // 排查"为什么选中了这个框 / 为什么没点中"的主要线索，而 provider 是唯一
+        // 能看到完整分析结果的地方。控制器会原样透传，不做任何判定。
+        return TargetCandidate.withoutId(box.rectInVideo, box.confidence,
+                result.hitType, result.candidateCount);
     }
 
     /** 当前生效的默认策略。 */

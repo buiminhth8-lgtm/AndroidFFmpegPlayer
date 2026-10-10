@@ -22,3 +22,6 @@ __pycache__/
 # Slice 5（矩形恢复 + 点击命中）的样本：同样由 build_samples.sh 现场生成（真实解码帧 +
 # HEVC 往返），体积大且含采集素材内容，不入版本库
 /artifacts/target_box_samples/
+# Slice 6（多目标选择）的样本：同样由 build_samples.sh 现场生成，只是把点按坐标换成
+# 了"多目标场景"（相邻框、重叠框、嵌套框、点击两框之间、点击 id 文字行……）
+/artifacts/target_selection_samples/

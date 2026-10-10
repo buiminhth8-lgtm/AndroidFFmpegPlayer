@@ -39,6 +39,12 @@ import com.example.motro.targetselection.vision.TargetProvider;
  * <p><b>顺序说明</b>：几何校验被前置于取帧 —— 点在黑边上时不必浪费一次帧回读，
  * 这是对“取帧→映射”管线顺序的有意调整，语义不变。</p>
  *
+ * <p><b>诊断字段透传（Slice 6）</b>：{@link TargetHitResult#hitType} 与
+ * {@link TargetHitResult#candidateCount} 由 provider 提供、本类原样带上，
+ * 用于回答"这次是扎实命中还是擦边命中""当时有几个候选在竞争"。
+ * 本类<b>不参与</b>任何命中或选择的判断 —— 那些都在视觉层完成，
+ * 这里只做状态映射，免得同一套优先级在两个层次各写一遍。</p>
+ *
  * <p><b>线程约定（重要）</b>：{@link #selectTargetAtViewPoint} 是<b>同步阻塞</b>调用，
  * 内部会做帧回读与识别，<b>禁止在主线程调用</b>。调用方负责切到工作线程，
  * 并把结果切回主线程更新 UI（本类返回不可变结果，可安全跨线程传递）。</p>
@@ -139,7 +145,9 @@ public final class TargetSelectionController {
             final long processingMs = elapsedMs(startNs);
 
             if (candidate == null || candidate.confidence < config.minConfidence) {
-                return TargetHitResult.miss(videoX, videoY, frame.ptsUs, processingMs);
+                // 有候选但没点中，与"画面里没有候选"是两回事：前者带候选数，后者为 0。
+                return TargetHitResult.miss(videoX, videoY, frame.ptsUs, processingMs,
+                        candidate == null ? 0 : candidate.candidateCount);
             }
             if (candidate.hasId()) {
                 return TargetHitResult.hit(candidate.targetId, candidate.boundingBox, candidate.confidence,
@@ -147,10 +155,12 @@ public final class TargetSelectionController {
             }
             if (!config.reportUnknownTargetId) {
                 // 上层只认 id：半成品结果降级为 MISS，而不是让它自己去猜
-                return TargetHitResult.miss(videoX, videoY, frame.ptsUs, processingMs);
+                return TargetHitResult.miss(videoX, videoY, frame.ptsUs, processingMs,
+                        candidate.candidateCount);
             }
             return TargetHitResult.hitIdUnknown(candidate.boundingBox, candidate.confidence,
-                    videoX, videoY, frame.ptsUs, processingMs);
+                    videoX, videoY, frame.ptsUs, processingMs,
+                    candidate.hitType, candidate.candidateCount);
         } finally {
             frame.release();
         }

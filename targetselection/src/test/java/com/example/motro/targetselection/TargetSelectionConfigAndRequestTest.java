@@ -81,6 +81,65 @@ public class TargetSelectionConfigAndRequestTest {
                 config.maxCandidateCount >= 1);
     }
 
+    /**
+     * Slice 6 的多目标选择配置：默认值必须"让几何说话"，而不是让某个先验偏好主导。
+     */
+    @Test
+    public void selectionDefaultsAreTunedAndExplicit() {
+        TargetSelectionConfig config = TargetSelectionConfig.defaults();
+
+        assertEquals(TargetSelectionConfig.DEFAULT_EXACT_HIT_WEIGHT, config.exactHitWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_CENTER_DISTANCE_WEIGHT,
+                config.centerDistanceWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_AREA_WEIGHT, config.areaWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_CONFIDENCE_WEIGHT, config.confidenceWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_COMPLETENESS_WEIGHT,
+                config.completenessWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_PREFER_SMALLER_BOX, config.preferSmallerBox);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_RANKED_CANDIDATES, config.maxRankedCandidates);
+
+        assertTrue("EXACT 加分必须为正，否则总分里看不出'点在框里'这件事",
+                config.exactHitWeight > 0f);
+        assertTrue("中心距离与面积必须同量级，嵌套框场景才不会被单一偏好一边倒",
+                Math.abs(config.centerDistanceWeight - config.areaWeight) < 0.0001f);
+        assertTrue("辅助项（置信度/完整度）之和必须小于主项，不能单独扭转明确的几何劣势",
+                config.confidenceWeight + config.completenessWeight
+                        <= config.centerDistanceWeight + config.areaWeight);
+        assertTrue("名次明细上限必须 >= 1，否则连选中项的评分都留不下来",
+                config.maxRankedCandidates >= 1);
+    }
+
+    /** Slice 6 的选择权重非法必须在 <b>build()</b> 处失败：负权重会带来"越远越好"这类反直觉行为。 */
+    @Test
+    public void invalidSelectionValuesAreRejectedAtBuildTime() {
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().exactHitWeight(-0.1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().exactHitWeight(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder()
+                .exactHitWeight(Float.POSITIVE_INFINITY));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().centerDistanceWeight(-1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().centerDistanceWeight(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().areaWeight(-1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().areaWeight(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().confidenceWeight(-1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().confidenceWeight(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().completenessWeight(-1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().completenessWeight(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxRankedCandidates(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxRankedCandidates(-3));
+
+        // 权重可以为 0（等于关掉这一项），这是合法配置，不该被拦
+        TargetSelectionConfig allOff = TargetSelectionConfig.defaults().toBuilder()
+                .exactHitWeight(0f)
+                .centerDistanceWeight(0f)
+                .areaWeight(0f)
+                .confidenceWeight(0f)
+                .completenessWeight(0f)
+                .preferSmallerBox(false)
+                .build();
+        assertEquals(0f, allOff.exactHitWeight, 0f);
+        assertFalse(allOff.preferSmallerBox);
+    }
+
     /** Slice 5 的矩形恢复阈值非法必须在 <b>build()</b> 处失败。 */
     @Test
     public void invalidTargetBoxValuesAreRejectedAtBuildTime() {
@@ -170,6 +229,13 @@ public class TargetSelectionConfigAndRequestTest {
                 .minBoxConfidence(0.55f)
                 .touchTolerancePx(24)
                 .maxCandidateCount(8)
+                .exactHitWeight(2f)
+                .centerDistanceWeight(0.75f)
+                .areaWeight(1.5f)
+                .confidenceWeight(0.25f)
+                .completenessWeight(0.125f)
+                .preferSmallerBox(false)
+                .maxRankedCandidates(3)
                 .build();
 
         assertNotSame(original, changed);
@@ -193,6 +259,16 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_CONFIDENCE, original.minBoxConfidence, 0.0001f);
         assertEquals(TargetSelectionConfig.DEFAULT_TOUCH_TOLERANCE_PX, original.touchTolerancePx);
         assertEquals(TargetSelectionConfig.DEFAULT_MAX_CANDIDATE_COUNT, original.maxCandidateCount);
+        // Slice 6 的选择策略也必须被 toBuilder 带上，否则"改一个权重"会悄悄丢掉其它选择配置
+        assertEquals(TargetSelectionConfig.DEFAULT_EXACT_HIT_WEIGHT, original.exactHitWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_CENTER_DISTANCE_WEIGHT,
+                original.centerDistanceWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_AREA_WEIGHT, original.areaWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_CONFIDENCE_WEIGHT, original.confidenceWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_COMPLETENESS_WEIGHT,
+                original.completenessWeight, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_PREFER_SMALLER_BOX, original.preferSmallerBox);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_RANKED_CANDIDATES, original.maxRankedCandidates);
 
         assertFalse(changed.enabled);
         assertEquals(1200L, changed.captureTimeoutMs);
@@ -221,6 +297,13 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(0.55f, changed.minBoxConfidence, 0.0001f);
         assertEquals(24, changed.touchTolerancePx);
         assertEquals(8, changed.maxCandidateCount);
+        assertEquals(2f, changed.exactHitWeight, 0.0001f);
+        assertEquals(0.75f, changed.centerDistanceWeight, 0.0001f);
+        assertEquals(1.5f, changed.areaWeight, 0.0001f);
+        assertEquals(0.25f, changed.confidenceWeight, 0.0001f);
+        assertEquals(0.125f, changed.completenessWeight, 0.0001f);
+        assertFalse(changed.preferSmallerBox);
+        assertEquals(3, changed.maxRankedCandidates);
     }
 
     @Test

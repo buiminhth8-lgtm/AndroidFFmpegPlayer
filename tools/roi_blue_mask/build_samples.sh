@@ -325,8 +325,233 @@ emit_box_sample id_1963_with_box_hit 270 160 HIT_BOX "120,40,420,280" no \
 drawtext=fontfile='$FONT_ESC':text='id\\:1963':x=140:y=290:fontsize=30:fontcolor=$BLUE"
 
 echo
+echo "=============================================================================="
+echo "Slice 6（多目标 / 重叠目标选择策略）样本"
+echo "=============================================================================="
+#
+# 与 Slice 5 样本的区别：Slice 5 期望的是「命中了哪一个框」，本段期望的是
+# 「多个框同时命中时，最终选了哪一个，以及凭什么」。于是除了 expect / box 之外，
+# 每个样本还记下 hitType（严格包含还是容差）、hits（同时命中的候选数）、
+# 期望的候选框数，以及一条"不许越界"的几何约束。
+#
+# 为什么单独一个目录：Slice 5 样本的期望是"命中/不命中"，本段的期望多出若干字段。
+# 分开以后，两批样本各自可独立复跑，Slice 5 的验收结论不会被本段的期望改写。
+#
+# 场景覆盖（对应需求里的 A~H）：
+#   A 两个完全独立目标、B 两框边缘接近、C 两框部分重叠、D 大框包含小框、
+#   E 触摸点在重叠区、F 仅靠容差命中多个框、G 小目标与大目标同时包含触摸点、
+#   H ROI 边缘的不完整候选框；另外覆盖"点框边缘""点两框之间""点 id 文字附近"。
+#
+# 几何前提（默认 roiRadius=200，即 ROI 为 400x400）：
+#   要恢复一个矩形，ROI 里必须看到**成对的边**。所以每个目标框在至少一个方向上
+#   必须小于 400px。点击点的放置也照着这条约束挑过：
+#     touchX ∈ [boxRight-200, boxLeft+200]、touchY ∈ [boxBottom-200, boxTop+200]
+#   才能同时框住两条对边。下面每个点击点都满足这条（脚本末尾的注释里逐个标了）。
+#
+# 默认 touchTolerancePx=12：容差命中与"点不中"之间只差 12 像素，
+#   所以下面凡是故意做"容差命中"的样本，点都放在离框边 11px 以内；
+#   凡是故意做"点不中"的样本，点都离边框 30px 以上。这样期望值不会骑在边界上。
+#
+# 一个曾经放不进来、现在靠检测层修复才成立的场景：**大框包含小框（场景 D）**。
+#   Slice 5 的矩形恢复原先按"该行所有蓝像素的并集"取边带跨度，于是内层小框的边会被
+#   外层大框的两条竖边把跨度从 110px 撑到 270px，实心度 1.0 → 0.44 < minEdgeSolidity(0.5)，
+#   内层框的边被当成"借像素凑出来的假边"丢掉 —— 内层框永远不会成为候选，
+#   用户点它只会选中外面的大框（而框的位置还是对的，属于最难被发现的那类错误）。
+#   修复后跨度只统计"比线宽上限还长的段"，嵌套框可以正常恢复，样本 nested_boxes_prefer_the_smaller
+#   因此既能验选择策略，又能当这条修复的回归哨兵（候选数必须为 2）。
+SELECT_OUT_DIR="${SELECT_OUT_DIR:-artifacts/target_selection_samples}"
+mkdir -p "$SELECT_OUT_DIR"
+rm -f "$SELECT_OUT_DIR"/*.rgba "$SELECT_OUT_DIR"/*.txt
+
+# render_overlay <name> <out_dir> <filters...>
+#
+# 合成叠加层 → 强制 yuv420p 的 HEVC 往返 → 解码回 RGBA。
+# 为什么不回头把 Slice 4/5 的两段也改成调它：那两批样本已经被验证过、写进了各自的
+# 验收结论，动它们会让"上一次验过的输入还是不是同一份"无法追溯。此处只服务新样本。
+render_overlay() {
+  local name="$1" out_dir="$2"
+  shift 2
+  local filters="$*"
+
+  "$FFMPEG" -v error -y -f rawvideo -pix_fmt rgba -s "${WIDTH}x${HEIGHT}" -i "$GRAY" \
+    -vf "$filters" -frames:v 1 -f rawvideo -pix_fmt rgba "$TMP/$name.comp.rgba"
+
+  "$FFMPEG" -v error -y -f rawvideo -pix_fmt rgba -s "${WIDTH}x${HEIGHT}" -i "$TMP/$name.comp.rgba" \
+    -frames:v 1 -c:v libx265 -crf "$CRF" -pix_fmt yuv420p \
+    -x265-params "log-level=error" "$TMP/$name.mp4"
+
+  "$FFMPEG" -v error -y -i "$TMP/$name.mp4" -frames:v 1 \
+    -f rawvideo -pix_fmt rgba "$out_dir/$name.rgba"
+}
+
+# opt_meta <file> <key> <value>：value 为 "-" 时不写这一行（表示"本样本不校验该项"）
+opt_meta() {
+  if [ "$3" != "-" ]; then
+    echo "$2=$3" >> "$1"
+  fi
+}
+
+# emit_selection_sample <name> <touchX> <touchY> <expect> <box> <hitType> <hits>
+#                       <cand> <clipped> <maxBottom> <note> <filter...>
+#   expect    : HIT_BOX（选了 box） / MISS（没命中） / NO_BOX（没有候选框）
+#   box       : "left,top,right,bottom"（期望被选中的那个框）或 "-"
+#   hitType   : EXACT_HIT / TOLERANCE_HIT / "-"（不校验）
+#   hits      : 期望的同时命中候选个数 / "-"
+#   cand      : 期望的候选框总数 / "-"
+#   maxBottom : 任何候选框的下边界不得超过它 / "-"（用来证明 id 文字没被吃进框里）
+emit_selection_sample() {
+  local name="$1" touch_x="$2" touch_y="$3" expect="$4" box="$5"
+  local hit_type="$6" hits="$7" cand="$8" clipped="$9" max_bottom="${10}" note="${11}"
+  shift 11
+  local filters="$*"
+
+  render_overlay "$name" "$SELECT_OUT_DIR" "$filters"
+
+  local meta="$SELECT_OUT_DIR/$name.txt"
+  cat > "$meta" <<EOF
+# 由 tools/roi_blue_mask/build_samples.sh 生成（Slice 6），请勿手工编辑
+source=$BASE_VIDEO
+sourceTimeSeconds=$BASE_TIME
+codec=hevc
+crf=$CRF
+base=desaturated
+width=$WIDTH
+height=$HEIGHT
+touchX=$touch_x
+touchY=$touch_y
+expect=$expect
+clipped=$clipped
+note=$note
+EOF
+  opt_meta "$meta" hitType "$hit_type"
+  opt_meta "$meta" hits "$hits"
+  opt_meta "$meta" expectCandidates "$cand"
+  opt_meta "$meta" maxCandidateBottom "$max_bottom"
+  if [ "$box" != "-" ]; then
+    IFS=',' read -r bx1 by1 bx2 by2 <<< "$box"
+    {
+      echo "boxLeft=$bx1"
+      echo "boxTop=$by1"
+      echo "boxRight=$bx2"
+      echo "boxBottom=$by2"
+    } >> "$meta"
+  fi
+
+  printf '  %-42s touch=(%s,%s) expect=%-8s hits=%-2s hitType=%-13s box=%-20s %s\n' \
+    "$name" "$touch_x" "$touch_y" "$expect" "$hits" "$hit_type" "$box" "$note"
+}
+
+echo "生成样本 :"
+
+# 1) 【场景 A/B】多车辆相邻：两个完全独立的框，点严格落在左边那个里面。
+#    点 (320,315) 在 A[240..400]×[250..380] 内；到 B.left=460 的距离 140px ≫ 容差 12，
+#    所以 B 连容差都够不到 —— 命中数必须是 1，且必须选 A。
+#
+#    右侧那个框只有 70x70 是有意的：两个框的"上边线/下边线"若落在同一个 ROI 行上，
+#    边带会互相配对造出一个"从 A 的左边界跨到 B 的右边"的假框（它不是虚的 ——
+#    它的四条边都是真实蓝像素，只是分属两个目标）。用 70px 的小框能让那个假框的
+#    左右边覆盖率掉到 0.26 以下、置信度 0.28 < minBoxConfidence(0.3)，从而被自然淘汰。
+#    这也解释了为什么"多目标"样本在这里要特意避免两个等宽框并排。
+emit_selection_sample adjacent_boxes_pick_the_clicked_one 320 315 HIT_BOX "240,250,400,380" \
+  EXACT_HIT 1 2 no - "多车辆相邻：点左边那个框，必须只选它" \
+  "drawbox=x=240:y=250:w=160:h=130:color=$BLUE:t=4,\
+drawbox=x=460:y=300:w=70:h=70:color=$BLUE:t=4"
+
+# 2) 【点两个框之间】两个框相距 140px，点(510,350) 落在正中间，离两边各 70px。
+#    容差只有 12px，所以两侧都够不到 —— 必须谁都不选（MISS），而不是"就近吸附"。
+#    这条样本是需求里"点击两个目标中间时不要错误吸附"的最强形式：
+#    真正的吸附错误发生在容差刚好够到两边时，而那时两框必然相距 < 24px，
+#    也就必然落进上面说的"边带互相配对造出假框"的地带，样本本身无法干净地隔离。
+#    "两侧都被容差命中、必须选更近的那个"这条由纯几何的单元测试穷举覆盖
+#    （TargetCandidateSelectorTest#toleranceOnlyHitsPickTheCloserOne）。
+#    两个框上下错开 110px，是为了让"从 A 右边界跨到 B 右边界"的假框因
+#    纵向重叠不足 50% 被配对规则直接拒掉。
+emit_selection_sample click_between_two_boxes_selects_neither 510 350 MISS - \
+  - - 2 no - "点两个框正中间：谁都不许被选中（不许就近吸附）" \
+  "drawbox=x=280:y=230:w=160:h=130:color=$BLUE:t=4,\
+drawbox=x=580:y=340:w=160:h=140:color=$BLUE:t=4"
+
+# 3) 【场景 C/E 的小框版】两个大小不同的框部分重叠，点(540,400) 落在重叠区里，
+#    所以两者都是严格命中。小框（140x120）在面积上明显更"具体"，
+#    在归一化中心距离上也更近（0.54 对 0.60）→ 两项判据一致指向小框，必须选小框。
+#    注意大框在 ROI 里被左边界截断（它的左边线在 ROI 之外），
+#    因此落到比较里的是"裁剪后的大框"——这正是场景 H 的真实形态。
+emit_selection_sample overlapping_boxes_prefer_the_smaller_one 540 400 HIT_BOX "520,340,660,460" \
+  EXACT_HIT 2 - no - "大小不同的两框重叠，点在重叠区：必须选更小更具体的小框" \
+  "drawbox=x=300:y=220:w=260:h=260:color=$BLUE:t=4,\
+drawbox=x=520:y=340:w=140:h=120:color=$BLUE:t=4"
+
+# 4) 【场景 G】小目标贴着一个大框（大框在其左上方）：点(610,380) 落在小框内，
+#    到大框最近边 131px，连容差都够不到 → 命中数必须是 1，必须选小框。
+#    大框在 ROI 里只剩一条右边线和两条水平边（左边线在 ROI 之外），
+#    被恢复成一个"裁剪框"——它照样不该把点击吸走。
+emit_selection_sample small_target_next_to_a_large_box 610 380 HIT_BOX "560,340,660,420" \
+  EXACT_HIT 1 2 no - "小目标贴大框：点小目标必须选小目标，不许被大框吸走" \
+  "drawbox=x=260:y=240:w=220:h=200:color=$BLUE:t=4,\
+drawbox=x=560:y=340:w=100:h=80:color=$BLUE:t=4"
+
+# 5) 【点击 bbox 边缘】点(285,335) 落在框左边线内侧 5px（框 120x170）。
+#    点"贴着框线"是真实点击习惯，必须仍然是严格包含命中，不能退化成容差命中。
+#    框取得窄（120px）是为了让 ROI 右界(touch+200=485)离框右边线(400)有 85px 余量，
+#    不会因为"边线正好压住 ROI 边界"而把框标成 clippedByRoi。
+emit_selection_sample click_just_inside_the_box_border 285 335 HIT_BOX "280,250,400,420" \
+  EXACT_HIT 1 1 no - "点框线内侧 5px：必须仍算严格包含命中" \
+  "drawbox=x=280:y=250:w=120:h=170:color=$BLUE:t=4"
+
+# 6) 【点 id 文字区域附近】框(260,220,545,360) 下方 35px 处画 id:1963 蓝字，
+#    点(355,411) 落在文字块正中，离框下边线 51px → 既不在框内也够不到容差 → MISS。
+#    这条样本真正要证明的是：**文字没有变成一个候选框**。于是显式断言候选数 = 1
+#    （只有那个框），并断言任何候选框的下边界都不得越过 380（越过就说明文字行被
+#    当成了一条边、和框的边配出了一个"更高的框"）。
+#    文字宽度约 103px，只覆盖框宽 285px 的 36% < minEdgeCoverage(0.5)，
+#    所以它连"一条边"都算不上；把它当"边带"看时厚度又超过 16px 上限，同样被拒。
+emit_selection_sample click_on_the_id_text_below_a_box 355 411 MISS - \
+  - - 1 no 380 "点 id:1963 文字区域：文字不得成为候选框，也不得并入上面的框" \
+  "drawbox=x=260:y=220:w=285:h=140:color=$BLUE:t=4,\
+drawtext=fontfile='$FONT_ESC':text='id\\:1963':x=300:y=395:fontsize=30:fontcolor=$BLUE"
+
+# 7) 【场景 C/E】两个同尺寸框部分重叠，点(450,435) 落在重叠区
+#    （x 440..500 × y 420..440）内，因此两者都是严格命中、面积相同。
+#    此时唯一能分胜负的是"离谁的中心更近"：A 中心(400,340) 距 107px、B 中心(540,520) 距 124px，
+#    归一化后 0.76 对 0.88 → 必须选 A。
+#    同尺寸是刻意的：面积项因此抵消，样本测的就只剩几何这一件事。
+#    两个框在 x 方向只重叠 60px（不足各自宽度的 50%），于是"跨框假框"会被
+#    配对规则（重叠需达到较长边的 minEdgeCoverage）直接拒掉，样本因此干净。
+emit_selection_sample overlapping_boxes_pick_the_nearer_center 450 435 HIT_BOX "300,240,500,440" \
+  EXACT_HIT 2 - no - "两框部分重叠，点在重叠区：必须选中心更近的那个" \
+  "drawbox=x=300:y=240:w=200:h=200:color=$BLUE:t=4,\
+drawbox=x=440:y=420:w=200:h=200:color=$BLUE:t=4"
+
+# 8) 【需求 3 的真实像素版】严格包含 vs 容差命中，且容差那个框在软性指标上更"讨喜"。
+#    A 是 190x190 的框，点(535,375) 在它内部、离右边线 5px；
+#    B 是 70x70 的小框，紧贴在 A 右边线外 6px 处，点离它 11px → 容差命中。
+#    软性指标对比：B 面积只有 A 的 14%（更小更具体，偏好小框的策略会站它那边），
+#    B 的归一化中心距离 0.92 也差于 A 的 0.67 —— 也就是说 B 面积占优、A 几何占优。
+#    结论必须由硬主键给出：A 是"点在框里"，B 只是"够到了" → 必须选 A。
+#    这条样本与单元测试 exactHitAlwaysBeatsToleranceHitEvenWhenTheToleranceBoxScoresHigher
+#    是同一命题的两个层面：那里用"把权重全清零"构造反例，这里用真实压缩过的像素。
+emit_selection_sample exact_containment_beats_the_smaller_box_beside_it 535 375 HIT_BOX \
+  "350,280,540,470" EXACT_HIT 2 2 no - \
+  "严格包含 vs 邻框容差命中：面积更小者也不许抢走真正被点中的框" \
+  "drawbox=x=350:y=280:w=190:h=190:color=$BLUE:t=4,\
+drawbox=x=546:y=345:w=70:h=70:color=$BLUE:t=4"
+
+# 9) 【场景 D】大框套小框：点(385,320) 同时在大框与小框内，两者都是严格命中。
+#    小框（110x100）在面积（11000 vs 72900）与归一化中心距离（0.067 vs 0.079）两项上都占优
+#    → 必须选小框。"大框面积更大因而更可信"这种想法在这里被明确否掉。
+#
+#    这条样本还兼任一个检测层的回归哨兵：内层框的两条水平边如果被外框竖边"借走跨度"，
+#    实心度会掉到 0.44 而被丢弃，候选数就只剩 1 —— 于是本样本会以"期望 2 个候选、实际 1 个"
+#    的形式失败，直接把"嵌套框被吞掉"这件事顶到台面上，而不是悄悄变成一次错误的选择。
+emit_selection_sample nested_boxes_prefer_the_smaller 385 320 HIT_BOX "330,270,440,370" \
+  EXACT_HIT 2 2 no - "大框套小框：两者都包含点击点，必须选更小更具体的" \
+  "drawbox=x=250:y=200:w=270:h=270:color=$BLUE:t=4,\
+drawbox=x=330:y=270:w=110:h=100:color=$BLUE:t=4"
+
+echo
 echo "完成：$(ls -1 "$OUT_DIR"/*.rgba | wc -l) 个 Slice 4 样本 → $OUT_DIR"
 echo "      $(ls -1 "$BOX_OUT_DIR"/*.rgba | wc -l) 个 Slice 5 样本 → $BOX_OUT_DIR"
+echo "      $(ls -1 "$SELECT_OUT_DIR"/*.rgba | wc -l) 个 Slice 6 样本 → $SELECT_OUT_DIR"
 echo "跑验证："
 echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*BlueMaskSampleSmokeTest*' \\"
 echo "      -Dtargetselection.sampleDir=$OUT_DIR \\"
@@ -334,4 +559,7 @@ echo "      -Dtargetselection.sampleReport=$OUT_DIR/report.txt"
 echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*TargetBoxSampleSmokeTest*' \\"
 echo "      -Dtargetselection.boxSampleDir=$BOX_OUT_DIR \\"
 echo "      -Dtargetselection.boxSampleReport=$BOX_OUT_DIR/report.txt"
+echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*TargetBoxSampleSmokeTest*' \\"
+echo "      -Dtargetselection.boxSampleDir=$SELECT_OUT_DIR \\"
+echo "      -Dtargetselection.boxSampleReport=$SELECT_OUT_DIR/report.txt"
 

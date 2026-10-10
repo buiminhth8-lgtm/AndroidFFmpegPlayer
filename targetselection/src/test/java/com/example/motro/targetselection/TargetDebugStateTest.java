@@ -8,6 +8,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import com.example.motro.targetselection.api.TargetSelectionConfig;
 import com.example.motro.targetselection.api.TouchSelectionRequest;
 import com.example.motro.targetselection.debug.TargetDebugState;
 import com.example.motro.targetselection.geometry.TargetBoundingBox;
@@ -20,8 +21,11 @@ import com.example.motro.targetselection.vision.DetectedTargetBox;
 import com.example.motro.targetselection.vision.RoiRect;
 import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
+import com.example.motro.targetselection.vision.TargetCandidateSelector;
 import com.example.motro.targetselection.vision.TargetHitTester;
 import com.example.motro.targetselection.vision.TargetHitTestResult;
+import com.example.motro.targetselection.vision.TargetHitType;
+import com.example.motro.targetselection.vision.TargetSelectionDecision;
 
 import org.junit.Test;
 
@@ -299,9 +303,11 @@ public class TargetDebugStateTest {
 
         TargetHitTestResult hit = new TargetHitTester(12)
                 .hitTest(180f, 170f, Arrays.asList(best, second));
+        TargetSelectionDecision decision = new TargetCandidateSelector(TargetSelectionConfig.defaults())
+                .select(180f, 170f, hit.hitCandidates);
         TargetBoxDetectionResult detection = TargetBoxDetectionResult
                 .detected(Arrays.asList(best, second), 6L)
-                .withHitTest(hit, 9L);
+                .withHitTest(hit, decision, 9L);
 
         // 先只挂掩码（processingMs 此时是掩码耗时），再挂检测结果
         TargetDebugState state = TargetDebugState.builder(mapping, 0L)
@@ -319,13 +325,26 @@ public class TargetDebugStateTest {
         assertEquals("processingMs 必须升级为 totalMs", 9L, state.processingMs);
         assertTrue(state.isHit());
 
+        // Slice 6：命中分级与排名明细也要落进来，否则叠加层答不出"为什么是它"
+        assertEquals(TargetHitType.EXACT_HIT, state.hitType());
+        assertEquals(1, state.rankedCandidates.size());
+        assertEquals(0, state.rankedCandidates.get(0).rank);
+        assertSame(best, state.rankedCandidates.get(0).box);
+        assertEquals(decision.selectionScore(), state.selectionScore(), 0f);
+        assertEquals(decision.selectionMs, state.selectionMs());
+        assertEquals(decision.reason, state.selectionReason());
+
         // 叠加层文本要能读出这些量
         final String text = state.debugString();
         assertTrue(text, text.contains("boxes=SUCCESS"));
         assertTrue(text, text.contains("candidates=2"));
+        assertTrue(text, text.contains("hits=1"));
+        assertTrue(text, text.contains("hitType=EXACT_HIT"));
         assertTrue(text, text.contains("detectMs=6"));
         assertTrue(text, text.contains("hitTestMs=" + hit.processingMs));
+        assertTrue(text, text.contains("selectMs=" + decision.selectionMs));
         assertTrue(text, text.contains("totalMs=9"));
+        assertTrue(text, text.contains("reason=" + decision.reason));
     }
 
     /** 未命中（MISS）时不得留下选中框与置信度 —— 否则叠加层会画出一个并不存在的"命中框"。 */
@@ -346,8 +365,12 @@ public class TargetDebugStateTest {
         assertEquals(1, state.detectedBoxes.size());
         assertNull("没有命中就不该有选中框", state.selectedBox);
         assertEquals(0f, state.confidence, 0f);
+        assertNull("没有命中就不该有分级", state.hitType());
+        assertFalse(state.hasRankedCandidates());
+        assertEquals(0f, state.selectionScore(), 0f);
         assertFalse(state.isHit());
         assertTrue(state.debugString(), state.debugString().contains("selected=null"));
+        assertTrue(state.debugString(), state.debugString().contains("hitType=-"));
     }
 
     /** 失败路径也要如实反映（{@code NO_BOX} / {@code INVALID_MASK}），否则叠加层只能空着让人猜。 */
@@ -372,10 +395,18 @@ public class TargetDebugStateTest {
     @Test
     public void toBuilderKeepsCoreAndBoxFields() {
         VideoPointMappingResult mapping = VideoCoordinateMapper.map(letterbox(), 200f, 270f);
+        final DetectedTargetBox only = box(1f, 1f, 2f, 2f, 0.9f, 1f, 4);
+        final TargetSelectionDecision decision = new TargetCandidateSelector(TargetSelectionConfig.defaults())
+                .select(1f, 1f, Arrays.asList(only));
         TargetDebugState first = TargetDebugState.builder(mapping, 9L)
-                .detectedBoxes(Arrays.asList(box(1f, 1f, 2f, 2f, 0.9f, 1f, 4)))
+                .detectedBoxes(Arrays.asList(only))
                 .boxStatus(TargetBoxDetectionStatus.SUCCESS)
                 .candidateCount(5)
+                .rankedCandidates(decision.rankedCandidates)
+                .hitType(decision.hitType())
+                .selectionScore(decision.selectionScore())
+                .selectionReason(decision.reason)
+                .selectionMs(decision.selectionMs)
                 .targetId("T-7")
                 .confidence(0.5f)
                 .processingMs(3L)
@@ -394,6 +425,13 @@ public class TargetDebugStateTest {
         assertEquals(5, second.candidateCount);
         assertEquals(2L, second.detectMs);
         assertEquals(1L, second.hitTestMs);
+        // Slice 6 的选择结果也必须被 toBuilder 带上，否则叠加层会在"复制一次"之后悄悄丢信息
+        assertEquals(1, second.rankedCandidates.size());
+        assertSame(only, second.rankedCandidates.get(0).box);
+        assertEquals(TargetHitType.EXACT_HIT, second.hitType());
+        assertEquals(decision.selectionScore(), second.selectionScore(), 0f);
+        assertEquals(decision.selectionMs, second.selectionMs());
+        assertEquals(decision.reason, second.selectionReason());
         // 推导字段也应一致（toBuilder 不该把回投影丢掉）
         assertEquals(first.mappedViewX, second.mappedViewX, 0f);
         assertEquals(first.mappedViewY, second.mappedViewY, 0f);
@@ -446,6 +484,16 @@ public class TargetDebugStateTest {
                 () -> TargetDebugState.builder(mapping, 0L).timings(0L, -1L));
         assertBuilderRejects("boxDetection 为 null",
                 () -> TargetDebugState.builder(mapping, 0L).boxDetection(null));
+        assertBuilderRejects("selectionScore 非有限",
+                () -> TargetDebugState.builder(mapping, 0L).selectionScore(Float.NaN));
+        assertBuilderRejects("selectionMs 为负",
+                () -> TargetDebugState.builder(mapping, 0L).selectionMs(-1L));
+        assertBuilderRejects("rankedCandidates 含 null",
+                () -> TargetDebugState.builder(mapping, 0L).rankedCandidates(Arrays.asList(
+                        (com.example.motro.targetselection.vision.TargetCandidateScore) null)));
+        // null 列表视为空，而不是抛错 —— 与 detectedBoxes 的行为保持一致
+        assertTrue(TargetDebugState.builder(mapping, 0L)
+                .rankedCandidates(null).build().rankedCandidates.isEmpty());
     }
 
     /** 造一个候选框替身：ROI 局部坐标随手给，测试只关心视频坐标与评分。 */

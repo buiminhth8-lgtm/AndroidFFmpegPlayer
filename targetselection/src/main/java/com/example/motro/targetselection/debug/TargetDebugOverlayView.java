@@ -13,6 +13,7 @@ import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
 import com.example.motro.targetselection.geometry.VideoGeometry;
 import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.vision.DetectedTargetBox;
+import com.example.motro.targetselection.vision.TargetCandidateScore;
 
 import java.util.List;
 
@@ -28,10 +29,16 @@ import java.util.List;
  * <p>Slice 5 再加上<b>矩形恢复的候选框</b>与<b>选中的框</b>，两者用不同样式区分：
  * 候选是<b>虚线黄</b>、选中的框是<b>粗实线洋红</b>。刻意不只靠颜色区分 ——
  * 虚线/实线在截图转灰度或色觉障碍下依然可辨。文本块同时给出候选计数、
- * 命中状态（HIT/MISS）、选中框坐标与置信度，以及前几个候选的
- * {@code conf}/{@code comp}/{@code edges} 评分，用来回答"为什么选中的是这个"。
- * <b>这些框只反映已经算好的结果，本类不参与任何命中计算</b> —— 否则调试图与正式判定
- * 会变成两套逻辑，而调试图的价值恰恰是"帮我判断正式算法对不对"。</p>
+ * 命中状态（HIT/MISS）、选中框坐标与置信度，以及逐候选的评分。</p>
+ *
+ * <p>Slice 6 加了第三层视觉编码：<b>被触摸点命中的候选</b>用<b>虚线绿</b>画在黄色候选之上
+ * （绿=点到了，与触摸点的命中色同一套语义），并在文本块里按 <b>rank</b> 列出
+ * 每个命中候选的 {@code EXACT_HIT/TOLERANCE_HIT}、总分、归一化中心距离、到边界距离、面积与置信度，
+ * 外加一句 {@code reason}。这一整块就是为了回答一个问题：
+ * <b>"为什么最终选中的是这个框，而不是旁边那个？"</b> ——
+ * 只看一个选中框是答不出来的，必须把全部命中候选连同各自的分数摆在屏幕上。
+ * <b>这些框与分数只反映已经算好的结果，本类不参与任何命中判定或排序</b> ——
+ * 否则调试图与正式算法会变成两套逻辑，而调试图的价值恰恰是"帮我判断正式算法对不对"。</p>
  *
  * <p><b>叠加方式（由 app 层决定，本类不关心父容器）</b>：</p>
  * <pre>
@@ -75,6 +82,11 @@ public class TargetDebugOverlayView extends View {
      * 于是截图转成灰度、或在色觉障碍下看，依然能一眼区分两者，不必只靠颜色。
      */
     private static final int COLOR_CANDIDATE_BOX = 0xFFFFFF00;
+    /**
+     * 被触摸点命中的候选（Slice 6）：虚线 + 绿色，与"触摸命中"的绿色共用同一套语义 ——
+     * 绿 = "这次点到了"。它还叠加在黄色候选之上，因此"既能当候选、又被点到"一眼可辨。
+     */
+    private static final int COLOR_RANKED_BOX = 0xFF00E676;
     /** 选中的框：实线 + 更粗 + 洋红。它是"本次点击实际命中的那个框"，必须最醒目。 */
     private static final int COLOR_SELECTED_BOX = 0xFFFF1744;
     private static final int COLOR_ROI_RECT = 0xFF7C4DFF;
@@ -85,6 +97,7 @@ public class TargetDebugOverlayView extends View {
     private static final float DP_CONTENT_STROKE = 2f;
     private static final float DP_ROI_STROKE = 3f;
     private static final float DP_CANDIDATE_STROKE = 2f;
+    private static final float DP_RANKED_STROKE = 2.5f;
     private static final float DP_SELECTED_STROKE = 4f;
     private static final float DP_CANDIDATE_DASH_ON = 6f;
     private static final float DP_CANDIDATE_DASH_OFF = 4f;
@@ -109,6 +122,7 @@ public class TargetDebugOverlayView extends View {
     private final Paint mappedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint linkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint candidatePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint rankedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint selectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roiPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -176,6 +190,14 @@ public class TargetDebugOverlayView extends View {
         candidatePaint.setStrokeWidth(DP_CANDIDATE_STROKE * density);
         candidatePaint.setColor(COLOR_CANDIDATE_BOX);
         candidatePaint.setPathEffect(new DashPathEffect(
+                new float[]{DP_CANDIDATE_DASH_ON * density, DP_CANDIDATE_DASH_OFF * density}, 0f));
+
+        // 命中候选：同样的虚线节奏，但换成"命中绿"并稍粗一点。
+        // 虚线节奏保持一致是有意的：形状语言统一（虚线=候选），颜色承载"是否被点到"。
+        rankedPaint.setStyle(Paint.Style.STROKE);
+        rankedPaint.setStrokeWidth(DP_RANKED_STROKE * density);
+        rankedPaint.setColor(COLOR_RANKED_BOX);
+        rankedPaint.setPathEffect(new DashPathEffect(
                 new float[]{DP_CANDIDATE_DASH_ON * density, DP_CANDIDATE_DASH_OFF * density}, 0f));
 
         selectedPaint.setStyle(Paint.Style.STROKE);
@@ -333,20 +355,27 @@ public class TargetDebugOverlayView extends View {
     }
 
     /**
-     * 画矩形恢复的结果：所有候选框（虚线黄）+ 选中的框（实线洋红）。
+     * 画矩形恢复与多目标选择的结果：所有候选框（虚线黄）、被点到的候选（虚线绿）、
+     * 选中的框（实线洋红）。
      *
-     * <p><b>本方法只读取</b> {@link TargetDebugState} 里已经算好的结果，不做任何命中判定 ——
-     * 判定是 {@code TargetHitTester} 的职责。若让叠加层自己再判一次"点在不在框里"，
-     * 就会出现两套逻辑；而调试图的全部价值恰恰是"帮我判断正式算法对不对"，
-     * 逻辑一分为二，这个价值就没了。</p>
+     * <p><b>本方法只读取</b> {@link TargetDebugState} 里已经算好的结果，不做任何命中判定、
+     * 也不做任何排序 —— 判定是 {@code TargetHitTester}、排序是
+     * {@code TargetCandidateSelector} 的职责。若让叠加层自己再算一遍"点在不在框里"
+     * 或"谁该排第一"，就会出现两套逻辑；而调试图的全部价值恰恰是
+     * "帮我判断正式算法对不对"，逻辑一分为二，这个价值就没了。</p>
      *
-     * <p>选中框在候选之后绘制（更靠上层）：它通常也在候选列表里，于是会被画两遍 ——
-     * 这正是想要的效果，虚线黄打底、粗实线洋红覆盖，"这个候选被选中了"一眼可辨。</p>
+     * <p>绘制顺序即层次：候选（黄）→ 命中（绿）→ 选中（洋红），后画的压在先画的上面。
+     * 于是同一个框被画几遍恰恰是想要的效果 ——
+     * "它既是候选、也被点到、而且最终胜出"这件事在视觉上层层叠加、一眼可辨。</p>
      */
     private void drawTargetBoxes(Canvas canvas, TargetDebugState current) {
         final List<DetectedTargetBox> boxes = current.detectedBoxes;
         for (int i = 0; i < boxes.size(); i++) {
             drawVideoBox(canvas, current.mapping.geometry, boxes.get(i).rectInVideo, candidatePaint);
+        }
+        final List<TargetCandidateScore> ranked = current.rankedCandidates;
+        for (int i = 0; i < ranked.size(); i++) {
+            drawVideoBox(canvas, current.mapping.geometry, ranked.get(i).box.rectInVideo, rankedPaint);
         }
         drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, candidatePaint);
         drawVideoBox(canvas, current.mapping.geometry, current.selectedBox, selectedPaint);
@@ -449,15 +478,18 @@ public class TargetDebugOverlayView extends View {
             }
         }
 
-        // Slice 5：矩形恢复 + 命中判定。同样"没做过就整段不输出"。
+        // Slice 5/6：矩形恢复 + 命中 + 多目标选择。同样"没做过就整段不输出"。
         if (current.hasBoxDetection()) {
             b.append('\n').append("boxes=").append(current.boxStatus())
                     .append("  candidates=").append(current.candidateCount());
             if (current.candidateCount() != current.detectedBoxes.size()) {
                 b.append(" (drawn ").append(current.detectedBoxes.size()).append(')');
             }
+            b.append("  hits=").append(current.rankedCandidates.size());
             b.append(current.isHit() ? "  HIT" : "  MISS");
             if (current.isHit()) {
+                // 命中分级是 Slice 6 的关键信息：点得扎实，还是只靠容差擦到
+                b.append("  ").append(current.hitType());
                 b.append("  sel=[");
                 appendFixed1(b, current.selectedBox.left);
                 b.append(',');
@@ -466,31 +498,45 @@ public class TargetDebugOverlayView extends View {
                 appendFixed1(b, current.selectedBox.right);
                 b.append(',');
                 appendFixed1(b, current.selectedBox.bottom);
-                b.append(']').append(" conf=");
+                b.append(']').append(" score=");
+                appendFixed(b, current.selectionScore(), 2);
+                b.append(" conf=");
                 appendFixed(b, current.confidence, 2);
             }
             b.append("  detect=").append(current.detectMs)
                     .append("ms hit=").append(current.hitTestMs)
+                    .append("ms select=").append(current.selectionMs)
                     .append("ms total=").append(current.processingMs).append("ms");
 
-            // 逐个候选给出评分：直接回答"为什么选中的是这个而不是别的"。
-            // 只印前几行 —— 候选上限是几十，全印会把文本块撑满整个屏幕，
-            // 那反而把真正要看的框和触摸点挡住。
-            final int shown = Math.min(MAX_CANDIDATE_LINES, current.detectedBoxes.size());
+            // 排名明细：直接回答"为什么选中的是这个而不是别的"。
+            // 只印前几行 —— 全印会把文本块撑满整个屏幕，反而把真正要看的框和触摸点挡住。
+            final int shown = Math.min(MAX_CANDIDATE_LINES, current.rankedCandidates.size());
             for (int i = 0; i < shown; i++) {
-                final DetectedTargetBox box = current.detectedBoxes.get(i);
-                b.append('\n').append("  #").append(i).append(" conf=");
-                appendFixed(b, box.confidence, 2);
-                b.append(" comp=");
-                appendFixed(b, box.completeness, 2);
-                b.append(" edges=").append(box.presentEdges);
-                if (box.clippedByRoi) {
-                    b.append(" clip");
-                }
+                final TargetCandidateScore score = current.rankedCandidates.get(i);
+                b.append('\n').append("  #").append(score.rank).append(' ').append(score.hitType)
+                        .append(" score=");
+                appendFixed(b, score.totalScore, 2);
+                b.append(" ncd=");
+                appendFixed(b, score.normalizedCenterDistance, 2);
+                b.append(" edge=");
+                appendFixed1(b, score.edgeDistance);
+                b.append(" area=");
+                appendFixed(b, score.area, 0);
+                b.append(" conf=");
+                appendFixed(b, score.boxConfidence, 2);
             }
-            if (current.detectedBoxes.size() > shown) {
+            if (current.rankedCandidates.size() > shown) {
                 b.append('\n').append("  ... +")
-                        .append(current.detectedBoxes.size() - shown).append(" more");
+                        .append(current.rankedCandidates.size() - shown).append(" more hits");
+            }
+            // 被找到但没被点到的那部分候选也要有一句话：否则"候选 5 个、命中 1 个"
+            // 这个差值的去向就得靠人自己猜。
+            final int notHit = current.detectedBoxes.size() - current.rankedCandidates.size();
+            if (notHit > 0) {
+                b.append('\n').append("  other candidates=").append(notHit).append(" (not hit)");
+            }
+            if (current.selectionReason() != null) {
+                b.append('\n').append("  reason=").append(current.selectionReason());
             }
         }
 

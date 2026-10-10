@@ -9,6 +9,8 @@ import com.example.motro.targetselection.vision.DetectedTargetBox;
 import com.example.motro.targetselection.vision.TargetBoxAnalyzer;
 import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
+import com.example.motro.targetselection.vision.TargetCandidateScore;
+import com.example.motro.targetselection.vision.TargetHitType;
 
 import org.junit.Assume;
 import org.junit.Test;
@@ -45,6 +47,19 @@ import java.util.Map;
  *   <li>{@code MISS}：ROI 里能找到候选，但点击点不在框内 —— 必须不命中。</li>
  *   <li>{@code NO_BOX}：ROI 里压根没有框 —— 必须报 NO_BOX 且不命中。</li>
  * </ul>
+ *
+ * <p>Slice 6（多目标选择）新增四个<b>可选</b>字段，缺省即"不校验"，因此 Slice 4/5 的
+ * 旧样本可以原样继续跑：</p>
+ * <ul>
+ *   <li>{@code hitType}：{@code EXACT_HIT} / {@code TOLERANCE_HIT}，钉住"点在框里"与
+ *       "只是够到了"必须被区分开。</li>
+ *   <li>{@code hits}：同时命中的候选个数 —— 多目标样本里这是核心期望值，
+ *       只看"选了谁"无法区分"另一个框没命中"与"命中了但排第二名"。</li>
+ *   <li>{@code expectCandidates}：候选框总数。用来证明 <b>{@code id:xxxx} 蓝字没有
+ *       凑出一个候选框</b> —— 只看命中与否是抓不到这类"多出来一个垃圾候选"的。</li>
+ *   <li>{@code maxCandidateBottom}：任何候选框的下边界都不得超过它。id 文字样本靠它
+ *       证明文字行既没自成框、也没被并进上面那个框（并进去会让框的下边界下移到文字行）。</li>
+ * </ul>
  */
 public class TargetBoxSampleSmokeTest {
 
@@ -60,6 +75,15 @@ public class TargetBoxSampleSmokeTest {
      * 所以这里比合成图用例（1.5px）放得宽一些。
      */
     private static final float EDGE_TOLERANCE_PX = 6f;
+
+    /**
+     * 选择阶段的耗时上限（毫秒）。{@code selectionMs} 是整数毫秒，正常情况下它必然是 0
+     * （16 个候选的实测值在微秒量级，见
+     * {@code TargetCandidateSelectorTest#selectionStaysFarBelowOneMillisecond}），
+     * 但整数毫秒读数会把"0.9ms"报成 0 或 1，且真实样本上偶尔会撞上一次 GC。
+     * 因此这里给一个宽容但有意义的上限：超过它就说明选择阶段确实退化成了"每次点击都要几毫秒"。
+     */
+    private static final long SELECTION_TIME_BUDGET_MS = 2L;
 
     @Test
     public void realSampleFramesProduceTheExpectedHitVerdictsAndBoxes() throws IOException {
@@ -98,10 +122,18 @@ public class TargetBoxSampleSmokeTest {
                 .append("px，边覆盖率≥").append(config.minEdgeCoverage)
                 .append("，最小置信度 ").append(config.minBoxConfidence)
                 .append("，触摸容差 ").append(config.touchTolerancePx).append("px）\n");
+        report.append("多目标选择（Slice 6）：exactHit=").append(config.exactHitWeight)
+                .append(" centerDist=").append(config.centerDistanceWeight)
+                .append(" area=").append(config.areaWeight)
+                .append(" conf=").append(config.confidenceWeight)
+                .append(" complete=").append(config.completenessWeight)
+                .append(" preferSmallerBox=").append(config.preferSmallerBox)
+                .append(" maxRanked=").append(config.maxRankedCandidates)
+                .append("（EXACT_HIT > TOLERANCE_HIT 是硬主键，不受权重影响）\n");
         report.append(String.format(Locale.ROOT,
-                "%-24s %-8s %5s %-14s %-38s %-7s %6s %6s %6s %s%n",
-                "sample", "expect", "cand", "status", "selectedBox", "result",
-                "detMs", "hitMs", "totMs", "note"));
+                "%-42s %-8s %4s %4s %-13s %-14s %-20s %-6s %5s %5s %5s %5s %s%n",
+                "sample", "expect", "cand", "hits", "hitType", "status", "selectedBox",
+                "result", "detMs", "hitMs", "selMs", "totMs", "note"));
 
         final List<String> failures = new ArrayList<>();
         final List<long[]> timings = new ArrayList<>();
@@ -124,7 +156,7 @@ public class TargetBoxSampleSmokeTest {
                     CapturedFrame.ofImage(ArgbFrameImage.of(width, height, argb), 0L, 0L);
 
             final TargetBoxDetectionResult result = analyzer.analyze(frame, null, touchX, touchY);
-            timings.add(new long[]{result.detectMs, result.hitTestMs, result.totalMs});
+            timings.add(new long[]{result.detectMs, result.hitTestMs, result.selectionMs, result.totalMs});
             if (result.isHit()) {
                 hits++;
             }
@@ -168,18 +200,76 @@ public class TargetBoxSampleSmokeTest {
                 throw new IllegalStateException("未知的 expect 值：" + expect + "（" + metaFile + "）");
             }
 
+            // ---- Slice 6 的可选期望：写了才校验 ----
+            final String expectedHitType = meta.getOrDefault("hitType", "").trim();
+            if (!expectedHitType.isEmpty() && !"-".equals(expectedHitType)) {
+                final TargetHitType actual = result.hitType;
+                if (actual == null || !expectedHitType.equalsIgnoreCase(actual.name())) {
+                    problems.add("期望 hitType=" + expectedHitType + "，实际 "
+                            + (actual == null ? "null" : actual.name()));
+                }
+            }
+            final String expectedHits = meta.getOrDefault("hits", "").trim();
+            if (!expectedHits.isEmpty() && !"-".equals(expectedHits)) {
+                final int expected = Integer.parseInt(expectedHits);
+                if (result.hitCount != expected) {
+                    problems.add("期望命中候选 " + expected + " 个，实际 " + result.hitCount);
+                }
+            }
+            final String expectedCandidates = meta.getOrDefault("expectCandidates", "").trim();
+            if (!expectedCandidates.isEmpty() && !"-".equals(expectedCandidates)) {
+                final int expected = Integer.parseInt(expectedCandidates);
+                if (result.candidateCount != expected) {
+                    problems.add("期望候选框 " + expected + " 个，实际 " + result.candidateCount
+                            + "（多出来的候选最可能是 id 文字凑出来的假框）");
+                }
+            }
+            // 任何候选框的下边界都不得越过这条线：用来证明 id 文字行既没自成框、
+            // 也没被当成一条边并进上面的框（并进去会让下边界下移到文字行处）。
+            final String maxBottom = meta.getOrDefault("maxCandidateBottom", "").trim();
+            if (!maxBottom.isEmpty() && !"-".equals(maxBottom)) {
+                final float limit = Float.parseFloat(maxBottom) + EDGE_TOLERANCE_PX;
+                for (DetectedTargetBox candidate : result.candidates) {
+                    if (candidate.rectInVideo.bottom > limit) {
+                        problems.add("候选框下边界 " + candidate.rectInVideo.bottom
+                                + " 越过了 " + limit + "（id 文字行不该成为框的一部分）："
+                                + describe(candidate));
+                    }
+                }
+            }
+            if (result.selectionMs > SELECTION_TIME_BUDGET_MS) {
+                problems.add("选择耗时 " + result.selectionMs + "ms 超过预算 "
+                        + SELECTION_TIME_BUDGET_MS + "ms");
+            }
+
             report.append(String.format(Locale.ROOT,
-                    "%-24s %-8s %5d %-14s %-38s %-7s %6d %6d %6d %s%n",
-                    name, expect, result.candidateCount, result.status,
+                    "%-42s %-8s %4d %4d %-13s %-14s %-20s %-6s %5d %5d %5d %5d %s%n",
+                    name, expect, result.candidateCount, result.hitCount,
+                    result.hitType == null ? "-" : result.hitType.name(),
+                    result.status,
                     result.selectedBox == null ? "-" : describe(result.selectedBox),
                     problems.isEmpty() ? "PASS" : "FAIL",
-                    result.detectMs, result.hitTestMs, result.totalMs, note));
+                    result.detectMs, result.hitTestMs, result.selectionMs, result.totalMs, note));
 
-            // 多候选时把每个候选都列出来 —— "多出来的候选是什么"是判断误检的关键信息，
-            // 只看选中框会漏掉"文字也凑出了候选框"这类精度问题。
-            if (result.candidateCount > 1) {
+            // 选择明细：这是回答"为什么最终选了它"的唯一依据，所以每一行都打出来，
+            // 而不是只在多候选时才打 —— 单候选样本的 score 同样要看（它是后续调参的基线）。
+            for (TargetCandidateScore score : result.rankedCandidates) {
+                report.append(String.format(Locale.ROOT,
+                        "        rank %d %-13s score=%7.3f ncd=%.3f edge=%7.1f area=%8.0f conf=%.2f comp=%.2f %s%n",
+                        score.rank, score.hitType.name(), score.totalScore,
+                        score.normalizedCenterDistance, score.edgeDistance, score.area,
+                        score.boxConfidence, score.completeness, describe(score.box)));
+            }
+            if (result.selectionReason != null) {
+                report.append("        reason=").append(result.selectionReason).append('\n');
+            }
+            // 候选里没被点到的那些也要列出来 —— "多出来的候选是什么"是判断误检的关键信息，
+            // 只看命中列表会漏掉"文字也凑出了一个候选框"这类精度问题。
+            if (result.candidateCount > result.hitCount) {
                 for (DetectedTargetBox candidate : result.candidates) {
-                    report.append("        candidate ").append(describe(candidate)).append('\n');
+                    if (!containsBox(result.rankedCandidates, candidate)) {
+                        report.append("        candidate(not hit) ").append(describe(candidate)).append('\n');
+                    }
                 }
             }
 
@@ -196,6 +286,16 @@ public class TargetBoxSampleSmokeTest {
         System.out.println(report);
 
         assertTrue("真实样本矩形恢复/命中验证失败：\n" + report, failures.isEmpty());
+    }
+
+    /** 该候选框是否出现在已排名列表里（用身份比较，框本身没有 equals）。 */
+    private static boolean containsBox(List<TargetCandidateScore> ranked, DetectedTargetBox box) {
+        for (TargetCandidateScore score : ranked) {
+            if (score.box == box) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -250,21 +350,25 @@ public class TargetBoxSampleSmokeTest {
     private static String timingSummary(List<long[]> timings, int samples, int hits) {
         long detectMax = 0L;
         long hitMax = 0L;
+        long selectMax = 0L;
         long totalMax = 0L;
         long totalSum = 0L;
         for (long[] t : timings) {
             detectMax = Math.max(detectMax, t[0]);
             hitMax = Math.max(hitMax, t[1]);
-            totalMax = Math.max(totalMax, t[2]);
-            totalSum += t[2];
+            selectMax = Math.max(selectMax, t[2]);
+            totalMax = Math.max(totalMax, t[3]);
+            totalSum += t[3];
         }
         final long average = timings.isEmpty() ? 0L : totalSum / timings.size();
         return String.format(Locale.ROOT,
-                "样本 %d 个（命中 %d），耗时 max：detect=%dms hitTest=%dms total=%dms；"
+                "样本 %d 个（命中 %d），耗时 max：detect=%dms hitTest=%dms select=%dms total=%dms；"
                         + "total 均值=%dms%n"
                         + "说明：这些数字包含 HEVC 解码帧的回读与整条链路，"
-                        + "不是纯算法耗时；单帧单次，不含解码/渲染开销。",
-                samples, hits, detectMax, hitMax, totalMax, average);
+                        + "不是纯算法耗时；单帧单次，不含解码/渲染开销。"
+                        + "select 这一项是整数毫秒，真实值远小于 1ms（无法在这一列显示），"
+                        + "选择阶段的精确耗时见 TargetCandidateSelectorTest 的纳秒级实测。",
+                samples, hits, detectMax, hitMax, selectMax, totalMax, average);
     }
 
     private static File resolveAgainstProjectRoot(String path) {

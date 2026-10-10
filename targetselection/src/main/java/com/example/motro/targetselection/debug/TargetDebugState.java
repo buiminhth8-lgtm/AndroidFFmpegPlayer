@@ -11,6 +11,8 @@ import com.example.motro.targetselection.vision.BlueMaskStatus;
 import com.example.motro.targetselection.vision.DetectedTargetBox;
 import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
+import com.example.motro.targetselection.vision.TargetCandidateScore;
+import com.example.motro.targetselection.vision.TargetHitType;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -122,6 +124,30 @@ public final class TargetDebugState {
     /** 最终选中的框（视频坐标）；本次点击未命中任何候选时为 null。 */
     public final TargetBoundingBox selectedBox;
 
+    // ---------------------------------------------------------------- 多目标选择（Slice 6）
+
+    /**
+     * 命中候选的评分明细，按 rank 从 0 递增（rank 0 就是 {@link #selectedBox}）；
+     * 未命中或未做选择时为空列表。
+     *
+     * <p>它比 {@link #detectedBoxes} 更进一层：{@code detectedBoxes} 回答"画面上找到了哪些框"，
+     * 这里回答"这次点击里哪些框被点到了、各自排第几、为什么"。叠加层正是靠它
+     * 回答"为什么最终选中的是这个框"。</p>
+     */
+    public final List<TargetCandidateScore> rankedCandidates;
+
+    /** 命中分级（严格包含 / 容差）；未命中或未做选择时为 null。 */
+    public final TargetHitType hitType;
+
+    /** 选中框的加权总分；未命中为 0。 */
+    public final float selectionScore;
+
+    /** 选择理由（英文，来自 {@code TargetSelectionDecision#reason}）；未做选择时为 null。 */
+    public final String selectionReason;
+
+    /** 多目标选择耗时（毫秒）；未做选择时为 0。 */
+    public final long selectionMs;
+
     /** 预留：标签识别区域（视频坐标）。本 Slice 恒为 null。 */
     public final TargetBoundingBox labelRoi;
 
@@ -155,6 +181,11 @@ public final class TargetDebugState {
         this.boxStatus = builder.boxStatus;
         this.candidateCount = builder.candidateCount;
         this.selectedBox = builder.selectedBox;
+        this.rankedCandidates = Collections.unmodifiableList(new ArrayList<>(builder.rankedCandidates));
+        this.hitType = builder.hitType;
+        this.selectionScore = builder.selectionScore;
+        this.selectionReason = builder.selectionReason;
+        this.selectionMs = builder.selectionMs;
         this.labelRoi = builder.labelRoi;
         this.targetId = builder.targetId;
         this.confidence = builder.confidence;
@@ -216,6 +247,11 @@ public final class TargetDebugState {
                 .boxStatus(boxStatus)
                 .candidateCount(candidateCount)
                 .selectedBox(selectedBox)
+                .rankedCandidates(rankedCandidates)
+                .hitType(hitType)
+                .selectionScore(selectionScore)
+                .selectionReason(selectionReason)
+                .selectionMs(selectionMs)
                 .labelRoi(labelRoi)
                 .targetId(targetId)
                 .confidence(confidence)
@@ -244,15 +280,17 @@ public final class TargetDebugState {
     }
 
     /**
-     * 复制并挂上一次矩形恢复 + 命中判定的结果 —— Slice 5 的标准接法。
+     * 复制并挂上一次矩形恢复 + 命中 + 多目标选择的结果 —— Slice 5/6 的标准接法。
      *
      * <p>把 {@link TargetBoxDetectionResult} 里叠加层需要的几项翻成可视化字段：候选框列表
-     * （含每框 confidence/completeness）、状态、候选计数、选中的框、命中耗时明细。
+     * （含每框 confidence/completeness）、状态、候选计数、选中的框、命中分级、
+     * 已排名候选的评分明细、以及分步耗时。
      * <b>掩码本体不进本对象</b>（叠加层不逐像素画掩码）。</p>
      *
-     * <p>{@link #processingMs} 会被覆盖成结果里的 {@code totalMs}（掩码 + 检测 + 命中），
+     * <p>{@link #processingMs} 会被覆盖成结果里的 {@code totalMs}（掩码 + 检测 + 命中 + 选择），
      * 而不是停留在 {@link #withBlueMask(BlueMaskResult)} 那一步的掩码耗时 ——
-     * 调试时看的是"这次点击总共花了多久"，分步耗时另由 {@link #detectMs}/{@link #hitTestMs} 给出。</p>
+     * 调试时看的是"这次点击总共花了多久"，分步耗时另由
+     * {@link #detectMs}/{@link #hitTestMs}/{@link #selectionMs} 给出。</p>
      *
      * <p>失败结果同样接受：{@code boxStatus} 会如实带上 {@code NO_BOX} 或 {@code INVALID_MASK}，
      * 于是叠加层能显示"为什么没有框"。</p>
@@ -388,6 +426,31 @@ public final class TargetDebugState {
         return !detectedBoxes.isEmpty();
     }
 
+    /** 是否有已排名的命中候选（即有框被点到）。 */
+    public boolean hasRankedCandidates() {
+        return !rankedCandidates.isEmpty();
+    }
+
+    /** 命中分级；未命中或未做选择时为 null。 */
+    public TargetHitType hitType() {
+        return hitType;
+    }
+
+    /** 选中框的加权总分；未命中为 0。 */
+    public float selectionScore() {
+        return selectionScore;
+    }
+
+    /** 选择理由（英文）；未做选择时为 null。 */
+    public String selectionReason() {
+        return selectionReason;
+    }
+
+    /** 多目标选择耗时（毫秒）；未做选择时为 0。 */
+    public long selectionMs() {
+        return selectionMs;
+    }
+
     /** 本次点击是否命中了一个候选框（叠加层据此把选中框画成高亮样式）。 */
     public boolean isHit() {
         return selectedBox != null;
@@ -425,7 +488,8 @@ public final class TargetDebugState {
      * rotation=0 mirror=false,false scale=FIT_CENTER mappedVideo=640.0,360.0
      * mappedView=960.0,540.0 roundTripErrPx=0.0 inside=true eventTimeNs=...
      * roi=SUCCESS rect=[...] blue=1832 ratio=0.01145 ms=3
-     * boxes=SUCCESS candidates=2 selected=[...] confidence=1.0 detectMs=1 hitTestMs=0 totalMs=4
+     * boxes=SUCCESS candidates=2 shown=2 hits=2 hitType=EXACT_HIT selected=[...] confidence=1.0
+     * selScore=2.91 detectMs=1 hitTestMs=0 selectMs=0 totalMs=4 reason=EXACT_HIT best-of-2 score=2.910
      * </pre>
      * <p>未做视觉分析时最后一段整体不出现，保持与 Slice 3 完全一致的输出（旧日志仍然可比）。
      * 做了矩形恢复时，掩码段的 {@code ms=} 会被省略 —— 那时 {@link #processingMs} 已经是
@@ -450,11 +514,18 @@ public final class TargetDebugState {
             b.append(" boxes=").append(boxStatus)
                     .append(" candidates=").append(candidateCount)
                     .append(" shown=").append(detectedBoxes.size())
+                    .append(" hits=").append(rankedCandidates.size())
+                    .append(" hitType=").append(hitType == null ? "-" : hitType)
                     .append(" selected=").append(selectedBox)
                     .append(" confidence=").append(confidence)
+                    .append(" selScore=").append(selectionScore)
                     .append(" detectMs=").append(detectMs)
                     .append(" hitTestMs=").append(hitTestMs)
+                    .append(" selectMs=").append(selectionMs)
                     .append(" totalMs=").append(processingMs);
+            if (selectionReason != null) {
+                b.append(" reason=").append(selectionReason);
+            }
         }
         return b.toString();
     }
@@ -495,6 +566,11 @@ public final class TargetDebugState {
         private TargetBoxDetectionStatus boxStatus;
         private int candidateCount;
         private TargetBoundingBox selectedBox;
+        private List<TargetCandidateScore> rankedCandidates = Collections.emptyList();
+        private TargetHitType hitType;
+        private float selectionScore;
+        private String selectionReason;
+        private long selectionMs;
         private TargetBoundingBox labelRoi;
         private String targetId;
         private float confidence;
@@ -599,7 +675,8 @@ public final class TargetDebugState {
 
         /**
          * 一次性把 {@link TargetBoxDetectionResult} 的可视信息并进来：候选框、状态、计数、
-         * 选中框、置信度、耗时明细（见 {@link TargetDebugState#withBoxDetection(TargetBoxDetectionResult)}）。
+         * 选中框、置信度、命中分级、排名明细、耗时明细
+         * （见 {@link TargetDebugState#withBoxDetection(TargetBoxDetectionResult)}）。
          *
          * <p>选中框取 {@link DetectedTargetBox#rectInVideo} —— 叠加层要画的是视频坐标矩形，
          * 而 {@link TargetDebugState#selectedBox} 的既有语义就是视频坐标，
@@ -616,10 +693,71 @@ public final class TargetDebugState {
                     .boxStatus(result.status)
                     .candidateCount(result.candidateCount)
                     .selectedBox(selected == null ? null : selected.rectInVideo)
+                    .rankedCandidates(result.rankedCandidates)
+                    .hitType(result.hitType)
+                    .selectionScore(result.selectionScore)
+                    .selectionReason(result.selectionReason)
                     .confidence(selected == null ? 0f : selected.confidence)
                     // processingMs 覆盖为总耗时：调试看的是"这次点击一共花了多久"
                     .processingMs(result.totalMs)
-                    .timings(result.detectMs, result.hitTestMs);
+                    .timings(result.detectMs, result.hitTestMs)
+                    .selectionMs(result.selectionMs);
+        }
+
+        /**
+         * 命中候选的评分明细（rank 0 起）。
+         *
+         * @throws IllegalArgumentException 列表含 null 元素；{@code selectionScore} 不在 [0,1] 时见
+         *         {@link #selectionScore(float)} 的说明（本字段本身不校验范围）
+         */
+        public Builder rankedCandidates(List<TargetCandidateScore> rankedCandidates) {
+            if (rankedCandidates == null) {
+                this.rankedCandidates = Collections.emptyList();
+                return this;
+            }
+            for (TargetCandidateScore score : rankedCandidates) {
+                if (score == null) {
+                    throw new IllegalArgumentException("rankedCandidates must not contain null elements");
+                }
+            }
+            this.rankedCandidates = new ArrayList<>(rankedCandidates);
+            return this;
+        }
+
+        /** 命中分级；null 表示本次没做选择或未命中。 */
+        public Builder hitType(TargetHitType hitType) {
+            this.hitType = hitType;
+            return this;
+        }
+
+        /**
+         * 选中框的加权总分。
+         *
+         * <p><b>不</b>校验范围：加权总分可以是负数（例如容差命中加上较大的中心距离惩罚），
+         * 它不是一个概率量。需要 [0,1] 语义请用
+         * {@link TargetDebugState#confidence}（那是框自身的置信度）。</p>
+         */
+        public Builder selectionScore(float selectionScore) {
+            if (!Float.isFinite(selectionScore)) {
+                throw new IllegalArgumentException("selectionScore must be finite but was " + selectionScore);
+            }
+            this.selectionScore = selectionScore;
+            return this;
+        }
+
+        /** 选择理由（英文）；null 表示未做选择。 */
+        public Builder selectionReason(String selectionReason) {
+            this.selectionReason = selectionReason;
+            return this;
+        }
+
+        /** 多目标选择耗时。@throws IllegalArgumentException 为负 */
+        public Builder selectionMs(long selectionMs) {
+            if (selectionMs < 0L) {
+                throw new IllegalArgumentException("selectionMs must be >= 0 but was " + selectionMs);
+            }
+            this.selectionMs = selectionMs;
+            return this;
         }
 
         /** 分步耗时。@throws IllegalArgumentException 任一为负 */

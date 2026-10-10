@@ -451,6 +451,54 @@ public class ModuleBoundaryTest {
                 detector.contains("TargetBoundingBox.of("));
     }
 
+    /**
+     * Slice 6 的多目标选择策略：权重与开关必须全部来自 {@code TargetSelectionConfig}，
+     * 而且<b>只允许 {@code TargetCandidateSelector} 读它们</b>。
+     *
+     * <p>第二条比第一条更重要。选权重这类东西一旦在两个地方各读一份，
+     * 就会出现"改了配置但结果没变"或"只变了一半"——排查时几乎无从下手。
+     * 所以这里同时断言过滤层（{@code TargetHitTester}）里<b>不存在</b>任何评分痕迹：
+     * 它只做几何过滤，把"哪个更好"完整地留给选择器。</p>
+     */
+    @Test
+    public void selectionPolicyLivesOnlyInTheCandidateSelector() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String selector = read(new File(visionDir, "TargetCandidateSelector.java"));
+
+        for (String knob : new String[]{
+                "touchTolerancePx", "exactHitWeight", "centerDistanceWeight", "areaWeight",
+                "confidenceWeight", "completenessWeight", "preferSmallerBox",
+                "maxRankedCandidates"}) {
+            assertTrue("TargetCandidateSelector 必须从配置读取 " + knob,
+                    selector.contains("config." + knob));
+        }
+        // 排序必须用显式比较器（逐级 tie-break），而不是靠排序稳定性
+        assertTrue("TargetCandidateSelector 必须自带比较器以固定名次",
+                selector.contains("compare(") && selector.contains("hitType.ordinal()"));
+
+        String hitTester = read(new File(visionDir, "TargetHitTester.java"));
+        assertTrue("TargetHitTester 只做几何过滤：必须用容差扩张后的框判定",
+                hitTester.contains("inflated("));
+        for (String scoring : new String[]{"totalScore", "score", "Comparator", "hitType.ordinal()",
+                "centerDistanceWeight", "areaWeight", "preferSmallerBox"}) {
+            assertFalse("TargetHitTester 不得掺入评分/排序逻辑（发现 " + scoring + "）",
+                    hitTester.contains(scoring));
+        }
+    }
+
+    /**
+     * 一次点击的四个耗时阶段必须各自有独立出口，否则现场只能知道"慢了"而不知"哪里慢"。
+     */
+    @Test
+    public void everyStageKeepsItsOwnTiming() throws IOException {
+        String result = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision/TargetBoxDetectionResult.java"));
+        for (String timing : new String[]{"detectMs", "hitTestMs", "selectionMs", "totalMs"}) {
+            assertTrue("TargetBoxDetectionResult 必须暴露 " + timing, result.contains(timing));
+        }
+    }
+
     // ---------------------------------------------------------------- utils
 
     private static void assertNoDependency(String deps, String needle) {

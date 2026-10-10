@@ -101,15 +101,19 @@ public final class TargetSelectionConfig {
     public static final int DEFAULT_MAX_EDGE_THICKNESS_PX = 16;
 
     /**
-     * {@link #minEdgeSolidity} 的默认值：一条边带的外接盒里至少 50% 是蓝的，才算一段"线"。
+     * {@link #minEdgeSolidity} 的默认值：一条边带在<b>它自己的范围内</b>至少 50% 是蓝的，
+     * 才算一段"线"。
      *
-     * <p>这条判据专门用来切开两类<b>看着一样细</b>的东西：真线，与"借来像素凑数的假线"。
-     * 真实框线的实心度≈1；而贴在框沿上的 {@code id:xxxx} 文字，其每一列会因为同时穿过
-     * 框的上、下边线而把像素数补到阈值以上，并集跨度又被拉到整框高度 —— 于是一列文字
-     * 冒充成一条贯穿全高的竖边（实测实心度只有 0.09）。</p>
+     * <p>这条判据切开的是两类<b>看着一样细</b>的东西：真线，与"稀疏碎片"（点状噪声、
+     * 虚线残段、断续的碎片）。真实框线的实心度≈1。</p>
      *
-     * <p>为什么厚度上限挡不住：那种列只有 4~14px 宽，比真正的细线还细。
-     * 而 0.5 这个值对真实情况很宽松 —— 一条被 HEVC 吃掉近一半像素的框线仍能通过
+     * <p><b>它的职责边界（重要）</b>：横穿这条边的另一条框线留下的几个像素<b>已经</b>在
+     * {@code TargetBoxDetector#extractBands} 里被排除在"本边范围"之外了，因此不会再来
+     * 稀释实心度。这一分工是必需的 —— 早期版本把横穿像素也算进范围，结果「大框套小框」
+     * 里内层框的真边（110px）被外框两条竖边把范围撑成 270px，实心度掉到 0.44 而被丢弃，
+     * 内层框永远无法成为候选。所以本阈值现在只回答"这条边自己实不实"。</p>
+     *
+     * <p>0.5 对真实情况很宽松 —— 一条被 HEVC 吃掉近一半像素的框线仍能通过
      * （实测断裂样本的上边线实心度 0.87）。</p>
      */
     public static final float DEFAULT_MIN_EDGE_SOLIDITY = 0.5f;
@@ -144,6 +148,58 @@ public final class TargetSelectionConfig {
      * 也避免把一堆垃圾候选丢给选择逻辑。</p>
      */
     public static final int DEFAULT_MAX_CANDIDATE_COUNT = 16;
+
+    // ---------------------------------------------------------------- 多目标选择策略（Slice 6）
+
+    /**
+     * {@link #exactHitWeight} 的默认值：严格包含命中在总分上的加分。
+     *
+     * <p>取 1.0 与其它几项同量级，使"点在框里"这一事实本身就足以压过中心距离与面积的差异。
+     * 注意排序时 {@code EXACT_HIT &gt; TOLERANCE_HIT} 是<b>硬约束</b>
+     * （见 {@link com.example.motro.targetselection.vision.TargetCandidateSelector}），
+     * 不依赖这个权重；把它设为 0 也不会让容差命中抢走严格的包含命中，
+     * 只会让 {@code totalScore} 这个数字少一项信息。</p>
+     */
+    public static final float DEFAULT_EXACT_HIT_WEIGHT = 1f;
+
+    /**
+     * {@link #centerDistanceWeight} 的默认值：触摸点到框中心的（归一化）距离惩罚。
+     *
+     * <p>与面积同量级：这是"同时包含时优先更接近触摸点中心的目标"这条产品直觉的权重。</p>
+     */
+    public static final float DEFAULT_CENTER_DISTANCE_WEIGHT = 1f;
+
+    /**
+     * {@link #areaWeight} 的默认值：（归一化）面积惩罚，实现"优先更小、更具体的框"。
+     *
+     * <p>权重与中心距离持平是刻意的：嵌套框场景里"小框更具体"与"大框更居中"经常同时出现，
+     * 两边都保持 1.0 时，谁胜出取决于本样本的真实几何，而不是取决于某个预设偏好。</p>
+     */
+    public static final float DEFAULT_AREA_WEIGHT = 1f;
+
+    /**
+     * {@link #confidenceWeight}/{@link #completenessWeight} 的默认值：框质量的辅助加分。
+     *
+     * <p>刻意取中心距离/面积的一半：框线画得全不全属于"这个框可不可信"，
+     * 而用户想点哪个框属于"几何关系"，后者更直接。辅助项加起来最多 1.0，
+     * 不足以单独扭转一次明确的几何劣势。</p>
+     */
+    public static final float DEFAULT_CONFIDENCE_WEIGHT = 0.5f;
+
+    /** {@link #completenessWeight} 的默认值。见 {@link #DEFAULT_CONFIDENCE_WEIGHT}。 */
+    public static final float DEFAULT_COMPLETENESS_WEIGHT = 0.5f;
+
+    /** {@link #preferSmallerBox} 的默认值：开启"更小、更具体优先"。 */
+    public static final boolean DEFAULT_PREFER_SMALLER_BOX = true;
+
+    /**
+     * {@link #maxRankedCandidates} 的默认值：单次选择最多保留 8 个已排名候选。
+     *
+     * <p>一次点击能同时命中的框本来就少（个位数），这个上限主要是给
+     * <b>异常掩码</b>兜底：宁可丢掉第 9 名之后的名次明细，也不要让调试信息无限膨胀。
+     * rank 0 永远保留，因此上限不会影响最终选中结果。</p>
+     */
+    public static final int DEFAULT_MAX_RANKED_CANDIDATES = 8;
 
     /** 是否启用。false 时控制器直接返回 {@code CANCELLED}，完全不触达帧来源与识别实现。 */
     public final boolean enabled;
@@ -229,8 +285,8 @@ public final class TargetSelectionConfig {
     public final int maxEdgeThicknessPx;
 
     /**
-     * 一条边带的<b>实心度</b>下限（(0,1]）：外接盒里蓝像素占比低于它就不算"线"。
-     * 用来挡掉"借别的边的像素凑出来的假边"（典型是贴在框沿上的 id 文字列）。
+     * 一条边带在自身范围内的<b>实心度</b>下限（(0,1]）：像素占比低于它就不算"线"。
+     * 用来挡掉点状噪声、虚线残段这类稀疏结构。见 {@link #DEFAULT_MIN_EDGE_SOLIDITY}。
      */
     public final float minEdgeSolidity;
 
@@ -242,6 +298,32 @@ public final class TargetSelectionConfig {
 
     /** 单次检测保留的候选上限（&ge; 1），防异常掩码产生组合爆炸。 */
     public final int maxCandidateCount;
+
+    // ---------------------------------------------------------------- 多目标选择策略（Slice 6）
+
+    /** 严格包含命中（{@code EXACT_HIT}）在总分上的加分（&ge; 0）。 */
+    public final float exactHitWeight;
+
+    /** 归一化中心距离的惩罚权重（&ge; 0）。 */
+    public final float centerDistanceWeight;
+
+    /** 归一化面积的惩罚权重（&ge; 0）；仅在 {@link #preferSmallerBox} 为 true 时生效。 */
+    public final float areaWeight;
+
+    /** 框自身置信度的加分权重（&ge; 0）。 */
+    public final float confidenceWeight;
+
+    /** 框自身完整度的加分权重（&ge; 0）。 */
+    public final float completenessWeight;
+
+    /**
+     * 是否让"更小、更具体"的框优先。true 时面积越小总分越高
+     * （用于"大框套小框"这类嵌套/重叠场景）；false 时面积完全不参与评分。
+     */
+    public final boolean preferSmallerBox;
+
+    /** 单次选择保留的已排名候选上限（&ge; 1）；rank 0 永远保留。 */
+    public final int maxRankedCandidates;
 
     private TargetSelectionConfig(Builder builder) {
         this.enabled = builder.enabled;
@@ -271,11 +353,20 @@ public final class TargetSelectionConfig {
         this.minBoxConfidence = builder.minBoxConfidence;
         this.touchTolerancePx = builder.touchTolerancePx;
         this.maxCandidateCount = builder.maxCandidateCount;
+        this.exactHitWeight = builder.exactHitWeight;
+        this.centerDistanceWeight = builder.centerDistanceWeight;
+        this.areaWeight = builder.areaWeight;
+        this.confidenceWeight = builder.confidenceWeight;
+        this.completenessWeight = builder.completenessWeight;
+        this.preferSmallerBox = builder.preferSmallerBox;
+        this.maxRankedCandidates = builder.maxRankedCandidates;
     }
 
     /**
      * 默认策略：启用、300ms 取帧预算、分析图最长边 640、不限帧龄、不设置信度门槛、汇报未知 id；
-     * ROI 半径 200、蓝色 200°~270° / S≥0.30 / V≥0.20、去噪阈值 1、蓝像素下限 12、debug 关闭。
+     * ROI 半径 200、蓝色 200°~270° / S≥0.30 / V≥0.20、去噪阈值 1、蓝像素下限 12、debug 关闭；
+     * 多目标选择用「EXACT 优先 → 中心距离 1.0 → 面积 1.0（更小优先）→
+     * 置信度/完整度各 0.5」的加权分，最多保留 8 个已排名候选。
      */
     public static TargetSelectionConfig defaults() {
         return new Builder().build();
@@ -309,7 +400,14 @@ public final class TargetSelectionConfig {
                 .minEdgeSolidity(minEdgeSolidity)
                 .minBoxConfidence(minBoxConfidence)
                 .touchTolerancePx(touchTolerancePx)
-                .maxCandidateCount(maxCandidateCount);
+                .maxCandidateCount(maxCandidateCount)
+                .exactHitWeight(exactHitWeight)
+                .centerDistanceWeight(centerDistanceWeight)
+                .areaWeight(areaWeight)
+                .confidenceWeight(confidenceWeight)
+                .completenessWeight(completenessWeight)
+                .preferSmallerBox(preferSmallerBox)
+                .maxRankedCandidates(maxRankedCandidates);
     }
 
     @Override
@@ -340,7 +438,14 @@ public final class TargetSelectionConfig {
                 + ", minEdgeSolidity=" + minEdgeSolidity
                 + ", minBoxConfidence=" + minBoxConfidence
                 + ", touchTolerancePx=" + touchTolerancePx
-                + ", maxCandidateCount=" + maxCandidateCount + "}";
+                + ", maxCandidateCount=" + maxCandidateCount
+                + ", exactHitWeight=" + exactHitWeight
+                + ", centerDistanceWeight=" + centerDistanceWeight
+                + ", areaWeight=" + areaWeight
+                + ", confidenceWeight=" + confidenceWeight
+                + ", completenessWeight=" + completenessWeight
+                + ", preferSmallerBox=" + preferSmallerBox
+                + ", maxRankedCandidates=" + maxRankedCandidates + "}";
     }
 
     /** 构造器：非法组合在 {@link #build()} 处一次性失败，避免把坏配置带进点击路径。 */
@@ -375,6 +480,14 @@ public final class TargetSelectionConfig {
         private float minBoxConfidence = DEFAULT_MIN_BOX_CONFIDENCE;
         private int touchTolerancePx = DEFAULT_TOUCH_TOLERANCE_PX;
         private int maxCandidateCount = DEFAULT_MAX_CANDIDATE_COUNT;
+
+        private float exactHitWeight = DEFAULT_EXACT_HIT_WEIGHT;
+        private float centerDistanceWeight = DEFAULT_CENTER_DISTANCE_WEIGHT;
+        private float areaWeight = DEFAULT_AREA_WEIGHT;
+        private float confidenceWeight = DEFAULT_CONFIDENCE_WEIGHT;
+        private float completenessWeight = DEFAULT_COMPLETENESS_WEIGHT;
+        private boolean preferSmallerBox = DEFAULT_PREFER_SMALLER_BOX;
+        private int maxRankedCandidates = DEFAULT_MAX_RANKED_CANDIDATES;
 
         public Builder enabled(boolean enabled) {
             this.enabled = enabled;
@@ -620,6 +733,51 @@ public final class TargetSelectionConfig {
             return this;
         }
 
+        /** @throws IllegalArgumentException 为负或非有限值 */
+        public Builder exactHitWeight(float exactHitWeight) {
+            this.exactHitWeight = requireWeight(exactHitWeight, "exactHitWeight");
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负或非有限值 */
+        public Builder centerDistanceWeight(float centerDistanceWeight) {
+            this.centerDistanceWeight = requireWeight(centerDistanceWeight, "centerDistanceWeight");
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负或非有限值 */
+        public Builder areaWeight(float areaWeight) {
+            this.areaWeight = requireWeight(areaWeight, "areaWeight");
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负或非有限值 */
+        public Builder confidenceWeight(float confidenceWeight) {
+            this.confidenceWeight = requireWeight(confidenceWeight, "confidenceWeight");
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负或非有限值 */
+        public Builder completenessWeight(float completenessWeight) {
+            this.completenessWeight = requireWeight(completenessWeight, "completenessWeight");
+            return this;
+        }
+
+        public Builder preferSmallerBox(boolean preferSmallerBox) {
+            this.preferSmallerBox = preferSmallerBox;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 小于 1 */
+        public Builder maxRankedCandidates(int maxRankedCandidates) {
+            if (maxRankedCandidates < 1) {
+                throw new IllegalArgumentException("maxRankedCandidates must be >= 1 but was "
+                        + maxRankedCandidates);
+            }
+            this.maxRankedCandidates = maxRankedCandidates;
+            return this;
+        }
+
         /**
          * @throws IllegalArgumentException 任一视觉阈值非法（这里复用
          *         {@link BlueColorThresholds#of} 的校验，保证「配置里能过」等价于
@@ -651,6 +809,14 @@ public final class TargetSelectionConfig {
             if (Float.isNaN(value) || value < 0f || value > 1f) {
                 throw new IllegalArgumentException(name + " must be within [0,1] but was " + value);
             }
+        }
+
+        /** 权重必须是非负有限值：负权重会把"越远越好"这类反直觉行为带进评分。 */
+        private static float requireWeight(float value, String name) {
+            if (!Float.isFinite(value) || value < 0f) {
+                throw new IllegalArgumentException(name + " must be finite and >= 0 but was " + value);
+            }
+            return value;
         }
     }
 }

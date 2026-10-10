@@ -78,12 +78,27 @@ final class TestImages {
     static int drawLabelGlyphs(int[] pixels, int imageWidth, int imageHeight,
                                int x, int y, int glyphWidth, int glyphHeight,
                                int count, int argb) {
+        return drawLabelGlyphs(pixels, imageWidth, imageHeight,
+                x, y, glyphWidth, glyphHeight, count, 2, argb);
+    }
+
+    /**
+     * 与 {@link #drawLabelGlyphs} 相同，但<b>字形间距可指定</b>。
+     *
+     * <p>需要它是因为真实推流端的字形间距比"紧排"大得多：实测 1080p 下
+     * {@code id:1850} 的 {@code d} 与 {@code :} 之间空了约 10px，而两个相邻目标的编号
+     * 之间也是约 10px —— 用默认的 2px 间距根本复现不出这个（本 Slice 最关键的）
+     * 歧义场景。</p>
+     */
+    static int drawLabelGlyphs(int[] pixels, int imageWidth, int imageHeight,
+                               int x, int y, int glyphWidth, int glyphHeight,
+                               int count, int gap, int argb) {
         int written = 0;
         int cursor = x;
         for (int i = 0; i < count; i++) {
             written += strokeRect(pixels, imageWidth, imageHeight,
                     cursor, y, glyphWidth, glyphHeight, 1, argb);
-            cursor += glyphWidth + 2;
+            cursor += glyphWidth + gap;
         }
         return written;
     }

@@ -13,6 +13,7 @@ import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
 import com.example.motro.targetselection.geometry.VideoGeometry;
 import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.vision.DetectedTargetBox;
+import com.example.motro.targetselection.vision.LabelCandidate;
 import com.example.motro.targetselection.vision.TargetCandidateScore;
 
 import java.util.List;
@@ -39,6 +40,13 @@ import java.util.List;
  * 只看一个选中框是答不出来的，必须把全部命中候选连同各自的分数摆在屏幕上。
  * <b>这些框与分数只反映已经算好的结果，本类不参与任何命中判定或排序</b> ——
  * 否则调试图与正式算法会变成两套逻辑，而调试图的价值恰恰是"帮我判断正式算法对不对"。</p>
+ *
+ * <p>Slice 7 再加第三层：标签区域提取。三层视觉编码 —— <b>点划浅蓝</b>=标签搜索带
+ * （这次真正扫过的窄带）、<b>细实线橙</b>=全部标签候选、<b>粗实线白</b>=选中的标签 ROI。
+ * 文本块给出状态（{@code SUCCESS}/{@code NO_LABEL}/…）、候选数、离框顶距离、水平对齐度、
+ * 文本形态得分、置信度与 search/crop 分步耗时，并按序列出每个候选。
+ * 它要回答的问题是：<b>"编号那一小块找到没有？没找到是搜索带没盖住，还是没有像文字的蓝块？"</b>
+ * 同样地，这些矩形全部来自已经算好的 {@link TargetDebugState}，本类不重跑任何检测。</p>
  *
  * <p><b>叠加方式（由 app 层决定，本类不关心父容器）</b>：</p>
  * <pre>
@@ -90,6 +98,16 @@ public class TargetDebugOverlayView extends View {
     /** 选中的框：实线 + 更粗 + 洋红。它是"本次点击实际命中的那个框"，必须最醒目。 */
     private static final int COLOR_SELECTED_BOX = 0xFFFF1744;
     private static final int COLOR_ROI_RECT = 0xFF7C4DFF;
+    /**
+     * 标签搜索带（Slice 7）：点划线 + 浅蓝。它表示"这次真正扫过的窄带"，
+     * 与紫色的 ROI（点击点附近的检索区域）是两件不同的事，因此颜色与线型都要分开 ——
+     * 混成同一种视觉编码以后，"标签为什么没找到"就无从判断（面积不够？还是压根没扫到？）。
+     */
+    private static final int COLOR_LABEL_SEARCH = 0xFF40C4FF;
+    /** 标签候选（Slice 7）：实线 + 橙色。它可能有好几个，所以用最细的线，避免糊成一片。 */
+    private static final int COLOR_LABEL_CANDIDATE = 0xFFFF9100;
+    /** 选中的标签区域（Slice 7）：实线 + 白色 + 最粗。它是本阶段的"最终答案"，必须压在最上层。 */
+    private static final int COLOR_LABEL_ROI = 0xFFFFFFFF;
     private static final int COLOR_TEXT = 0xFFF5F5F5;
     private static final int COLOR_TEXT_BG = 0xB3000000;
 
@@ -101,6 +119,11 @@ public class TargetDebugOverlayView extends View {
     private static final float DP_SELECTED_STROKE = 4f;
     private static final float DP_CANDIDATE_DASH_ON = 6f;
     private static final float DP_CANDIDATE_DASH_OFF = 4f;
+    private static final float DP_LABEL_SEARCH_STROKE = 1.5f;
+    private static final float DP_LABEL_SEARCH_DASH_ON = 2f;
+    private static final float DP_LABEL_SEARCH_DASH_OFF = 3f;
+    private static final float DP_LABEL_CANDIDATE_STROKE = 2f;
+    private static final float DP_LABEL_ROI_STROKE = 3f;
     private static final float DP_TOUCH_RADIUS = 9f;
     private static final float DP_TOUCH_CROSS_ARM = 16f;
     private static final float DP_MAPPED_RADIUS = 6f;
@@ -125,6 +148,9 @@ public class TargetDebugOverlayView extends View {
     private final Paint rankedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint selectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roiPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelSearchPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelCandidatePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint labelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textBgPaint = new Paint();
 
@@ -209,6 +235,22 @@ public class TargetDebugOverlayView extends View {
         roiPaint.setStyle(Paint.Style.STROKE);
         roiPaint.setStrokeWidth(DP_ROI_STROKE * density);
         roiPaint.setColor(COLOR_ROI_RECT);
+
+        // Slice 7 的三层标签视觉编码。形状 + 粗细 + 颜色三重区分，
+        // 于是截图转灰度或色觉障碍下依然能分辨：点划线=搜索带、细实线=候选、粗实线=选中。
+        labelSearchPaint.setStyle(Paint.Style.STROKE);
+        labelSearchPaint.setStrokeWidth(DP_LABEL_SEARCH_STROKE * density);
+        labelSearchPaint.setColor(COLOR_LABEL_SEARCH);
+        labelSearchPaint.setPathEffect(new DashPathEffect(
+                new float[]{DP_LABEL_SEARCH_DASH_ON * density, DP_LABEL_SEARCH_DASH_OFF * density}, 0f));
+
+        labelCandidatePaint.setStyle(Paint.Style.STROKE);
+        labelCandidatePaint.setStrokeWidth(DP_LABEL_CANDIDATE_STROKE * density);
+        labelCandidatePaint.setColor(COLOR_LABEL_CANDIDATE);
+
+        labelPaint.setStyle(Paint.Style.STROKE);
+        labelPaint.setStrokeWidth(DP_LABEL_ROI_STROKE * density);
+        labelPaint.setColor(COLOR_LABEL_ROI);
 
         textPaint.setTextSize(DP_TEXT_SIZE * density);
         textPaint.setColor(COLOR_TEXT);
@@ -377,7 +419,15 @@ public class TargetDebugOverlayView extends View {
         for (int i = 0; i < ranked.size(); i++) {
             drawVideoBox(canvas, current.mapping.geometry, ranked.get(i).box.rectInVideo, rankedPaint);
         }
-        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, candidatePaint);
+        // Slice 7：标签提取的三层 —— 搜索带（点划浅蓝）→ 全部候选（细实线橙）→
+        // 选中的标签（粗实线白）。顺序即层次：后画的压在先画的上面，
+        // 于是"这一块既是候选、又是最终选中的那块"在视觉上层层叠加、一眼可辨。
+        drawVideoBox(canvas, current.mapping.geometry, current.labelSearchRegion, labelSearchPaint);
+        final List<LabelCandidate> labels = current.labelCandidates;
+        for (int i = 0; i < labels.size(); i++) {
+            drawVideoBox(canvas, current.mapping.geometry, labels.get(i).rectInVideo, labelCandidatePaint);
+        }
+        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, labelPaint);
         drawVideoBox(canvas, current.mapping.geometry, current.selectedBox, selectedPaint);
     }
 
@@ -537,6 +587,63 @@ public class TargetDebugOverlayView extends View {
             }
             if (current.selectionReason() != null) {
                 b.append('\n').append("  reason=").append(current.selectionReason());
+            }
+        }
+
+        // Slice 7：标签区域提取。这一段直接回答"编号那一小块找到没有、为什么是它"。
+        if (current.hasLabelExtraction()) {
+            b.append('\n').append("label=").append(current.labelStatus())
+                    .append("  candidates=").append(current.labelCandidates.size());
+            if (current.hasLabelCandidates()) {
+                b.append("  dist=");
+                appendFixed1(b, current.labelCandidates.get(0).distanceToBox);
+                b.append("  align=");
+                appendFixed(b, current.labelCandidates.get(0).alignmentScore, 2);
+                b.append("  text=");
+                appendFixed(b, current.labelCandidates.get(0).textLikeScore, 2);
+                b.append("  conf=");
+                appendFixed(b, current.labelConfidence(), 2);
+            }
+            if (current.hasLabelRoi()) {
+                b.append("  roi=[");
+                appendFixed1(b, current.labelRoi.left);
+                b.append(',');
+                appendFixed1(b, current.labelRoi.top);
+                b.append(',');
+                appendFixed1(b, current.labelRoi.right);
+                b.append(',');
+                appendFixed1(b, current.labelRoi.bottom);
+                b.append(']');
+            } else {
+                b.append("  roi=-");
+            }
+            b.append("  detect=").append(current.labelDetectMs())
+                    .append("ms crop=").append(current.labelCropMs()).append("ms");
+            // 候选明细：与多目标选择那段同一个理由 —— 只看选中结果是答不出"为什么不是旁边那个"的。
+            final int shownLabels = Math.min(MAX_CANDIDATE_LINES, current.labelCandidates.size());
+            for (int i = 0; i < shownLabels; i++) {
+                final LabelCandidate candidate = current.labelCandidates.get(i);
+                b.append('\n').append("  label#").append(i).append(" dist=");
+                appendFixed1(b, candidate.distanceToBox);
+                b.append(" align=");
+                appendFixed(b, candidate.alignmentScore, 2);
+                b.append(" text=");
+                appendFixed(b, candidate.textLikeScore, 2);
+                b.append(" conf=");
+                appendFixed(b, candidate.confidence, 2);
+                b.append(" [");
+                appendFixed1(b, candidate.rectInVideo.left);
+                b.append(',');
+                appendFixed1(b, candidate.rectInVideo.top);
+                b.append(',');
+                appendFixed1(b, candidate.rectInVideo.right);
+                b.append(',');
+                appendFixed1(b, candidate.rectInVideo.bottom);
+                b.append(']');
+            }
+            if (current.labelCandidates.size() > shownLabels) {
+                b.append('\n').append("  ... +")
+                        .append(current.labelCandidates.size() - shownLabels).append(" more labels");
             }
         }
 

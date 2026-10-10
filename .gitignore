@@ -25,3 +25,9 @@ __pycache__/
 # Slice 6（多目标选择）的样本：同样由 build_samples.sh 现场生成，只是把点按坐标换成
 # 了"多目标场景"（相邻框、重叠框、嵌套框、点击两框之间、点击 id 文字行……）
 /artifacts/target_selection_samples/
+# Slice 7（标签区域提取）的样本：合成样本 + 直接从真实采集视频解码的真实帧样本，
+# 同样由 build_samples.sh 现场生成，体积大且含采集素材内容，不入版本库
+/artifacts/target_label_samples/
+/artifacts/target_label_real_samples/
+# Slice 7 期间的临时探针产物（人工查看真实帧用的裁剪/放大图）
+/artifacts/label_probe/

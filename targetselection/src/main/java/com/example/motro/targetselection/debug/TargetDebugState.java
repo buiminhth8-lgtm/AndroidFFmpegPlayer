@@ -9,6 +9,9 @@ import com.example.motro.targetselection.geometry.VideoScaleType;
 import com.example.motro.targetselection.vision.BlueMaskResult;
 import com.example.motro.targetselection.vision.BlueMaskStatus;
 import com.example.motro.targetselection.vision.DetectedTargetBox;
+import com.example.motro.targetselection.vision.LabelCandidate;
+import com.example.motro.targetselection.vision.LabelExtractionResult;
+import com.example.motro.targetselection.vision.LabelExtractionStatus;
 import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
 import com.example.motro.targetselection.vision.TargetCandidateScore;
@@ -148,10 +151,46 @@ public final class TargetDebugState {
     /** 多目标选择耗时（毫秒）；未做选择时为 0。 */
     public final long selectionMs;
 
-    /** 预留：标签识别区域（视频坐标）。本 Slice 恒为 null。 */
+    // ---------------------------------------------------------------- 标签区域提取（Slice 7）
+
+    /**
+     * 标签搜索区域（视频坐标）：这次真正扫过的那条窄带（框顶上方 + 左右余量 + 压进框顶一点）。
+     * 由 {@link #withLabelExtraction(LabelExtractionResult)} 填充；未做标签提取时为 null。
+     *
+     * <p>它是排查"标签为什么没找到"的第一手依据：先看这条带画在哪 ——
+     * 若它压根没盖住编号，问题在配置或框的位置，而不在文字形态判据。</p>
+     */
+    public final TargetBoundingBox labelSearchRegion;
+
+    /**
+     * 全部标签候选（视频坐标），顺序与提取器给出的确定性顺序一致；
+     * 未做标签提取时为空列表。
+     *
+     * <p>放全部而不是只放选中的那个：调试价值的一半在"为什么是它"，
+     * 而答案全在被丢掉的候选里。</p>
+     */
+    public final List<LabelCandidate> labelCandidates;
+
+    /** 标签提取状态；未做标签提取时为 null。见 {@link LabelExtractionStatus}。 */
+    public final LabelExtractionStatus labelStatus;
+
+    /** 选中标签的置信度 [0,1]；未找到标签时为 0。 */
+    public final float labelConfidence;
+
+    /** 标签搜索阶段耗时（毫秒）；未做标签提取时为 0。 */
+    public final long labelDetectMs;
+
+    /** 标签裁剪阶段耗时（毫秒）；未做标签提取时为 0。 */
+    public final long labelCropMs;
+
+    /**
+     * 选中的标签区域（视频坐标）。Slice 6 之前是预留字段（恒为 null），
+     * Slice 7 起由 {@link #withLabelExtraction(LabelExtractionResult)} 填入；
+     * 没找到标签时仍为 null，此时 {@link #labelStatus} 会说明原因。
+     */
     public final TargetBoundingBox labelRoi;
 
-    /** 预留：目标 id。本 Slice 恒为 null（矩形恢复不识别 id，见 Slice 6）。 */
+    /** 预留：目标 id。本 Slice 恒为 null（标签提取不识别文字内容，见 Slice 7）。 */
     public final String targetId;
 
     /** 选中框的置信度 [0,1]；未命中时为 0。 */
@@ -186,6 +225,12 @@ public final class TargetDebugState {
         this.selectionScore = builder.selectionScore;
         this.selectionReason = builder.selectionReason;
         this.selectionMs = builder.selectionMs;
+        this.labelSearchRegion = builder.labelSearchRegion;
+        this.labelCandidates = Collections.unmodifiableList(new ArrayList<>(builder.labelCandidates));
+        this.labelStatus = builder.labelStatus;
+        this.labelConfidence = builder.labelConfidence;
+        this.labelDetectMs = builder.labelDetectMs;
+        this.labelCropMs = builder.labelCropMs;
         this.labelRoi = builder.labelRoi;
         this.targetId = builder.targetId;
         this.confidence = builder.confidence;
@@ -252,6 +297,11 @@ public final class TargetDebugState {
                 .selectionScore(selectionScore)
                 .selectionReason(selectionReason)
                 .selectionMs(selectionMs)
+                .labelSearchRegion(labelSearchRegion)
+                .labelCandidates(labelCandidates)
+                .labelStatus(labelStatus)
+                .labelConfidence(labelConfidence)
+                .labelTimings(labelDetectMs, labelCropMs)
                 .labelRoi(labelRoi)
                 .targetId(targetId)
                 .confidence(confidence)
@@ -301,6 +351,32 @@ public final class TargetDebugState {
      */
     public TargetDebugState withBoxDetection(TargetBoxDetectionResult result) {
         return toBuilder().boxDetection(result).build();
+    }
+
+    /**
+     * 复制并挂上一次标签区域提取的结果 —— Slice 7 的标准接法。
+     *
+     * <p>把 {@link LabelExtractionResult} 里叠加层需要的几项翻成可视化字段：
+     * 搜索区域、全部候选、选中的标签、状态、置信度、以及搜索/裁剪分步耗时。
+     * <b>裁剪出的像素不进本对象</b> —— 叠加层只画矢量矩形与文字，
+     * 把几 KB 的 ARGB 数组塞进调试状态只会让它在主线程上多背一份无用数据
+     * （真正的消费方是后续的识别阶段，它直接吃 {@code LabelExtractionResult}）。</p>
+     *
+     * <p>{@link #processingMs} 会被<b>累加</b>上这次标签提取的耗时（而不是覆盖）：
+     * 标签提取发生在矩形恢复之后，两者是同一串工作的前后两段，
+     * 覆盖会让「这次点击一共花了多久」丢掉前半段。分步耗时另由
+     * {@link #labelDetectMs}/{@link #labelCropMs} 给出。</p>
+     *
+     * <p>失败结果同样接受：{@link #labelStatus} 会如实带上
+     * {@code NO_LABEL} / {@code INVALID_BOX} / …，于是叠加层能显示「为什么没有标签」，
+     * 而不是空着让人猜。注意 {@code NO_LABEL} <b>不是</b> MISS（见该枚举的说明）。</p>
+     *
+     * @param result 提取结果，非 null
+     * @return 新的状态对象（本对象不变）
+     * @throws IllegalArgumentException result 为 null
+     */
+    public TargetDebugState withLabelExtraction(LabelExtractionResult result) {
+        return toBuilder().labelExtraction(result).build();
     }
 
 
@@ -451,6 +527,41 @@ public final class TargetDebugState {
         return selectionMs;
     }
 
+    /** 是否做过标签提取（即 {@link #labelStatus} 有值，无论成功还是失败）。 */
+    public boolean hasLabelExtraction() {
+        return labelStatus != null;
+    }
+
+    /** 是否有可绘制的标签候选。 */
+    public boolean hasLabelCandidates() {
+        return !labelCandidates.isEmpty();
+    }
+
+    /** 是否有可绘制的选中标签区域。 */
+    public boolean hasLabelRoi() {
+        return labelRoi != null;
+    }
+
+    /** 标签提取状态；未做标签提取时为 null。 */
+    public LabelExtractionStatus labelStatus() {
+        return labelStatus;
+    }
+
+    /** 选中标签的置信度 [0,1]；未找到标签时为 0。 */
+    public float labelConfidence() {
+        return labelConfidence;
+    }
+
+    /** 标签搜索耗时（毫秒）；未做标签提取时为 0。 */
+    public long labelDetectMs() {
+        return labelDetectMs;
+    }
+
+    /** 标签裁剪耗时（毫秒）；未做标签提取时为 0。 */
+    public long labelCropMs() {
+        return labelCropMs;
+    }
+
     /** 本次点击是否命中了一个候选框（叠加层据此把选中框画成高亮样式）。 */
     public boolean isHit() {
         return selectedBox != null;
@@ -490,10 +601,12 @@ public final class TargetDebugState {
      * roi=SUCCESS rect=[...] blue=1832 ratio=0.01145 ms=3
      * boxes=SUCCESS candidates=2 shown=2 hits=2 hitType=EXACT_HIT selected=[...] confidence=1.0
      * selScore=2.91 detectMs=1 hitTestMs=0 selectMs=0 totalMs=4 reason=EXACT_HIT best-of-2 score=2.910
+     * label=SUCCESS search=[...] candidates=1 selected=[...] labelConf=0.91 labelDetectMs=0 labelCropMs=0 labelMs=0
      * </pre>
      * <p>未做视觉分析时最后一段整体不出现，保持与 Slice 3 完全一致的输出（旧日志仍然可比）。
      * 做了矩形恢复时，掩码段的 {@code ms=} 会被省略 —— 那时 {@link #processingMs} 已经是
-     * 覆盖掩码 + 检测 + 命中的总耗时，同一数值在两段里各印一次只会让人误读成分步耗时。</p>
+     * 覆盖掩码 + 检测 + 命中的总耗时，同一数值在两段里各印一次只会让人误读成分步耗时。
+     * 标签段同理"没做过就整段不输出"，因此只跑到 Slice 6 的日志不受影响。</p>
      */
     public String debugString() {
         final StringBuilder b = new StringBuilder(256);
@@ -526,6 +639,20 @@ public final class TargetDebugState {
             if (selectionReason != null) {
                 b.append(" reason=").append(selectionReason);
             }
+        }
+        // Slice 7：标签区域提取。同样"没做过就整段不输出"，于是旧场景的日志逐字不变。
+        // 这里刻意不打 processingMs —— 它已是"整条链"的累计耗时（含前面的框检测），
+        // 在标签段再印一次会被误读成"标签这一段花了那么久"。标签这一段的耗时看
+        // labelDetectMs/labelCropMs/labelMs。
+        if (hasLabelExtraction()) {
+            b.append(" label=").append(labelStatus)
+                    .append(" search=").append(labelSearchRegion == null ? "-" : labelSearchRegion)
+                    .append(" candidates=").append(labelCandidates.size())
+                    .append(" selected=").append(labelRoi == null ? "-" : labelRoi)
+                    .append(" labelConf=").append(labelConfidence)
+                    .append(" labelDetectMs=").append(labelDetectMs)
+                    .append(" labelCropMs=").append(labelCropMs)
+                    .append(" labelMs=").append(labelDetectMs + labelCropMs);
         }
         return b.toString();
     }
@@ -571,6 +698,12 @@ public final class TargetDebugState {
         private float selectionScore;
         private String selectionReason;
         private long selectionMs;
+        private TargetBoundingBox labelSearchRegion;
+        private List<LabelCandidate> labelCandidates = Collections.emptyList();
+        private LabelExtractionStatus labelStatus;
+        private float labelConfidence;
+        private long labelDetectMs;
+        private long labelCropMs;
         private TargetBoundingBox labelRoi;
         private String targetId;
         private float confidence;
@@ -760,6 +893,88 @@ public final class TargetDebugState {
             return this;
         }
 
+        /**
+         * 一次性把 {@link LabelExtractionResult} 的可视信息并进来：搜索区域、全部候选、
+         * 选中的标签、状态、置信度、分步耗时
+         * （见 {@link TargetDebugState#withLabelExtraction(LabelExtractionResult)}）。
+         *
+         * <p>选中标签取 {@link LabelExtractionResult#getLabelRectInVideo()} ——
+         * 叠加层要画的是视频坐标矩形，与 {@link TargetDebugState#labelRoi} 的既有语义一致，
+         * 这里不做转换、只做取值。</p>
+         *
+         * <p>{@code processingMs} 是<b>累加</b>而不是覆盖：标签提取在矩形恢复之后，
+         * 覆盖会让"这次点击一共花了多久"丢掉前半段。</p>
+         *
+         * @throws IllegalArgumentException result 为 null
+         */
+        public Builder labelExtraction(LabelExtractionResult result) {
+            if (result == null) {
+                throw new IllegalArgumentException("result must not be null");
+            }
+            final LabelCandidate selected = result.selectedLabel;
+            return labelSearchRegion(result.labelSearchRegion)
+                    .labelCandidates(result.candidates)
+                    .labelStatus(result.status)
+                    .labelRoi(result.getLabelRectInVideo())
+                    .labelConfidence(selected == null ? 0f : selected.confidence)
+                    .labelTimings(result.labelDetectMs, result.labelCropMs)
+                    .processingMs(processingMs + result.totalMs);
+        }
+
+        /** 标签搜索区域（视频坐标）；null 表示本次没做标签提取。 */
+        public Builder labelSearchRegion(TargetBoundingBox labelSearchRegion) {
+            this.labelSearchRegion = labelSearchRegion;
+            return this;
+        }
+
+        /** 标签候选列表；null 视为空列表。元素不得为 null。 */
+        public Builder labelCandidates(List<LabelCandidate> labelCandidates) {
+            if (labelCandidates == null) {
+                this.labelCandidates = Collections.emptyList();
+                return this;
+            }
+            for (LabelCandidate candidate : labelCandidates) {
+                if (candidate == null) {
+                    throw new IllegalArgumentException("labelCandidates must not contain null elements");
+                }
+            }
+            this.labelCandidates = new ArrayList<>(labelCandidates);
+            return this;
+        }
+
+        /** 标签提取状态；null 表示本次没做标签提取。 */
+        public Builder labelStatus(LabelExtractionStatus labelStatus) {
+            this.labelStatus = labelStatus;
+            return this;
+        }
+
+        /** 选中标签的置信度。@throws IllegalArgumentException 不在 [0,1] 内 */
+        public Builder labelConfidence(float labelConfidence) {
+            if (Float.isNaN(labelConfidence) || labelConfidence < 0f || labelConfidence > 1f) {
+                throw new IllegalArgumentException("labelConfidence must be within [0,1] but was "
+                        + labelConfidence);
+            }
+            this.labelConfidence = labelConfidence;
+            return this;
+        }
+
+        /**
+         * 标签提取的分步耗时。
+         *
+         * @throws IllegalArgumentException 任一为负
+         */
+        public Builder labelTimings(long labelDetectMs, long labelCropMs) {
+            if (labelDetectMs < 0L) {
+                throw new IllegalArgumentException("labelDetectMs must be >= 0 but was " + labelDetectMs);
+            }
+            if (labelCropMs < 0L) {
+                throw new IllegalArgumentException("labelCropMs must be >= 0 but was " + labelCropMs);
+            }
+            this.labelDetectMs = labelDetectMs;
+            this.labelCropMs = labelCropMs;
+            return this;
+        }
+
         /** 分步耗时。@throws IllegalArgumentException 任一为负 */
         public Builder timings(long detectMs, long hitTestMs) {
             if (detectMs < 0L) {
@@ -779,13 +994,13 @@ public final class TargetDebugState {
             return this;
         }
 
-        /** 预留：标签识别区域。 */
+        /** 选中的标签区域（视频坐标）；null 表示没找到标签或没做标签提取。 */
         public Builder labelRoi(TargetBoundingBox labelRoi) {
             this.labelRoi = labelRoi;
             return this;
         }
 
-        /** 预留：目标 id。 */
+        /** 目标 id。本 Slice 恒为 null（标签提取不识别文字内容）。 */
         public Builder targetId(String targetId) {
             this.targetId = targetId;
             return this;

@@ -497,6 +497,59 @@ public class ModuleBoundaryTest {
         for (String timing : new String[]{"detectMs", "hitTestMs", "selectionMs", "totalMs"}) {
             assertTrue("TargetBoxDetectionResult 必须暴露 " + timing, result.contains(timing));
         }
+
+        // Slice 7 的标签提取同理：搜索与裁剪各自要能被单独看到
+        String label = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision/LabelExtractionResult.java"));
+        for (String timing : new String[]{"labelDetectMs", "labelCropMs", "totalMs"}) {
+            assertTrue("LabelExtractionResult 必须暴露 " + timing, label.contains(timing));
+        }
+    }
+
+    /**
+     * Slice 7 的标签提取策略：参数必须全部来自 {@code TargetSelectionConfig}，
+     * 而且<b>只允许 {@code LabelRegionExtractor} 读它们</b>。
+     *
+     * <p>同时钉住两件更重要的结构性约束：</p>
+     * <ol>
+     *   <li><b>蓝阈值只有一份</b>：标签提取必须复用 {@code BlueColorThresholds}
+     *       （以及配置里同一组 {@code blueHueMinDegrees} / {@code blueHueMaxDegrees} /
+     *       {@code minSaturation} / {@code minValue}），
+     *       不许为了"文字细、压缩后掉色更狠"另起一套阈值 ——
+     *       两套阈值意味着现场调参要调两处，且永远不知道哪一处才是生效的那个。</li>
+     *   <li><b>排序只有一处</b>：候选名次必须由 {@code LabelRegionExtractor} 里的显式比较器
+     *       逐级 tie-break 给出，不能靠集合遍历顺序或排序稳定性 ——
+     *       后者的结果会随输入规模与实现细节漂移，而"选错标签"是肉眼几乎发现不了的缺陷。</li>
+     * </ol>
+     */
+    @Test
+    public void labelExtractionPolicyLivesOnlyInTheLabelRegionExtractor() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String extractor = read(new File(visionDir, "LabelRegionExtractor.java"));
+
+        for (String knob : new String[]{
+                "labelSearchHeightPx", "labelHorizontalPaddingPx", "labelVerticalPaddingPx",
+                "labelMaxDistanceFromBoxPx", "minLabelCandidateWidth", "minLabelCandidateHeight",
+                "maxLabelCandidateCount"}) {
+            assertTrue("LabelRegionExtractor 必须从配置读取 " + knob,
+                    extractor.contains("config." + knob));
+        }
+        assertTrue("LabelRegionExtractor 必须复用 BlueColorThresholds（不得新建第二套蓝阈值）",
+                extractor.contains("BlueColorThresholds.of("));
+        assertTrue("LabelRegionExtractor 必须自带比较器以固定名次",
+                extractor.contains("Comparator<LabelCandidate>") && extractor.contains(".sort(RANKING)"));
+
+        // 其它视觉阶段不得掺入标签参数：否则"改了配置但行为没变"或"只变了一半"
+        for (String other : new String[]{"TargetBoxDetector.java", "TargetHitTester.java",
+                "TargetCandidateSelector.java", "BlueMaskDetector.java"}) {
+            String text = read(new File(visionDir, other));
+            for (String knob : new String[]{"labelSearchHeightPx", "labelMaxDistanceFromBoxPx",
+                    "labelHorizontalPaddingPx", "labelVerticalPaddingPx",
+                    "minLabelCandidate", "maxLabelCandidateCount"}) {
+                assertFalse(other + " 不得掺入标签提取参数（发现 " + knob + "）", text.contains(knob));
+            }
+        }
     }
 
     // ---------------------------------------------------------------- utils

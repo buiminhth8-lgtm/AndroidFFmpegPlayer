@@ -17,6 +17,12 @@ import com.example.motro.targetselection.vision.BlueColorThresholds;
  *       {@code minValue} / {@code minBluePixelCount} / {@code maskDenoiseMinNeighbors}）：
  *       决定"看多大范围、什么颜色算蓝"。这些值<b>必然</b>会随真实无人机画面/推流端调色而变，
  *       所以它们在这里集中暴露，而不是散落成算法里的魔数 —— 现场调参只改这一个对象。</li>
+ *   <li><b>标签区域调参</b>（{@code labelSearchHeightPx} / {@code labelHorizontalPaddingPx} /
+ *       {@code labelVerticalPaddingPx} / {@code labelMaxDistanceFromBoxPx} /
+ *       {@code minLabelCandidate*} / {@code maxLabelCandidateCount}，Slice 7）：
+ *       决定"在框顶附近的哪一带、以多大的最小尺寸、找 {@code id:xxxx}"。
+ *       换推流端（字号/编号位置/框线粗细变了）时只需要改这一组，
+ *       算法里没有任何写死的绝对坐标。</li>
  * </ul>
  *
  * <p>线程约定：不可变对象，可跨线程安全共享。</p>
@@ -201,6 +207,83 @@ public final class TargetSelectionConfig {
      */
     public static final int DEFAULT_MAX_RANKED_CANDIDATES = 8;
 
+    // ---------------------------------------------------------------- 标签区域提取（Slice 7）
+
+    /**
+     * {@link #labelSearchHeightPx} 的默认值（<b>视频</b>像素）：搜索带向框顶<b>上方</b>
+     * 延伸的高度。
+     *
+     * <p>取 48 的理由：推流端的编号文字字高实测在 10~18px 量级（1080p），并且它<b>紧贴</b>
+     * 框顶边（间隙 0~2px）甚至与之重叠；48px 足以覆盖"字高 + 若干像素的位置抖动"，
+     * 而多算的高度只是多扫几行像素 —— 搜索区域本来就窄，放宽的代价可以忽略。
+     * 它是"搜索"的上界，不是"接受"的上界：把远方另一个目标的编号也扫进来之后，
+     * 由 {@link #labelMaxDistanceFromBoxPx} 与水平对齐度把它们筛掉。</p>
+     */
+    public static final int DEFAULT_LABEL_SEARCH_HEIGHT_PX = 48;
+
+    /**
+     * {@link #labelHorizontalPaddingPx} 的默认值（视频像素）：搜索带在框的左右各外扩多少。
+     *
+     * <p>编号一般从框的左边界起画、宽度远小于框宽，所以左右各 16px 主要是给
+     * 「编号左端略超出框左边界」和「检测出的框左右各有几像素误差」留余量。
+     * 不宜过大：外扩太多会把隔壁目标框的编号也扫进来（虽然排序能把它排到后面，
+     * 但白扫的像素是纯浪费）。</p>
+     */
+    public static final int DEFAULT_LABEL_HORIZONTAL_PADDING_PX = 16;
+
+    /**
+     * {@link #labelVerticalPaddingPx} 的默认值（视频像素）：搜索带向框顶<b>下方</b>
+     * 压进框内的深度。
+     *
+     * <p>必须 &gt; 0：实测（1080p 真实推流画面）编号文字的下沿会与框顶边线<b>重叠</b>
+     * 若干像素（文字在 y=700~715，框顶边在 y=712~715）。若搜索带严格止于
+     * {@code box.top}，文字最下面那几行笔画就被切掉了 —— 外接盒高度随之偏小、
+     * 形态统计被扭曲。压进 6px 足以覆盖这种重叠，又不会把框的顶边线整条收进来
+     * （收进来也无妨：那是一条与框等宽的横线，会被当作框边线剔除，见
+     * {@code LabelRegionExtractor}）。</p>
+     */
+    public static final int DEFAULT_LABEL_VERTICAL_PADDING_PX = 6;
+
+    /**
+     * {@link #labelMaxDistanceFromBoxPx} 的默认值（视频像素）：候选被接受时，
+     * 它到 {@code box.top} 的最大垂直距离。
+     *
+     * <p>为什么比 {@link #DEFAULT_LABEL_SEARCH_HEIGHT_PX} 小：两者分工不同 ——
+     * 「搜索」可以放宽（多扫几行几乎不花钱，还能容忍检测出的框顶有几像素偏差），
+     * 但「接受」要收紧，否则框上方另一个目标（或另一层叠加文字）的编号会被当成
+     * 本框的标签。真实编号到框顶的距离实测 ≤ 3px，32px 已是十倍的余量。</p>
+     */
+    public static final int DEFAULT_LABEL_MAX_DISTANCE_FROM_BOX_PX = 32;
+
+    /**
+     * {@link #minLabelCandidateWidth} 的默认值（<b>视频</b>像素）。
+     *
+     * <p>取 16：编号至少是 {@code id:1} 这种长度，在 1080p 上宽 40px 上下；
+     * 16px 用来挡掉压缩后残留的零星蓝色碎片（它们凑不出这么宽的连续结构）。
+     * 按视频像素计，因此换分辨率不需要改。</p>
+     */
+    public static final int DEFAULT_MIN_LABEL_CANDIDATE_WIDTH = 16;
+
+    /**
+     * {@link #minLabelCandidateHeight} 的默认值（<b>视频</b>像素）。
+     *
+     * <p>取 6：这是<b>排除框边线</b>的一条硬判据。框线厚度实测 4~12px，
+     * 文字行高实测 10~18px。压下限到 6 以后，"薄于 6px 的一条横线"直接出局，
+     * 而最矮的真实编号（强压缩后字高掉到 8~10px）仍然通过。
+     * 它与 {@code LabelRegionExtractor} 里"剔除长横段"是两道互补的防线：
+     * 那道按<b>长度</b>挡、这道按<b>厚度</b>挡，粗框线只能靠前者、细框线两者都能挡。</p>
+     */
+    public static final int DEFAULT_MIN_LABEL_CANDIDATE_HEIGHT = 6;
+
+    /**
+     * {@link #maxLabelCandidateCount} 的默认值：单次提取最多保留 8 个候选。
+     *
+     * <p>一次点击附近真正像编号的文字块本来就没几个；这个上限是给<b>异常画面</b>
+     * 兜底（噪声密集时行带会被切得很碎）。rank 0 永远保留，因此上限不影响最终结果，
+     * 只限制调试信息膨胀。</p>
+     */
+    public static final int DEFAULT_MAX_LABEL_CANDIDATE_COUNT = 8;
+
     /** 是否启用。false 时控制器直接返回 {@code CANCELLED}，完全不触达帧来源与识别实现。 */
     public final boolean enabled;
 
@@ -325,6 +408,29 @@ public final class TargetSelectionConfig {
     /** 单次选择保留的已排名候选上限（&ge; 1）；rank 0 永远保留。 */
     public final int maxRankedCandidates;
 
+    // ---------------------------------------------------------------- 标签区域提取（Slice 7）
+
+    /** 标签搜索带在框顶<b>上方</b>的高度（视频像素，&gt; 0）。见 {@link #DEFAULT_LABEL_SEARCH_HEIGHT_PX}。 */
+    public final int labelSearchHeightPx;
+
+    /** 标签搜索带在框<b>左右</b>各外扩的宽度（视频像素，&ge; 0）。 */
+    public final int labelHorizontalPaddingPx;
+
+    /** 标签搜索带向框顶<b>下方</b>压进框内的深度（视频像素，&ge; 0）。 */
+    public final int labelVerticalPaddingPx;
+
+    /** 候选被接受时到 {@code box.top} 的最大垂直距离（视频像素，&ge; 0）。 */
+    public final int labelMaxDistanceFromBoxPx;
+
+    /** 标签候选的最小宽度（视频像素，&gt; 0）。 */
+    public final int minLabelCandidateWidth;
+
+    /** 标签候选的最小高度（视频像素，&gt; 0）。 */
+    public final int minLabelCandidateHeight;
+
+    /** 单次标签提取保留的候选上限（&ge; 1）；rank 0 永远保留。 */
+    public final int maxLabelCandidateCount;
+
     private TargetSelectionConfig(Builder builder) {
         this.enabled = builder.enabled;
         this.captureTimeoutMs = builder.captureTimeoutMs;
@@ -360,13 +466,22 @@ public final class TargetSelectionConfig {
         this.completenessWeight = builder.completenessWeight;
         this.preferSmallerBox = builder.preferSmallerBox;
         this.maxRankedCandidates = builder.maxRankedCandidates;
+        this.labelSearchHeightPx = builder.labelSearchHeightPx;
+        this.labelHorizontalPaddingPx = builder.labelHorizontalPaddingPx;
+        this.labelVerticalPaddingPx = builder.labelVerticalPaddingPx;
+        this.labelMaxDistanceFromBoxPx = builder.labelMaxDistanceFromBoxPx;
+        this.minLabelCandidateWidth = builder.minLabelCandidateWidth;
+        this.minLabelCandidateHeight = builder.minLabelCandidateHeight;
+        this.maxLabelCandidateCount = builder.maxLabelCandidateCount;
     }
 
     /**
      * 默认策略：启用、300ms 取帧预算、分析图最长边 640、不限帧龄、不设置信度门槛、汇报未知 id；
      * ROI 半径 200、蓝色 200°~270° / S≥0.30 / V≥0.20、去噪阈值 1、蓝像素下限 12、debug 关闭；
      * 多目标选择用「EXACT 优先 → 中心距离 1.0 → 面积 1.0（更小优先）→
-     * 置信度/完整度各 0.5」的加权分，最多保留 8 个已排名候选。
+     * 置信度/完整度各 0.5」的加权分，最多保留 8 个已排名候选；
+     * 标签提取在框顶上方 48px、左右各 16px、压进框顶 6px 的带状区域里搜索，
+     * 只接受离框顶 32px 以内、尺寸不小于 16×6 的视频像素块，最多保留 8 个候选。
      */
     public static TargetSelectionConfig defaults() {
         return new Builder().build();
@@ -407,7 +522,14 @@ public final class TargetSelectionConfig {
                 .confidenceWeight(confidenceWeight)
                 .completenessWeight(completenessWeight)
                 .preferSmallerBox(preferSmallerBox)
-                .maxRankedCandidates(maxRankedCandidates);
+                .maxRankedCandidates(maxRankedCandidates)
+                .labelSearchHeightPx(labelSearchHeightPx)
+                .labelHorizontalPaddingPx(labelHorizontalPaddingPx)
+                .labelVerticalPaddingPx(labelVerticalPaddingPx)
+                .labelMaxDistanceFromBoxPx(labelMaxDistanceFromBoxPx)
+                .minLabelCandidateWidth(minLabelCandidateWidth)
+                .minLabelCandidateHeight(minLabelCandidateHeight)
+                .maxLabelCandidateCount(maxLabelCandidateCount);
     }
 
     @Override
@@ -445,7 +567,14 @@ public final class TargetSelectionConfig {
                 + ", confidenceWeight=" + confidenceWeight
                 + ", completenessWeight=" + completenessWeight
                 + ", preferSmallerBox=" + preferSmallerBox
-                + ", maxRankedCandidates=" + maxRankedCandidates + "}";
+                + ", maxRankedCandidates=" + maxRankedCandidates
+                + ", labelSearchHeightPx=" + labelSearchHeightPx
+                + ", labelHorizontalPaddingPx=" + labelHorizontalPaddingPx
+                + ", labelVerticalPaddingPx=" + labelVerticalPaddingPx
+                + ", labelMaxDistanceFromBoxPx=" + labelMaxDistanceFromBoxPx
+                + ", minLabelCandidateWidth=" + minLabelCandidateWidth
+                + ", minLabelCandidateHeight=" + minLabelCandidateHeight
+                + ", maxLabelCandidateCount=" + maxLabelCandidateCount + "}";
     }
 
     /** 构造器：非法组合在 {@link #build()} 处一次性失败，避免把坏配置带进点击路径。 */
@@ -488,6 +617,14 @@ public final class TargetSelectionConfig {
         private float completenessWeight = DEFAULT_COMPLETENESS_WEIGHT;
         private boolean preferSmallerBox = DEFAULT_PREFER_SMALLER_BOX;
         private int maxRankedCandidates = DEFAULT_MAX_RANKED_CANDIDATES;
+
+        private int labelSearchHeightPx = DEFAULT_LABEL_SEARCH_HEIGHT_PX;
+        private int labelHorizontalPaddingPx = DEFAULT_LABEL_HORIZONTAL_PADDING_PX;
+        private int labelVerticalPaddingPx = DEFAULT_LABEL_VERTICAL_PADDING_PX;
+        private int labelMaxDistanceFromBoxPx = DEFAULT_LABEL_MAX_DISTANCE_FROM_BOX_PX;
+        private int minLabelCandidateWidth = DEFAULT_MIN_LABEL_CANDIDATE_WIDTH;
+        private int minLabelCandidateHeight = DEFAULT_MIN_LABEL_CANDIDATE_HEIGHT;
+        private int maxLabelCandidateCount = DEFAULT_MAX_LABEL_CANDIDATE_COUNT;
 
         public Builder enabled(boolean enabled) {
             this.enabled = enabled;
@@ -778,6 +915,85 @@ public final class TargetSelectionConfig {
             return this;
         }
 
+        /** @throws IllegalArgumentException 不为正 */
+        public Builder labelSearchHeightPx(int labelSearchHeightPx) {
+            if (labelSearchHeightPx <= 0) {
+                throw new IllegalArgumentException("labelSearchHeightPx must be > 0 but was "
+                        + labelSearchHeightPx);
+            }
+            this.labelSearchHeightPx = labelSearchHeightPx;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负 */
+        public Builder labelHorizontalPaddingPx(int labelHorizontalPaddingPx) {
+            if (labelHorizontalPaddingPx < 0) {
+                throw new IllegalArgumentException("labelHorizontalPaddingPx must be >= 0 but was "
+                        + labelHorizontalPaddingPx);
+            }
+            this.labelHorizontalPaddingPx = labelHorizontalPaddingPx;
+            return this;
+        }
+
+        /**
+         * 搜索带压进框顶的深度。
+         *
+         * @throws IllegalArgumentException 为负，或大于等于 {@link #labelSearchHeightPx}
+         *         （压进框里的深度比向上搜索的高度还大，说明这一对参数被设反了）
+         */
+        public Builder labelVerticalPaddingPx(int labelVerticalPaddingPx) {
+            if (labelVerticalPaddingPx < 0) {
+                throw new IllegalArgumentException("labelVerticalPaddingPx must be >= 0 but was "
+                        + labelVerticalPaddingPx);
+            }
+            if (labelVerticalPaddingPx >= labelSearchHeightPx) {
+                throw new IllegalArgumentException("labelVerticalPaddingPx (" + labelVerticalPaddingPx
+                        + ") must be < labelSearchHeightPx (" + labelSearchHeightPx + ")");
+            }
+            this.labelVerticalPaddingPx = labelVerticalPaddingPx;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 为负 */
+        public Builder labelMaxDistanceFromBoxPx(int labelMaxDistanceFromBoxPx) {
+            if (labelMaxDistanceFromBoxPx < 0) {
+                throw new IllegalArgumentException("labelMaxDistanceFromBoxPx must be >= 0 but was "
+                        + labelMaxDistanceFromBoxPx);
+            }
+            this.labelMaxDistanceFromBoxPx = labelMaxDistanceFromBoxPx;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 不为正 */
+        public Builder minLabelCandidateWidth(int minLabelCandidateWidth) {
+            if (minLabelCandidateWidth <= 0) {
+                throw new IllegalArgumentException("minLabelCandidateWidth must be > 0 but was "
+                        + minLabelCandidateWidth);
+            }
+            this.minLabelCandidateWidth = minLabelCandidateWidth;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 不为正 */
+        public Builder minLabelCandidateHeight(int minLabelCandidateHeight) {
+            if (minLabelCandidateHeight <= 0) {
+                throw new IllegalArgumentException("minLabelCandidateHeight must be > 0 but was "
+                        + minLabelCandidateHeight);
+            }
+            this.minLabelCandidateHeight = minLabelCandidateHeight;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 小于 1 */
+        public Builder maxLabelCandidateCount(int maxLabelCandidateCount) {
+            if (maxLabelCandidateCount < 1) {
+                throw new IllegalArgumentException("maxLabelCandidateCount must be >= 1 but was "
+                        + maxLabelCandidateCount);
+            }
+            this.maxLabelCandidateCount = maxLabelCandidateCount;
+            return this;
+        }
+
         /**
          * @throws IllegalArgumentException 任一视觉阈值非法（这里复用
          *         {@link BlueColorThresholds#of} 的校验，保证「配置里能过」等价于
@@ -789,6 +1005,12 @@ public final class TargetSelectionConfig {
             // 若先设 max 后设 min，单次调用时无法发现矛盾，必须在这里兜住。
             requireSizeLimitsConsistent(maxBoxWidth, minBoxWidth, "maxBoxWidth", "minBoxWidth");
             requireSizeLimitsConsistent(maxBoxHeight, minBoxHeight, "maxBoxHeight", "minBoxHeight");
+            // 同上：setter 是按调用顺序逐个校验的，先设 searchHeight 再设 verticalPadding
+            // 也必须在 build() 处被认定为一对矛盾（否则搜索带会"压进框里比向上还深"）。
+            if (labelVerticalPaddingPx >= labelSearchHeightPx) {
+                throw new IllegalArgumentException("labelVerticalPaddingPx (" + labelVerticalPaddingPx
+                        + ") must be < labelSearchHeightPx (" + labelSearchHeightPx + ")");
+            }
             return new TargetSelectionConfig(this);
         }
 

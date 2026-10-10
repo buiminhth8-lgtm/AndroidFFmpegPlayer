@@ -56,10 +56,19 @@ dependencies {
 // 两者共用同一个属性名的话，用 Slice 5 的目录去跑全量测试会让 Slice 4 的 smoke test
 // 撞上它不认识的 expect 值（HIT_BOX / MISS / NO_BOX）而报错 —— 那是配置问题，
 // 不是真实缺陷，不该以失败的形式冒出来。
+//
+// Slice 7（标签区域）同样独立（labelSampleDir/labelSampleReport）。它的目录参数支持
+// 逗号分隔的多个目录，因为样本分两族（合成 + 真实帧），一次跑完才有完整的验收面：
+//   ./gradlew :targetselection:testDebugUnitTest --tests '*LabelSampleSmokeTest*' \
+//       -Dtargetselection.labelSampleDir=artifacts/target_label_samples,artifacts/target_label_real_samples
 tasks.withType(Test).configureEach {
     systemProperty 'targetselection.sampleDir', System.getProperty('targetselection.sampleDir', '')
     systemProperty 'targetselection.sampleReport', System.getProperty('targetselection.sampleReport', '')
     systemProperty 'targetselection.boxSampleDir', System.getProperty('targetselection.boxSampleDir', '')
     systemProperty 'targetselection.boxSampleReport',
             System.getProperty('targetselection.boxSampleReport', '')
+    systemProperty 'targetselection.labelSampleDir',
+            System.getProperty('targetselection.labelSampleDir', '')
+    systemProperty 'targetselection.labelSampleReport',
+            System.getProperty('targetselection.labelSampleReport', '')
 }

@@ -549,9 +549,314 @@ emit_selection_sample nested_boxes_prefer_the_smaller 385 320 HIT_BOX "330,270,4
 drawbox=x=330:y=270:w=110:h=100:color=$BLUE:t=4"
 
 echo
+echo "=============================================================================="
+echo "Slice 7（已选中目标框 → 它是哪一个 id:xxxx 标签区域）样本"
+echo "=============================================================================="
+#
+# 与 Slice 5/6 的区别：那两批期望的是「命中了哪个框」，本段期望的是
+# 「选中框的编号区域在哪」。于是每个样本多记两个字段：
+#
+#   labelLeft/labelTop/labelRight/labelBottom —— 期望被 ROI **包住**的编号外接盒
+#        （"外边界"语义，与 TargetBoundingBox 一致）
+#   labelMinWidth / labelMaxWidth / labelMaxHeight —— ROI 尺寸的上下界
+#        上界用来证明"缩小到了编号那一小块，而不是整块大区域"，
+#        下界用来证明"没有把编号截断"（真实推流端同一个编号内部也有约 10px 的字形空隙，
+#        只接住后半截就会在这里露馅）。
+#
+# 编号图案有两种，用途不同：
+#   fake_id(...)  ：用若干个 8x10 的空心小方块拼出"编号"，外接盒可以用算术**精确**写出来，
+#                   于是"ROI 必须包住它"这条断言才有确定的期望值（不依赖字体渲染）。
+#   drawtext      ：真实字体渲染的 id:1963，负责"字形/镂空/字距"的真实形态，
+#                   但它的小数级外接盒依赖字体，所以只断言尺寸上下界。
+#
+# 本段下半部分还有一批**真实帧**样本：直接解码自真实采集视频、不再合成叠加层。
+# 必须有它们，因为本 Slice 最关键的结论全都来自真实帧的实测：同一个编号内部有约 10px
+# 的字形空隙、两个相邻目标的编号之间也是约 10px、框顶边的抗锯齿残段会被压缩切成几段
+# —— 这些用合成叠加层复现不出来。
+LABEL_OUT_DIR="${LABEL_OUT_DIR:-artifacts/target_label_samples}"
+mkdir -p "$LABEL_OUT_DIR"
+rm -f "$LABEL_OUT_DIR"/*.rgba "$LABEL_OUT_DIR"/*.txt
+
+# fake_id <x> <y> <glyphCount> [glyphWidth] [glyphHeight] [gap]
+#   设置两个全局量：FAKE_FILTER（可拼进 -vf 的 drawbox 串）与 FAKE_BBOX（"l,t,r,b"）。
+fake_id() {
+  local x="$1" y="$2" count="$3" gw="${4:-8}" gh="${5:-10}" gap="${6:-2}"
+  FAKE_FILTER=""
+  local i=0 cx
+  while [ "$i" -lt "$count" ]; do
+    cx=$((x + i * (gw + gap)))
+    [ -n "$FAKE_FILTER" ] && FAKE_FILTER="$FAKE_FILTER,"
+    FAKE_FILTER="${FAKE_FILTER}drawbox=x=${cx}:y=${y}:w=${gw}:h=${gh}:color=${BLUE}:t=1"
+    i=$((i + 1))
+  done
+  FAKE_BBOX="${x},${y},$((x + count * gw + (count - 1) * gap)),$((y + gh))"
+}
+
+# emit_label_sample <name> <touchX> <touchY> <expect> <box> <label>
+#                   <minWidth> <maxWidth> <maxHeight> <note> <filter...>
+#   expect : LABEL_FOUND / NO_LABEL
+#   box    : "left,top,right,bottom"（期望被选中的框）或 "-"
+#   label  : "left,top,right,bottom"（期望 ROI 包住的编号盒）或 "-"
+#   min/max: 数字或 "-"（"-" 表示该项不校验）
+emit_label_sample() {
+  local name="$1" touch_x="$2" touch_y="$3" expect="$4" box="$5" label="$6"
+  local min_w="$7" max_w="$8" max_h="$9" note="${10}"
+  shift 10
+  local filters="$*"
+
+  render_overlay "$name" "$LABEL_OUT_DIR" "$filters"
+
+  local meta="$LABEL_OUT_DIR/$name.txt"
+  cat > "$meta" <<EOF
+# 由 tools/roi_blue_mask/build_samples.sh 生成（Slice 7），请勿手工编辑
+source=$BASE_VIDEO
+sourceTimeSeconds=$BASE_TIME
+codec=hevc
+crf=$CRF
+base=desaturated
+width=$WIDTH
+height=$HEIGHT
+touchX=$touch_x
+touchY=$touch_y
+expect=$expect
+note=$note
+EOF
+  opt_meta "$meta" labelMinWidth "$min_w"
+  opt_meta "$meta" labelMaxWidth "$max_w"
+  opt_meta "$meta" labelMaxHeight "$max_h"
+  if [ "$box" != "-" ]; then
+    IFS=',' read -r bx1 by1 bx2 by2 <<< "$box"
+    {
+      echo "boxLeft=$bx1"
+      echo "boxTop=$by1"
+      echo "boxRight=$bx2"
+      echo "boxBottom=$by2"
+    } >> "$meta"
+  fi
+  if [ "$label" != "-" ]; then
+    IFS=',' read -r lx1 ly1 lx2 ly2 <<< "$label"
+    {
+      echo "labelLeft=$lx1"
+      echo "labelTop=$ly1"
+      echo "labelRight=$lx2"
+      echo "labelBottom=$ly2"
+    } >> "$meta"
+  fi
+
+  printf '  %-40s touch=(%s,%s) expect=%-11s box=%-18s label=%-18s %s\n' \
+    "$name" "$touch_x" "$touch_y" "$expect" "$box" "$label" "$note"
+}
+
+echo "生成样本（合成）:"
+
+# 1) 【需求里的验收样本】人物框 + id:1963 紧贴框顶。
+#    编号左端与框左边界对齐（真实推流端就是这么排的），编号底边离框顶 2px。
+fake_id 200 148 7
+emit_label_sample id_1963_person_box 350 280 LABEL_FOUND "200,160,500,400" "$FAKE_BBOX" \
+  40 90 24 "id:1963 人物框，编号紧贴框顶" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 2) 车辆框：编号右侧溢出框右边界 8px（仍在左右各 16px 的搜索余量内）
+fake_id 900 408 7
+emit_label_sample vehicle_box_label_overhanging_right 800 520 LABEL_FOUND "640,420,960,620" \
+  "$FAKE_BBOX" 40 90 24 "车辆框，编号右端溢出框右边界" \
+  "drawbox=x=640:y=420:w=320:h=200:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 3) 多目标相邻 + 隔壁目标的编号落进我的搜索区：点左框必须取**左框自己**的编号。
+#    隔壁编号离本框左边界只有 2px（在左侧 16px 余量内，确实进了搜索区），
+#    但整体低了 20px（底边落在框顶下方 18px）→ 会被"离框顶太远"这一条挡掉。
+#    若把两个编号并成一块，ROI 宽度会是 138px，超过 maxWidth=90 直接失败。
+fake_id 130 168 7
+ID2_FILTER="$FAKE_FILTER"
+fake_id 200 148 7
+emit_label_sample multi_target_pick_the_clicked_boxes_label 350 280 LABEL_FOUND "200,160,500,400" \
+  "$FAKE_BBOX" 40 90 24 "多目标：隔壁编号进了搜索区，仍必须取被点中那框的编号" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4,$ID2_FILTER,$FAKE_FILTER"
+
+# 4) 目标靠顶部：搜索带被画面顶边夹住（本该是 -36），编号仍必须找到
+fake_id 200 2 7
+emit_label_sample box_near_the_top_edge 350 130 LABEL_FOUND "200,12,500,252" "$FAKE_BBOX" \
+  40 90 24 "目标靠顶部，搜索带被画面顶边夹住" \
+  "drawbox=x=200:y=12:w=300:h=240:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 5) 目标靠左边缘：编号左端与框左边界对齐，搜索区左界被夹到 0
+fake_id 4 148 7
+emit_label_sample box_near_the_left_edge 150 280 LABEL_FOUND "4,160,304,400" "$FAKE_BBOX" \
+  40 90 24 "目标贴左边缘，搜索区左界被夹到 0" \
+  "drawbox=x=4:y=160:w=300:h=240:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 6) 目标靠右边缘：搜索区右界被夹到画面宽度
+fake_id 1100 148 7
+emit_label_sample box_near_the_right_edge 1120 280 LABEL_FOUND "976,160,1276,400" "$FAKE_BBOX" \
+  40 90 24 "目标贴右边缘，搜索区右界被夹到画面宽" \
+  "drawbox=x=976:y=160:w=300:h=240:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 7) 小目标（90x70）：框小但编号宽度不变 —— 编号宽度与框宽并没有固定比例
+fake_id 600 288 4
+emit_label_sample small_target_with_label 645 335 LABEL_FOUND "600,300,690,370" "$FAKE_BBOX" \
+  24 60 24 "小目标（90x70）上的编号" \
+  "drawbox=x=600:y=300:w=90:h=70:color=$BLUE:t=4,$FAKE_FILTER"
+
+# 8) 蓝框上边线断掉 40px：只要矩形已经恢复成功，编号照样要能找到
+#    （断裂本身由 Slice 5 的样本负责，这里验的是"框边线碎掉之后不再冒充文字"）
+fake_id 200 148 7
+emit_label_sample broken_box_edge_with_label 350 280 LABEL_FOUND "200,160,500,400" "$FAKE_BBOX" \
+  40 90 24 "蓝框上边线断 40px，框已恢复，编号仍要找到" \
+  "drawbox=x=200:y=160:w=150:h=4:color=$BLUE:t=fill,\
+drawbox=x=390:y=160:w=110:h=4:color=$BLUE:t=fill,\
+drawbox=x=200:y=160:w=4:h=240:color=$BLUE:t=fill,\
+drawbox=x=496:y=160:w=4:h=240:color=$BLUE:t=fill,\
+drawbox=x=200:y=396:w=300:h=4:color=$BLUE:t=fill,$FAKE_FILTER"
+
+# 9) 只有框、框顶上方没有任何编号 → NO_LABEL（不是 MISS：目标已经选中了，只是没编号）
+emit_label_sample box_without_label_reports_no_label 350 280 NO_LABEL "200,160,500,400" - \
+  - - - "只有框没有编号：必须 NO_LABEL（不是没打中）" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4"
+
+# 10) 同一框上方两行文字：必须选离框顶更近的那一行
+fake_id 200 120 7
+FAR_FILTER="$FAKE_FILTER"
+fake_id 200 148 7
+emit_label_sample two_text_rows_prefer_the_nearer 350 280 LABEL_FOUND "200,160,500,400" "$FAKE_BBOX" \
+  40 90 24 "框上方两行文字，必须选更靠近框顶的那行" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4,$FAR_FILTER,$FAKE_FILTER"
+
+# 11) 真实字体渲染的 id:1963（字形/镂空/字距的真实形态）。外接盒依赖字体，
+#     所以只断言尺寸上下界：宽度必须小于框宽的一半（绝不能变成整块大区域）。
+emit_label_sample id_1963_real_font 350 280 LABEL_FOUND "200,160,500,400" - \
+  - 110 34 "真实字体渲染的 id:1963（只断言尺寸上界）" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4,\
+drawtext=fontfile='$FONT_ESC':text='id\\:1963':x=200:y=142:fontsize=34:fontcolor=$BLUE"
+
+# 12) 真实推流端那种**宽字形间隙**：把 id 与 :1963 分成两次 drawtext，中间留 14px。
+#     只接住后半截就会小于 labelMinWidth（真实帧实测字形间隙约 10px）。
+emit_label_sample wide_glyph_gap_keeps_the_whole_label 350 280 LABEL_FOUND "200,160,500,400" - \
+  55 140 34 "宽字形间隙必须仍是同一个编号" \
+  "drawbox=x=200:y=160:w=300:h=240:color=$BLUE:t=4,\
+drawtext=fontfile='$FONT_ESC':text='id':x=200:y=142:fontsize=34:fontcolor=$BLUE,\
+drawtext=fontfile='$FONT_ESC':text='\\:1963':x=232:y=142:fontsize=34:fontcolor=$BLUE"
+
+# ------------------------------------------------------------------ 真实帧样本
+#
+# 直接从真实采集视频解码，**不再合成任何叠加层** —— 输入就是推流端渲染 + HEVC 压缩
+# 之后的真实像素。编号坐标是同一套蓝色判据在生成时量出来的（外边界语义）。
+#
+# 坐标的来历（1080p）：
+#   t=20  框[260,674,504,826]  编号 id:1850 [262,664,318,674]（宽 56，与框顶零间隙）
+#   t=45  框[998,698,1068,757] 编号 id:1975 [1002,688,1060,698]（框只有 70x58）
+#         同一帧里隔壁目标的编号 id:1980 结束于 x=991，离本编号左端只有 10px
+#   t=30  框[658,808,922,1007] 编号 id:xxxx [666,798,718,808]
+#   t=45  框[1528,752,1664,811] 编号 [1530,738,1590,752]
+# 最后一条（real_box_without_its_label）把真实帧从 y=300 起裁出来，故意丢掉编号行；
+# 框顶边线与两条竖边线都还在搜索带里 —— 必须在**真实压缩像素**上如实报 NO_LABEL。
+LABEL_REAL_OUT_DIR="${LABEL_REAL_OUT_DIR:-artifacts/target_label_real_samples}"
+LABEL_VIDEO="${LABEL_VIDEO:-}"
+if [ -z "$LABEL_VIDEO" ]; then
+  echo
+  echo "跳过真实帧标签样本：未指定 LABEL_VIDEO=<真实采集视频>"
+  echo "（本 Slice 最关键的结论都出自真实帧，建议指定后重跑）"
+else
+  if [ ! -f "$LABEL_VIDEO" ]; then
+    echo "找不到 LABEL_VIDEO：$LABEL_VIDEO" >&2
+    exit 1
+  fi
+  REAL_SIZE=$("$FFPROBE" -v error -select_streams v:0 \
+    -show_entries stream=width,height -of csv=p=0:s=x "$LABEL_VIDEO" | head -1)
+  REAL_W="${REAL_SIZE%x*}"
+  REAL_H="${REAL_SIZE#*x}"
+  mkdir -p "$LABEL_REAL_OUT_DIR"
+  rm -f "$LABEL_REAL_OUT_DIR"/*.rgba "$LABEL_REAL_OUT_DIR"/*.txt
+  echo
+  echo "生成样本（真实帧 ${REAL_W}x${REAL_H}，源：$LABEL_VIDEO）:"
+
+  # emit_real_label_sample <name> <time> <cropTop> <touchX> <touchY> <expect>
+  #                        <box> <label> <maxWidth> <note>
+  #   cropTop : 裁掉画面上方多少像素（0 = 不裁），用来构造"编号已经不在画面里"的真实样本
+  emit_real_label_sample() {
+    local name="$1" stamp="$2" crop_top="$3" touch_x="$4" touch_y="$5" expect="$6"
+    local box="$7" label="$8" max_w="$9" note="${10}"
+
+    local frame_w="$REAL_W" frame_h="$REAL_H"
+    local crop=()
+    if [ "$crop_top" != "0" ]; then
+      frame_h=$((REAL_H - crop_top))
+      crop=(-vf "crop=${frame_w}:${frame_h}:0:${crop_top}")
+    fi
+
+    "$FFMPEG" -v error -y -ss "$stamp" -i "$LABEL_VIDEO" -frames:v 1 "${crop[@]}" \
+      -f rawvideo -pix_fmt rgba "$LABEL_REAL_OUT_DIR/$name.rgba"
+
+    local meta="$LABEL_REAL_OUT_DIR/$name.txt"
+    cat > "$meta" <<EOF
+# 由 tools/roi_blue_mask/build_samples.sh 生成（Slice 7，真实帧），请勿手工编辑
+source=$LABEL_VIDEO
+sourceTimeSeconds=$stamp
+codec=source
+base=original
+width=$frame_w
+height=$frame_h
+cropTop=$crop_top
+touchX=$touch_x
+touchY=$touch_y
+expect=$expect
+note=$note
+EOF
+    opt_meta "$meta" labelMaxWidth "$max_w"
+    if [ "$box" != "-" ]; then
+      IFS=',' read -r bx1 by1 bx2 by2 <<< "$box"
+      {
+        echo "boxLeft=$bx1"
+        echo "boxTop=$by1"
+        echo "boxRight=$bx2"
+        echo "boxBottom=$by2"
+      } >> "$meta"
+    fi
+    if [ "$label" != "-" ]; then
+      IFS=',' read -r lx1 ly1 lx2 ly2 <<< "$label"
+      {
+        echo "labelLeft=$lx1"
+        echo "labelTop=$ly1"
+        echo "labelRight=$lx2"
+        echo "labelBottom=$ly2"
+      } >> "$meta"
+    fi
+
+    printf '  %-38s t=%-4s crop=%-4s touch=(%s,%s) expect=%-11s label=%-18s %s\n' \
+      "$name" "$stamp" "$crop_top" "$touch_x" "$touch_y" "$expect" "$label" "$note"
+  }
+
+  # R1 单个目标 + 编号紧贴框顶（id:1850）—— 最标准的一条
+  emit_real_label_sample real_single_box_with_label 20 0 380 750 LABEL_FOUND \
+    "260,674,504,826" "262,664,318,674" 70 "id:1850 人物框：编号宽 56、与框顶零间隙"
+
+  # R2 多目标相邻 + 隔壁编号只隔 10px（框只有 70x58，是真正的"小目标"）
+  #    maxWidth=64：一旦把隔壁编号并进来，宽度会到 76 以上
+  emit_real_label_sample real_small_box_beside_a_neighbour 45 0 1030 730 LABEL_FOUND \
+    "998,698,1068,757" "1002,688,1060,698" 64 "小目标（70x58），隔壁编号只隔 10px，不许并进来"
+
+  # R3 大框 + 编号（框宽 264，编号宽 52）—— 编号宽度与框宽没有固定比例
+  emit_real_label_sample real_wide_box_with_label 30 0 790 900 LABEL_FOUND \
+    "658,808,922,1007" "666,798,718,808" 66 "大框（264 宽）上的编号，宽仅 52"
+
+  # R4 同一帧里另一个目标（编号右侧 27px 处还有别的文字）
+  emit_real_label_sample real_second_target_label 45 0 1560 780 LABEL_FOUND \
+    "1528,752,1664,811" "1530,738,1590,752" 76 "同帧第二个目标：编号右侧还有别的文字"
+
+  # R5 真实帧去掉编号行（裁掉 y<674，框顶边线正好落在裁剪后的第一行）
+  #    → 同一个真实框必须报 NO_LABEL。裁剪是"去掉画面内容"，不是"改像素"：
+  #    框顶边线与两条竖边线都还在搜索带里，必须在真实压缩像素上如实报"没有编号"。
+  emit_real_label_sample real_box_without_its_label 20 674 380 80 NO_LABEL \
+    "260,0,504,152" - - "真实帧裁掉编号行后：框边线还在搜索带里，必须如实报 NO_LABEL"
+fi
+
+echo
 echo "完成：$(ls -1 "$OUT_DIR"/*.rgba | wc -l) 个 Slice 4 样本 → $OUT_DIR"
 echo "      $(ls -1 "$BOX_OUT_DIR"/*.rgba | wc -l) 个 Slice 5 样本 → $BOX_OUT_DIR"
 echo "      $(ls -1 "$SELECT_OUT_DIR"/*.rgba | wc -l) 个 Slice 6 样本 → $SELECT_OUT_DIR"
+echo "      $(ls -1 "$LABEL_OUT_DIR"/*.rgba | wc -l) 个 Slice 7 合成样本 → $LABEL_OUT_DIR"
+if [ -n "$LABEL_VIDEO" ]; then
+  echo "      $(ls -1 "$LABEL_REAL_OUT_DIR"/*.rgba | wc -l) 个 Slice 7 真实帧样本 → $LABEL_REAL_OUT_DIR"
+fi
 echo "跑验证："
 echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*BlueMaskSampleSmokeTest*' \\"
 echo "      -Dtargetselection.sampleDir=$OUT_DIR \\"
@@ -562,4 +867,8 @@ echo "      -Dtargetselection.boxSampleReport=$BOX_OUT_DIR/report.txt"
 echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*TargetBoxSampleSmokeTest*' \\"
 echo "      -Dtargetselection.boxSampleDir=$SELECT_OUT_DIR \\"
 echo "      -Dtargetselection.boxSampleReport=$SELECT_OUT_DIR/report.txt"
+echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*LabelSampleSmokeTest*' \\"
+echo "      -Dtargetselection.labelSampleDir=$LABEL_OUT_DIR \\"
+echo "      -Dtargetselection.labelSampleReport=$LABEL_OUT_DIR/report.txt"
+echo "  LABEL_VIDEO=<真实采集视频> tools/roi_blue_mask/build_samples.sh   # 另跑一次就生成真实帧样本"
 

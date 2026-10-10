@@ -35,6 +35,8 @@ import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.geometry.VideoScaleType;
 import com.example.motro.targetselection.vision.BlueMaskAnalyzer;
 import com.example.motro.targetselection.vision.BlueMaskResult;
+import com.example.motro.targetselection.vision.LabelExtractionResult;
+import com.example.motro.targetselection.vision.LabelRegionExtractor;
 import com.example.motro.targetselection.vision.TargetBoxAnalyzer;
 import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TouchRoiRequest;
@@ -82,6 +84,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 并显示候选数、HIT/MISS、每框的 conf/comp/edges 与 detect/hit/total 三步耗时。
  * 之所以复用同一份掩码（{@code TargetBoxAnalyzer.analyze(BlueMaskResult, x, y)}）
  * 而不是重跑一遍：像素回读与 HSV 遍历没必要为调试付两遍。</p>
+ *
+ * <p>Slice 7 增加：命中之后在<b>同一帧、同一份几何</b>上再跑一次
+ * {@link LabelRegionExtractor}，把选中的框顶部附近的 {@code id:xxxx} 区域找出来并裁好，
+ * 结果并进 {@link TargetDebugState}。叠加层因此能画出标签搜索带（点划浅蓝）、
+ * 全部标签候选（细实线橙）与选中的标签 ROI（粗实线白），并显示状态、候选数、
+ * 距离/对齐/文本形态得分与 search/crop 分步耗时。
+ * 仍然不识别文字内容（那是后续 Slice 的事）：本探针只回答"编号那一小块找到没有、在哪"。</p>
  */
 public final class FrameCaptureProbeActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -111,6 +120,13 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
      * 与 {@link #blueMaskAnalyzer} 共用同一份配置，保证"探针看到的"与"单测/正式路径算的"一致。
      */
     private final TargetBoxAnalyzer targetBoxAnalyzer = new TargetBoxAnalyzer(
+            TargetSelectionConfig.defaults().toBuilder().debugMaskEnabled(true).build());
+
+    /**
+     * 标签区域提取（播放器无关，Slice 7）。同样是<b>同一份配置</b> ——
+     * 搜索结果带尺寸与裁剪下限都由它决定，探针不再制造第二套参数。
+     */
+    private final LabelRegionExtractor labelRegionExtractor = new LabelRegionExtractor(
             TargetSelectionConfig.defaults().toBuilder().debugMaskEnabled(true).build());
 
     private SurfaceView surfaceView;
@@ -333,11 +349,24 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
                             targetBoxAnalyzer.analyze(mask, mapping.videoX, mapping.videoY);
                     Log.i(TAG, "boxes " + detection.debugString());
 
-                    final TargetDebugState updated = TargetDebugState
+                    // Slice 7：有选中的框才谈得上"找它的编号"。
+                    // 用同一个 frame 与同一份 geometry —— 换一份几何会让搜索带落在别的坐标系上。
+                    // 注意 NO_LABEL 不是 MISS：框依然命中，只是编号区域没找到（上层报 HIT_ID_UNKNOWN）。
+                    final LabelExtractionResult label = detection.selectedBox == null
+                            ? null
+                            : labelRegionExtractor.extract(frame, geometry, detection.selectedBox.rectInVideo);
+                    if (label != null) {
+                        Log.i(TAG, "labelRegion " + label.debugString());
+                    }
+
+                    final TargetDebugState.Builder builder = TargetDebugState
                             .builder(mapping, eventTimeNs)
                             .blueMask(mask)
-                            .boxDetection(detection)
-                            .build();
+                            .boxDetection(detection);
+                    if (label != null) {
+                        builder.labelExtraction(label);
+                    }
+                    final TargetDebugState updated = builder.build();
                     mainHandler.post(() -> {
                         final TargetDebugOverlayView current = overlay;
                         if (current != null) {

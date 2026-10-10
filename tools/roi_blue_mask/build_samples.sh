@@ -187,8 +187,151 @@ emit_sample "$COLOR" real_frame_blue_region 600 100 HAS_BLUE "$CRF" \
   "null"
 
 echo
-echo "完成：$(ls -1 "$OUT_DIR"/*.rgba | wc -l) 个样本 → $OUT_DIR"
+echo "=============================================================================="
+echo "Slice 5（矩形恢复 + 触摸命中）样本"
+echo "=============================================================================="
+#
+# 与 Slice 4 样本的区别：这里期望的不再是"ROI 里有没有蓝"，而是
+# 「这次点击命中了哪个框」。于是每个样本额外记下**目标框的视频坐标**，
+# 让 smoke test 能把恢复出的 rectInVideo 与它逐边比对 ——
+# 只看 HIT/MISS 两个字母是验不出"框的位置对不对"的，而位置错了比漏检更危险。
+#
+# 几何约定（重要）：drawbox 的边框画在 w×h 区域内侧，所以
+#   drawbox=x=X:y=Y:w=W:h=H:t=4
+# 的最外层蓝像素落在 [X, X+W-1] × [Y, Y+H-1]，而检测器返回的 rectInVideo
+# 用"外边界"语义（left/top = 第一条蓝线，right/bottom = 最后一条蓝线 + 1），
+# 因此样本里记的 boxRight 应当写 X+W、boxBottom 写 Y+H。
+#
+# expect 取三种值：
+#   HIT_BOX  点击落在目标框内 → 必须命中，且选中框要与 boxLeft..boxBottom 吻合
+#   MISS     找到了候选框，但点击点不在里面（含容差）→ 必须不命中
+#   NO_BOX   ROI 里压根没有框 → 必须不命中，且结果为 NO_BOX
+#
+BOX_OUT_DIR="${BOX_OUT_DIR:-artifacts/target_box_samples}"
+mkdir -p "$BOX_OUT_DIR"
+rm -f "$BOX_OUT_DIR"/*.rgba "$BOX_OUT_DIR"/*.txt
+
+# emit_box_sample <name> <touchX> <touchY> <expect> <box> <clipped> <note> <filter...>
+#   box     : "left,top,right,bottom"（视频像素）或 "-"（本样本没有目标框）
+#   clipped : yes/no —— 目标框是否被 ROI 边界截断（截断时只有部分边可信）
+emit_box_sample() {
+  local name="$1" touch_x="$2" touch_y="$3" expect="$4" box="$5" clipped="$6" note="$7"
+  shift 7
+  local filters="$*"
+
+  "$FFMPEG" -v error -y -f rawvideo -pix_fmt rgba -s "${WIDTH}x${HEIGHT}" -i "$GRAY" \
+    -vf "$filters" -frames:v 1 -f rawvideo -pix_fmt rgba "$TMP/$name.comp.rgba"
+
+  "$FFMPEG" -v error -y -f rawvideo -pix_fmt rgba -s "${WIDTH}x${HEIGHT}" -i "$TMP/$name.comp.rgba" \
+    -frames:v 1 -c:v libx265 -crf "$CRF" -pix_fmt yuv420p \
+    -x265-params "log-level=error" "$TMP/$name.mp4"
+
+  "$FFMPEG" -v error -y -i "$TMP/$name.mp4" -frames:v 1 \
+    -f rawvideo -pix_fmt rgba "$BOX_OUT_DIR/$name.rgba"
+
+  cat > "$BOX_OUT_DIR/$name.txt" <<EOF
+# 由 tools/roi_blue_mask/build_samples.sh 生成（Slice 5），请勿手工编辑
+source=$BASE_VIDEO
+sourceTimeSeconds=$BASE_TIME
+codec=hevc
+crf=$CRF
+base=desaturated
+width=$WIDTH
+height=$HEIGHT
+touchX=$touch_x
+touchY=$touch_y
+expect=$expect
+clipped=$clipped
+note=$note
+EOF
+  if [ "$box" != "-" ]; then
+    IFS=',' read -r bx1 by1 bx2 by2 <<< "$box"
+    {
+      echo "boxLeft=$bx1"
+      echo "boxTop=$by1"
+      echo "boxRight=$bx2"
+      echo "boxBottom=$by2"
+    } >> "$BOX_OUT_DIR/$name.txt"
+  fi
+
+  printf '  %-26s touch=(%s,%s) expect=%-8s box=%-18s %s\n' \
+    "$name" "$touch_x" "$touch_y" "$expect" "$box" "$note"
+}
+
+echo "生成样本 :"
+
+# 尺寸约束（重要，别随手把框画大）：
+#   ROI 是 2*roiRadius（默认 400x400）。要恢复一个矩形，ROI 里必须同时看到**对边**
+#   —— 两条水平边（定上下）或两条垂直边（定左右）。因此目标框在至少一个方向上
+#   必须小于 ROI；比 ROI 还大的框，点击其内部时 ROI 里根本看不到成对的边，
+#   几何上就是不可恢复的（这不是实现的缺陷，是"只看 ROI"这一约定的固有边界）。
+#   所以这里的目标框都取真实目标量级：几十到三百像素。
+#   由此也得出点击点的放置规则：点击 x 落在 [boxRight-roiRadius, boxLeft+roiRadius]
+#   内，且 y 落在 [boxBottom-roiRadius, boxTop+roiRadius] 内，才能同时框住两条对边。
+#   下面每个点击点都按这条规则挑过（默认 roiRadius=200）。
+
+# 1) 人物蓝框（300x240），点击框内 → HIT_BOX
+emit_box_sample person_box_hit 270 160 HIT_BOX "120,40,420,280" no "蓝色人物框，点击框内" \
+  "drawbox=x=120:y=40:w=300:h=240:color=$BLUE:t=4"
+
+# 2) 车辆蓝框（320x200，不同长宽比），点击框内 → HIT_BOX
+emit_box_sample vehicle_box_hit 800 560 HIT_BOX "640,460,960,660" no "蓝色车辆框，点击框内" \
+  "drawbox=x=640:y=460:w=320:h=200:color=$BLUE:t=4"
+
+# 3) 点击落在画面另一侧，ROI 完全不含任何框 → NO_BOX（不是"有框但没点中"）
+emit_box_sample far_from_box_no_box 1200 120 NO_BOX "-" no "点击处 ROI 内没有框，应报 NO_BOX" \
+  "drawbox=x=120:y=40:w=300:h=240:color=$BLUE:t=4"
+
+# 4) 点击落在小框外侧 70px：ROI 能把整个框包进来（候选找得到），但点不在框内 → MISS
+emit_box_sample outside_box_edge_miss 720 335 MISS "560,300,650,370" no \
+  "点在框右侧外面 70px：候选能找到，但必须判 MISS" \
+  "drawbox=x=560:y=300:w=90:h=70:color=$BLUE:t=4"
+
+# 5) 多框同屏：点击落在下面那个框内，选中框必须是它（而不是上面那个或合并框）
+emit_box_sample multi_box_hit 910 490 HIT_BOX "760,380,1060,600" no "多框同屏，点击下面那个框" \
+  "drawbox=x=120:y=40:w=260:h=200:color=$BLUE:t=4,\
+drawbox=x=760:y=380:w=300:h=220:color=$BLUE:t=4"
+
+# 6) 小目标：90x70 的框，刚过最小尺寸门槛，点击框中心
+emit_box_sample small_box_hit 605 335 HIT_BOX "560,300,650,370" no "小目标（90x70），点击框中心" \
+  "drawbox=x=560:y=300:w=90:h=70:color=$BLUE:t=4"
+
+# 7) 部分断裂的框：上边线中间整段缺失 40px（模拟 HEVC 把一条边吃掉）。
+#    用 5 条独立线段拼出来 —— 缺口远大于任何去噪/连通性修补能力，几何必须靠"并集跨度"保住。
+emit_box_sample broken_edge_box_hit 270 160 HIT_BOX "120,40,420,280" no \
+  "上边线中间断掉 40px，几何仍须恢复出整框" \
+  "drawbox=x=120:y=40:w=140:h=4:color=$BLUE:t=fill,\
+drawbox=x=300:y=40:w=120:h=4:color=$BLUE:t=fill,\
+drawbox=x=120:y=276:w=300:h=4:color=$BLUE:t=fill,\
+drawbox=x=120:y=40:w=4:h=240:color=$BLUE:t=fill,\
+drawbox=x=416:y=40:w=4:h=240:color=$BLUE:t=fill"
+
+# 8) 目标框被 ROI 边界截断：右框线在 ROI 之外（ROI 右界 = touchX+roiRadius = 1220），
+#    几何只能给到 ROI 边界，因此必须如实标记 clippedByRoi。
+emit_box_sample roi_edge_box_hit 1020 330 HIT_BOX "980,200,1260,460" yes \
+  "框跨出 ROI 右边界：左/上/下边可信，右边被夹取到 ROI 界" \
+  "drawbox=x=980:y=200:w=280:h=260:color=$BLUE:t=4"
+
+# 9) 只有 id:1963 蓝字（无框）：字高约 34px < 最小框高 40px，绝不能单独成框
+emit_box_sample id_text_only_no_box 610 267 NO_BOX "-" no \
+  "只有 id 蓝字，字高不足最小框高，不得误判为框" \
+  "drawtext=fontfile='$FONT_ESC':text='id\\:1963':x=520:y=250:fontsize=34:fontcolor=$BLUE"
+
+# 10) id:1963 蓝字 + 它下方的蓝框：点击框内必须命中那个框（不要求识别出 1963）。
+#     文字落在同一个 ROI 里，正是"文字不能把框带偏"的压力场景。
+emit_box_sample id_1963_with_box_hit 270 160 HIT_BOX "120,40,420,280" no \
+  "示例 id:1963 与其蓝框，点击框内返回该框候选" \
+  "drawbox=x=120:y=40:w=300:h=240:color=$BLUE:t=4,\
+drawtext=fontfile='$FONT_ESC':text='id\\:1963':x=140:y=290:fontsize=30:fontcolor=$BLUE"
+
+echo
+echo "完成：$(ls -1 "$OUT_DIR"/*.rgba | wc -l) 个 Slice 4 样本 → $OUT_DIR"
+echo "      $(ls -1 "$BOX_OUT_DIR"/*.rgba | wc -l) 个 Slice 5 样本 → $BOX_OUT_DIR"
 echo "跑验证："
 echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*BlueMaskSampleSmokeTest*' \\"
 echo "      -Dtargetselection.sampleDir=$OUT_DIR \\"
 echo "      -Dtargetselection.sampleReport=$OUT_DIR/report.txt"
+echo "  ./gradlew :targetselection:testDebugUnitTest --tests '*TargetBoxSampleSmokeTest*' \\"
+echo "      -Dtargetselection.boxSampleDir=$BOX_OUT_DIR \\"
+echo "      -Dtargetselection.boxSampleReport=$BOX_OUT_DIR/report.txt"
+

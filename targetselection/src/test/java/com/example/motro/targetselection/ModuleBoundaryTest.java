@@ -392,6 +392,65 @@ public class ModuleBoundaryTest {
         }
     }
 
+    /**
+     * Slice 5 的矩形恢复阈值也必须全部来自 {@code TargetSelectionConfig}。
+     *
+     * <p>矩形检测比蓝色阈值更难调：边线厚度、最小框高、边覆盖率这几个量互相牵制
+     * （放宽覆盖率就会把"两条平行线"放进来，压紧又会漏掉 HEVC 断边）。一旦它们散落成
+     * 算法里的字面量，现场调参就退化成"改代码 → 重编 → 重跑真机"。</p>
+     */
+    @Test
+    public void targetBoxThresholdsAreOwnedByTheConfigObject() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String detector = read(new File(visionDir, "TargetBoxDetector.java"));
+
+        for (String knob : new String[]{
+                "minBoxWidth", "minBoxHeight", "maxBoxWidth", "maxBoxHeight",
+                "maxBoxAspectRatio", "minEdgeCoverage", "minPresentEdges",
+                "maxEdgeThicknessPx", "minEdgeSolidity", "minBoxConfidence",
+                "maxCandidateCount"}) {
+            assertTrue("TargetBoxDetector 必须从配置读取 " + knob, detector.contains("config." + knob));
+        }
+
+        String hitTester = read(new File(visionDir, "TargetHitTester.java"));
+        assertTrue("TargetHitTester 必须从配置读取 touchTolerancePx",
+                hitTester.contains("config.touchTolerancePx"));
+    }
+
+    /**
+     * ROI 局部坐标 → 视频坐标的换算只允许有一条通道：{@code RoiRect.toVideoRect}。
+     *
+     * <p>这是 Slice 5 最隐蔽的一处坑。帧被 {@code maxFrameLongSidePx} 缩小后，ROI 的局部像素
+     * 与视频像素之间差的是一个<b>缩放</b>，不是单纯的 {@code +left/+top} 偏移；两者在 1:1 时
+     * 恰好退化成一回事，所以「漏掉缩放」在默认配置下能跑对，只在帧被缩小时静默判错 ——
+     * 不崩、不报错，只是点到框上判 MISS。把公式钉在唯一一处，这种错误就无处可藏。</p>
+     *
+     * <p>判据刻意只看「公式本体」与「检测器是否绕开它自建视频矩形」，不限制
+     * {@code * scaleX} 这种<b>尺寸</b>缩放 —— 检测器按视频尺度做最小尺寸过滤时会用到它，
+     * 那是另一件事（缩放边长 vs 换算坐标原点），不构成第二份坐标公式。</p>
+     */
+    @Test
+    public void roiLocalToVideoConversionHasASingleChannel() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+
+        List<String> holders = new ArrayList<>();
+        for (File source : javaSourcesIn(visionDir.toString())) {
+            if (read(source).contains("roiRectInVideo.left +")) {
+                holders.add(source.getName());
+            }
+        }
+        assertEquals("ROI 局部→视频的换算公式只应出现在 RoiRect，实际：" + holders,
+                Collections.singletonList("RoiRect.java"), holders);
+
+        String detector = read(new File(visionDir, "TargetBoxDetector.java"));
+        assertTrue("TargetBoxDetector 必须经 RoiRect.toVideoRect(...) 落到视频坐标",
+                detector.contains(".toVideoRect("));
+        assertFalse("TargetBoxDetector 不得自建视频矩形 —— 那等于把带缩放的换算公式抄了第二份",
+                detector.contains("TargetBoundingBox.of("));
+    }
+
     // ---------------------------------------------------------------- utils
 
     private static void assertNoDependency(String deps, String needle) {

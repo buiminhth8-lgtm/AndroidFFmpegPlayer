@@ -45,6 +45,100 @@ public class TargetSelectionConfigAndRequestTest {
                 config.minSaturation, config.minValue);
     }
 
+    /**
+     * Slice 5 的矩形恢复默认值同样要有确定取值 —— 它们决定"什么算一个目标框"。
+     *
+     * <p>这里额外钉住两条真实样本推出来的<b>取舍</b>，而不是把常量抄一遍：</p>
+     * <ul>
+     *   <li>{@code minBoxConfidence} 必须严格大于「两条平行线」的置信度 0.25
+     *       （2 边达标 → 0.5 覆盖率 × 2/4），否则窗棂、文字下划线会稳定误检；</li>
+     *   <li>{@code maxEdgeThicknessPx} 必须远小于常见蓝框边长，才能把"实心蓝色物体"
+     *       与"蓝色细框"分开。</li>
+     * </ul>
+     */
+    @Test
+    public void targetBoxDefaultsAreTunedAndExplicit() {
+        TargetSelectionConfig config = TargetSelectionConfig.defaults();
+
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_WIDTH, config.minBoxWidth);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_HEIGHT, config.minBoxHeight);
+        assertEquals(TargetSelectionConfig.NO_BOX_SIZE_LIMIT, config.maxBoxWidth);
+        assertEquals(TargetSelectionConfig.NO_BOX_SIZE_LIMIT, config.maxBoxHeight);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_BOX_ASPECT_RATIO, config.maxBoxAspectRatio, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_EDGE_COVERAGE, config.minEdgeCoverage, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_PRESENT_EDGES, config.minPresentEdges);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_EDGE_THICKNESS_PX, config.maxEdgeThicknessPx);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_EDGE_SOLIDITY, config.minEdgeSolidity, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_CONFIDENCE, config.minBoxConfidence, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_TOUCH_TOLERANCE_PX, config.touchTolerancePx);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_CANDIDATE_COUNT, config.maxCandidateCount);
+
+        assertTrue("两条平行线的置信度是 0.5×(2/4)=0.25，门槛必须高于它，否则稳定误检",
+                config.minBoxConfidence > 0.25f);
+        assertTrue("边线厚度上限必须远小于蓝框边长，才能区分'蓝色细框'与'蓝色实心物体'",
+                config.maxEdgeThicknessPx < config.minBoxWidth);
+        assertTrue("候选上限必须 >= 1，否则异常掩码会造出大量候选拖垮点击路径",
+                config.maxCandidateCount >= 1);
+    }
+
+    /** Slice 5 的矩形恢复阈值非法必须在 <b>build()</b> 处失败。 */
+    @Test
+    public void invalidTargetBoxValuesAreRejectedAtBuildTime() {
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxWidth(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxWidth(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxHeight(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxHeight(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxWidth(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxHeight(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxAspectRatio(0.5f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxAspectRatio(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeCoverage(0f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeCoverage(1.01f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeCoverage(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minPresentEdges(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minPresentEdges(5));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxEdgeThicknessPx(0));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxEdgeThicknessPx(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeSolidity(0f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeSolidity(1.01f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minEdgeSolidity(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxConfidence(-0.1f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxConfidence(1.5f));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().minBoxConfidence(Float.NaN));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().touchTolerancePx(-1));
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxCandidateCount(0));
+    }
+
+    /**
+     * 上/下限矛盾必须在 {@code build()} 兜住，而<b>不是</b>只在 setter 里查。
+     *
+     * <p>setter 是按调用顺序逐个校验的：先设 max=120 再设 min=200 时，两次调用各自都看不出矛盾，
+     * 只有 build 时把两者放在一起才发现。若少了 build 这一步，配置对象就会带着
+     * "min &gt; max" 进入检测器，结果是任何框都过不了尺寸过滤 —— 表现为"永远 MISS"，
+     * 现场极难归因。</p>
+     */
+    @Test
+    public void boxSizeLimitsAreCrossCheckedAtBuildTime() {
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxWidth(30).build());
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder().maxBoxHeight(30).build());
+        // 顺序反过来：先设合法 max，再把 min 抬到它之上
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder()
+                .maxBoxWidth(120).minBoxWidth(200).build());
+        assertRejected(() -> TargetSelectionConfig.defaults().toBuilder()
+                .maxBoxHeight(120).minBoxHeight(200).build());
+    }
+
+    /** 最大尺寸的「不限」哨兵必须被接受，而且不与下限矛盾。 */
+    @Test
+    public void boxSizeLimitsAcceptTheUnlimitedSentinel() {
+        TargetSelectionConfig config = TargetSelectionConfig.defaults().toBuilder()
+                .maxBoxWidth(TargetSelectionConfig.NO_BOX_SIZE_LIMIT)
+                .maxBoxHeight(TargetSelectionConfig.NO_BOX_SIZE_LIMIT)
+                .build();
+        assertEquals(0, config.maxBoxWidth);
+        assertEquals(0, config.maxBoxHeight);
+    }
+
     @Test
     public void toBuilderProducesIndependentCopy() {
         TargetSelectionConfig original = TargetSelectionConfig.defaults();
@@ -64,6 +158,18 @@ public class TargetSelectionConfigAndRequestTest {
                 .minBluePixelCount(40)
                 .maskDenoiseMinNeighbors(2)
                 .debugMaskEnabled(true)
+                .minBoxWidth(64)
+                .minBoxHeight(48)
+                .maxBoxWidth(1200)
+                .maxBoxHeight(900)
+                .maxBoxAspectRatio(4f)
+                .minEdgeCoverage(0.7f)
+                .minPresentEdges(3)
+                .maxEdgeThicknessPx(10)
+                .minEdgeSolidity(0.65f)
+                .minBoxConfidence(0.55f)
+                .touchTolerancePx(24)
+                .maxCandidateCount(8)
                 .build();
 
         assertNotSame(original, changed);
@@ -75,6 +181,18 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(TargetSelectionConfig.DEFAULT_ROI_RADIUS, original.roiRadiusX);
         assertEquals(BlueColorThresholds.DEFAULT_HUE_MIN_DEGREES, original.blueHueMinDegrees, 0.0001f);
         assertFalse(original.debugMaskEnabled);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_WIDTH, original.minBoxWidth);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_HEIGHT, original.minBoxHeight);
+        assertEquals(TargetSelectionConfig.NO_BOX_SIZE_LIMIT, original.maxBoxWidth);
+        assertEquals(TargetSelectionConfig.NO_BOX_SIZE_LIMIT, original.maxBoxHeight);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_BOX_ASPECT_RATIO, original.maxBoxAspectRatio, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_EDGE_COVERAGE, original.minEdgeCoverage, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_PRESENT_EDGES, original.minPresentEdges);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_EDGE_THICKNESS_PX, original.maxEdgeThicknessPx);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_EDGE_SOLIDITY, original.minEdgeSolidity, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_MIN_BOX_CONFIDENCE, original.minBoxConfidence, 0.0001f);
+        assertEquals(TargetSelectionConfig.DEFAULT_TOUCH_TOLERANCE_PX, original.touchTolerancePx);
+        assertEquals(TargetSelectionConfig.DEFAULT_MAX_CANDIDATE_COUNT, original.maxCandidateCount);
 
         assertFalse(changed.enabled);
         assertEquals(1200L, changed.captureTimeoutMs);
@@ -91,6 +209,18 @@ public class TargetSelectionConfigAndRequestTest {
         assertEquals(40, changed.minBluePixelCount);
         assertEquals(2, changed.maskDenoiseMinNeighbors);
         assertTrue(changed.debugMaskEnabled);
+        assertEquals(64, changed.minBoxWidth);
+        assertEquals(48, changed.minBoxHeight);
+        assertEquals(1200, changed.maxBoxWidth);
+        assertEquals(900, changed.maxBoxHeight);
+        assertEquals(4f, changed.maxBoxAspectRatio, 0.0001f);
+        assertEquals(0.7f, changed.minEdgeCoverage, 0.0001f);
+        assertEquals(3, changed.minPresentEdges);
+        assertEquals(10, changed.maxEdgeThicknessPx);
+        assertEquals(0.65f, changed.minEdgeSolidity, 0.0001f);
+        assertEquals(0.55f, changed.minBoxConfidence, 0.0001f);
+        assertEquals(24, changed.touchTolerancePx);
+        assertEquals(8, changed.maxCandidateCount);
     }
 
     @Test

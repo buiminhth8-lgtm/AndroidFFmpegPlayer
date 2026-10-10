@@ -19,3 +19,6 @@ __pycache__/
 # 现场生成，体积大且含采集素材内容，不入版本库（脚本本身要提交）
 /artifacts/roi_blue_mask_samples/
 /artifacts/roi_blue_mask_probe/
+# Slice 5（矩形恢复 + 点击命中）的样本：同样由 build_samples.sh 现场生成（真实解码帧 +
+# HEVC 往返），体积大且含采集素材内容，不入版本库
+/artifacts/target_box_samples/

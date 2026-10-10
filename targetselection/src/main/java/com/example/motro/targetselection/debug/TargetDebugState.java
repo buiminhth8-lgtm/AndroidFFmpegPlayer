@@ -8,6 +8,9 @@ import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.geometry.VideoScaleType;
 import com.example.motro.targetselection.vision.BlueMaskResult;
 import com.example.motro.targetselection.vision.BlueMaskStatus;
+import com.example.motro.targetselection.vision.DetectedTargetBox;
+import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
+import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -86,28 +89,60 @@ public final class TargetDebugState {
      */
     public final float bluePixelRatio;
 
-    // ---------------------------------------------------------------- 预留字段（后续 Slice 产生）
+    // ---------------------------------------------------------------- 矩形恢复与命中（Slice 5）
 
-    /** 预留：识别出的候选框（视频坐标）。矩形恢复之前恒为空列表。 */
-    public final List<TargetBoundingBox> detectedBoxes;
+    /**
+     * 矩形恢复产生的候选框（视频坐标），按置信度降序，与
+     * {@link TargetBoxDetectionResult#candidates} 同序。
+     *
+     * <p>这里放的是 {@link DetectedTargetBox} 而不是裸的 {@link TargetBoundingBox}：
+     * 叠加层的价值一半在"框画在哪"，另一半在"为什么这个框被选中"——
+     * 每框的 {@code confidence} 与 {@code completeness} 正是后者的依据，
+     * 拆成两个平行列表（矩形一份、评分一份）迟早会出现一份忘了更新的情况。</p>
+     *
+     * <p>未做矩形恢复时为空列表（叠加层不画任何候选框）。</p>
+     */
+    public final List<DetectedTargetBox> detectedBoxes;
 
-    /** 预留：最终选中的框（视频坐标）。本 Slice 恒为 null。 */
+    /**
+     * 矩形恢复的状态；未做矩形恢复时为 null。
+     * <p>它把"没有框"（{@link TargetBoxDetectionStatus#NO_BOX}）与"输入有问题"
+     * （{@code INVALID_MASK} / {@code INVALID_INPUT}）区分开 —— 叠加层据此显示
+     * "为什么一个框都没有"，而不是空着让人猜。</p>
+     */
+    public final TargetBoxDetectionStatus boxStatus;
+
+    /**
+     * 矩形恢复给出的候选总数。与 {@link #detectedBoxes} 的尺寸未必相等：
+     * 检测器有候选数上限，超限时会截断，而这里保留的是<b>检测器自报</b>的数值，
+     * 便于叠加层显示"检测到 16 个，只画了 5 个"这类信息。
+     */
+    public final int candidateCount;
+
+    /** 最终选中的框（视频坐标）；本次点击未命中任何候选时为 null。 */
     public final TargetBoundingBox selectedBox;
 
     /** 预留：标签识别区域（视频坐标）。本 Slice 恒为 null。 */
     public final TargetBoundingBox labelRoi;
 
-    /** 预留：目标 id。本 Slice 恒为 null。 */
+    /** 预留：目标 id。本 Slice 恒为 null（矩形恢复不识别 id，见 Slice 6）。 */
     public final String targetId;
 
-    /** 预留：置信度 [0,1]。本 Slice 恒为 0。 */
+    /** 选中框的置信度 [0,1]；未命中时为 0。 */
     public final float confidence;
 
     /**
-     * 本次点击的处理耗时（毫秒）。视觉阶段由 {@link #withBlueMask(BlueMaskResult)} 填入
-     * （ROI 裁剪 + 颜色分析的总耗时）；未做视觉分析时为 0。
+     * 本次点击的处理耗时（毫秒）。视觉阶段由 {@link #withBlueMask(BlueMaskResult)} 填入，
+     * 矩形恢复阶段由 {@link #withBoxDetection(TargetBoxDetectionResult)} 覆盖为
+     * {@code totalMs}（含掩码 + 检测 + 命中三步）；未做任何视觉分析时为 0。
      */
     public final long processingMs;
+
+    /** 矩形恢复耗时（毫秒）；未做矩形恢复时为 0。 */
+    public final long detectMs;
+
+    /** 触摸命中判定耗时（毫秒）；未做矩形恢复时为 0。 */
+    public final long hitTestMs;
 
     private TargetDebugState(Builder builder) {
         this.mapping = builder.mapping;
@@ -117,11 +152,15 @@ public final class TargetDebugState {
         this.bluePixelCount = builder.bluePixelCount;
         this.bluePixelRatio = builder.bluePixelRatio;
         this.detectedBoxes = Collections.unmodifiableList(new ArrayList<>(builder.detectedBoxes));
+        this.boxStatus = builder.boxStatus;
+        this.candidateCount = builder.candidateCount;
         this.selectedBox = builder.selectedBox;
         this.labelRoi = builder.labelRoi;
         this.targetId = builder.targetId;
         this.confidence = builder.confidence;
         this.processingMs = builder.processingMs;
+        this.detectMs = builder.detectMs;
+        this.hitTestMs = builder.hitTestMs;
 
         // 回投影：只有真的拿到了视频坐标才谈得上正推
         final float[] projected = projectBack(mapping);
@@ -174,11 +213,14 @@ public final class TargetDebugState {
                 .bluePixelCount(bluePixelCount)
                 .bluePixelRatio(bluePixelRatio)
                 .detectedBoxes(detectedBoxes)
+                .boxStatus(boxStatus)
+                .candidateCount(candidateCount)
                 .selectedBox(selectedBox)
                 .labelRoi(labelRoi)
                 .targetId(targetId)
                 .confidence(confidence)
-                .processingMs(processingMs);
+                .processingMs(processingMs)
+                .timings(detectMs, hitTestMs);
     }
 
     /**
@@ -199,6 +241,28 @@ public final class TargetDebugState {
      */
     public TargetDebugState withBlueMask(BlueMaskResult result) {
         return toBuilder().blueMask(result).build();
+    }
+
+    /**
+     * 复制并挂上一次矩形恢复 + 命中判定的结果 —— Slice 5 的标准接法。
+     *
+     * <p>把 {@link TargetBoxDetectionResult} 里叠加层需要的几项翻成可视化字段：候选框列表
+     * （含每框 confidence/completeness）、状态、候选计数、选中的框、命中耗时明细。
+     * <b>掩码本体不进本对象</b>（叠加层不逐像素画掩码）。</p>
+     *
+     * <p>{@link #processingMs} 会被覆盖成结果里的 {@code totalMs}（掩码 + 检测 + 命中），
+     * 而不是停留在 {@link #withBlueMask(BlueMaskResult)} 那一步的掩码耗时 ——
+     * 调试时看的是"这次点击总共花了多久"，分步耗时另由 {@link #detectMs}/{@link #hitTestMs} 给出。</p>
+     *
+     * <p>失败结果同样接受：{@code boxStatus} 会如实带上 {@code NO_BOX} 或 {@code INVALID_MASK}，
+     * 于是叠加层能显示"为什么没有框"。</p>
+     *
+     * @param result 检测结果，非 null
+     * @return 新的状态对象（本对象不变）
+     * @throws IllegalArgumentException result 为 null，或结果自带的耗时/计数为负
+     */
+    public TargetDebugState withBoxDetection(TargetBoxDetectionResult result) {
+        return toBuilder().boxDetection(result).build();
     }
 
 
@@ -314,6 +378,31 @@ public final class TargetDebugState {
         return bluePixelRatio != NO_RATIO;
     }
 
+    /** 是否做过矩形恢复（即 {@link #boxStatus} 有值，无论成功还是失败）。 */
+    public boolean hasBoxDetection() {
+        return boxStatus != null;
+    }
+
+    /** 是否有可绘制的候选框。 */
+    public boolean hasDetectedBoxes() {
+        return !detectedBoxes.isEmpty();
+    }
+
+    /** 本次点击是否命中了一个候选框（叠加层据此把选中框画成高亮样式）。 */
+    public boolean isHit() {
+        return selectedBox != null;
+    }
+
+    /** 矩形恢复的状态；未做矩形恢复时为 null。 */
+    public TargetBoxDetectionStatus boxStatus() {
+        return boxStatus;
+    }
+
+    /** 候选框总数（检测器自报值）；未做矩形恢复时为 0。 */
+    public int candidateCount() {
+        return candidateCount;
+    }
+
     /** 蓝色掩码分析的状态；未做视觉分析时为 null。 */
     public BlueMaskStatus roiStatus() {
         return roiStatus;
@@ -336,8 +425,11 @@ public final class TargetDebugState {
      * rotation=0 mirror=false,false scale=FIT_CENTER mappedVideo=640.0,360.0
      * mappedView=960.0,540.0 roundTripErrPx=0.0 inside=true eventTimeNs=...
      * roi=SUCCESS rect=[...] blue=1832 ratio=0.01145 ms=3
+     * boxes=SUCCESS candidates=2 selected=[...] confidence=1.0 detectMs=1 hitTestMs=0 totalMs=4
      * </pre>
-     * <p>未做视觉分析时最后一段整体不出现，保持与 Slice 3 完全一致的输出（旧日志仍然可比）。</p>
+     * <p>未做视觉分析时最后一段整体不出现，保持与 Slice 3 完全一致的输出（旧日志仍然可比）。
+     * 做了矩形恢复时，掩码段的 {@code ms=} 会被省略 —— 那时 {@link #processingMs} 已经是
+     * 覆盖掩码 + 检测 + 命中的总耗时，同一数值在两段里各印一次只会让人误读成分步耗时。</p>
      */
     public String debugString() {
         final StringBuilder b = new StringBuilder(256);
@@ -349,8 +441,20 @@ public final class TargetDebugState {
             b.append(" roi=").append(roiStatus)
                     .append(" rect=").append(searchRoi)
                     .append(" blue=").append(bluePixelCount)
-                    .append(" ratio=").append(hasBlueRatio() ? bluePixelRatio : "n/a")
-                    .append(" ms=").append(processingMs);
+                    .append(" ratio=").append(hasBlueRatio() ? bluePixelRatio : "n/a");
+            if (!hasBoxDetection()) {
+                b.append(" ms=").append(processingMs);
+            }
+        }
+        if (hasBoxDetection()) {
+            b.append(" boxes=").append(boxStatus)
+                    .append(" candidates=").append(candidateCount)
+                    .append(" shown=").append(detectedBoxes.size())
+                    .append(" selected=").append(selectedBox)
+                    .append(" confidence=").append(confidence)
+                    .append(" detectMs=").append(detectMs)
+                    .append(" hitTestMs=").append(hitTestMs)
+                    .append(" totalMs=").append(processingMs);
         }
         return b.toString();
     }
@@ -387,12 +491,16 @@ public final class TargetDebugState {
         private BlueMaskStatus roiStatus;
         private int bluePixelCount;
         private float bluePixelRatio = NO_RATIO;
-        private List<TargetBoundingBox> detectedBoxes = Collections.emptyList();
+        private List<DetectedTargetBox> detectedBoxes = Collections.emptyList();
+        private TargetBoxDetectionStatus boxStatus;
+        private int candidateCount;
         private TargetBoundingBox selectedBox;
         private TargetBoundingBox labelRoi;
         private String targetId;
         private float confidence;
         private long processingMs;
+        private long detectMs;
+        private long hitTestMs;
 
         private Builder(VideoPointMappingResult mapping, long eventTimeNs) {
             if (mapping == null) {
@@ -459,13 +567,13 @@ public final class TargetDebugState {
             return this;
         }
 
-        /** 预留：候选框列表；null 视为空列表。元素不得为 null。 */
-        public Builder detectedBoxes(List<TargetBoundingBox> detectedBoxes) {
+        /** 候选框列表；null 视为空列表。元素不得为 null。 */
+        public Builder detectedBoxes(List<DetectedTargetBox> detectedBoxes) {
             if (detectedBoxes == null) {
                 this.detectedBoxes = Collections.emptyList();
                 return this;
             }
-            for (TargetBoundingBox box : detectedBoxes) {
+            for (DetectedTargetBox box : detectedBoxes) {
                 if (box == null) {
                     throw new IllegalArgumentException("detectedBoxes must not contain null elements");
                 }
@@ -474,7 +582,60 @@ public final class TargetDebugState {
             return this;
         }
 
-        /** 预留：选中的框。 */
+        /** 矩形恢复状态；null 表示本次没做矩形恢复。 */
+        public Builder boxStatus(TargetBoxDetectionStatus boxStatus) {
+            this.boxStatus = boxStatus;
+            return this;
+        }
+
+        /** 候选框总数（检测器自报值）。@throws IllegalArgumentException 为负 */
+        public Builder candidateCount(int candidateCount) {
+            if (candidateCount < 0) {
+                throw new IllegalArgumentException("candidateCount must be >= 0 but was " + candidateCount);
+            }
+            this.candidateCount = candidateCount;
+            return this;
+        }
+
+        /**
+         * 一次性把 {@link TargetBoxDetectionResult} 的可视信息并进来：候选框、状态、计数、
+         * 选中框、置信度、耗时明细（见 {@link TargetDebugState#withBoxDetection(TargetBoxDetectionResult)}）。
+         *
+         * <p>选中框取 {@link DetectedTargetBox#rectInVideo} —— 叠加层要画的是视频坐标矩形，
+         * 而 {@link TargetDebugState#selectedBox} 的既有语义就是视频坐标，
+         * 这里不做转换、只做取值，避免再引入一处坐标搬运。</p>
+         *
+         * @throws IllegalArgumentException result 为 null
+         */
+        public Builder boxDetection(TargetBoxDetectionResult result) {
+            if (result == null) {
+                throw new IllegalArgumentException("result must not be null");
+            }
+            final DetectedTargetBox selected = result.selectedBox;
+            return detectedBoxes(result.candidates)
+                    .boxStatus(result.status)
+                    .candidateCount(result.candidateCount)
+                    .selectedBox(selected == null ? null : selected.rectInVideo)
+                    .confidence(selected == null ? 0f : selected.confidence)
+                    // processingMs 覆盖为总耗时：调试看的是"这次点击一共花了多久"
+                    .processingMs(result.totalMs)
+                    .timings(result.detectMs, result.hitTestMs);
+        }
+
+        /** 分步耗时。@throws IllegalArgumentException 任一为负 */
+        public Builder timings(long detectMs, long hitTestMs) {
+            if (detectMs < 0L) {
+                throw new IllegalArgumentException("detectMs must be >= 0 but was " + detectMs);
+            }
+            if (hitTestMs < 0L) {
+                throw new IllegalArgumentException("hitTestMs must be >= 0 but was " + hitTestMs);
+            }
+            this.detectMs = detectMs;
+            this.hitTestMs = hitTestMs;
+            return this;
+        }
+
+        /** 选中的框（视频坐标）。 */
         public Builder selectedBox(TargetBoundingBox selectedBox) {
             this.selectedBox = selectedBox;
             return this;

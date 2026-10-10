@@ -2,6 +2,7 @@ package com.example.motro.targetselection.debug;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
@@ -11,6 +12,7 @@ import com.example.motro.targetselection.geometry.TargetBoundingBox;
 import com.example.motro.targetselection.geometry.VideoCoordinateMapper;
 import com.example.motro.targetselection.geometry.VideoGeometry;
 import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
+import com.example.motro.targetselection.vision.DetectedTargetBox;
 
 import java.util.List;
 
@@ -22,6 +24,14 @@ import java.util.List;
  * 不在每帧重绘。Slice 4 起它多画两样东西 —— <b>检索 ROI 矩形</b>（紫色描边，
  * 表示"这次点击后真正被分析过的区域"）与<b>视觉阶段的状态/蓝像素占比/耗时</b>文本
  * （ROI 或掩码数据缺失时这两项自动不画，因此旧场景的观感与 Slice 3 完全一致）。</p>
+ *
+ * <p>Slice 5 再加上<b>矩形恢复的候选框</b>与<b>选中的框</b>，两者用不同样式区分：
+ * 候选是<b>虚线黄</b>、选中的框是<b>粗实线洋红</b>。刻意不只靠颜色区分 ——
+ * 虚线/实线在截图转灰度或色觉障碍下依然可辨。文本块同时给出候选计数、
+ * 命中状态（HIT/MISS）、选中框坐标与置信度，以及前几个候选的
+ * {@code conf}/{@code comp}/{@code edges} 评分，用来回答"为什么选中的是这个"。
+ * <b>这些框只反映已经算好的结果，本类不参与任何命中计算</b> —— 否则调试图与正式判定
+ * 会变成两套逻辑，而调试图的价值恰恰是"帮我判断正式算法对不对"。</p>
  *
  * <p><b>叠加方式（由 app 层决定，本类不关心父容器）</b>：</p>
  * <pre>
@@ -60,7 +70,13 @@ public class TargetDebugOverlayView extends View {
     private static final int COLOR_TOUCH_OUTSIDE = 0xFFFFC107;
     private static final int COLOR_TOUCH_INVALID = 0xFFFF3D00;
     private static final int COLOR_MAPPED_POINT = 0xFFFF4081;
-    private static final int COLOR_RESERVED_BOX = 0xFFFFFF00;
+    /**
+     * 普通候选框：虚线 + 黄色。虚线是刻意的 —— 它把"候选"与"选中"在<b>形状</b>上就分开，
+     * 于是截图转成灰度、或在色觉障碍下看，依然能一眼区分两者，不必只靠颜色。
+     */
+    private static final int COLOR_CANDIDATE_BOX = 0xFFFFFF00;
+    /** 选中的框：实线 + 更粗 + 洋红。它是"本次点击实际命中的那个框"，必须最醒目。 */
+    private static final int COLOR_SELECTED_BOX = 0xFFFF1744;
     private static final int COLOR_ROI_RECT = 0xFF7C4DFF;
     private static final int COLOR_TEXT = 0xFFF5F5F5;
     private static final int COLOR_TEXT_BG = 0xB3000000;
@@ -68,6 +84,10 @@ public class TargetDebugOverlayView extends View {
     /** 以下尺寸均以 dp 为单位，构造时按屏幕密度换算成像素。 */
     private static final float DP_CONTENT_STROKE = 2f;
     private static final float DP_ROI_STROKE = 3f;
+    private static final float DP_CANDIDATE_STROKE = 2f;
+    private static final float DP_SELECTED_STROKE = 4f;
+    private static final float DP_CANDIDATE_DASH_ON = 6f;
+    private static final float DP_CANDIDATE_DASH_OFF = 4f;
     private static final float DP_TOUCH_RADIUS = 9f;
     private static final float DP_TOUCH_CROSS_ARM = 16f;
     private static final float DP_MAPPED_RADIUS = 6f;
@@ -77,12 +97,19 @@ public class TargetDebugOverlayView extends View {
     private static final float DP_TEXT_MARGIN = 10f;
     private static final float DP_TEXT_PADDING = 8f;
 
+    /**
+     * 文本块里最多逐条列出的候选数。候选上限由配置控制（几十量级），
+     * 全量列出会把文本块撑到占满屏幕，反而挡住真正要看的框与触摸点。
+     */
+    private static final int MAX_CANDIDATE_LINES = 4;
+
     private final Paint rectPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint touchFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint touchStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mappedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint linkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint boxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint candidatePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint selectedPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint roiPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textBgPaint = new Paint();
@@ -142,9 +169,18 @@ public class TargetDebugOverlayView extends View {
         linkPaint.setStrokeWidth(DP_LINK_STROKE * density);
         linkPaint.setColor(COLOR_MAPPED_POINT);
 
-        boxPaint.setStyle(Paint.Style.STROKE);
-        boxPaint.setStrokeWidth(strokePx);
-        boxPaint.setColor(COLOR_RESERVED_BOX);
+        // 候选框：虚线（形状区分）+ 黄色；选中的框：实线 + 更粗 + 洋红。
+        // 两者用不同 Paint 而非同一支改色 —— 描边宽度与虚线效果都属于 Paint 状态，
+        // 每帧来回改会和硬件加速层对 Paint 的缓存打架，也让"哪种样式代表什么"变得隐晦。
+        candidatePaint.setStyle(Paint.Style.STROKE);
+        candidatePaint.setStrokeWidth(DP_CANDIDATE_STROKE * density);
+        candidatePaint.setColor(COLOR_CANDIDATE_BOX);
+        candidatePaint.setPathEffect(new DashPathEffect(
+                new float[]{DP_CANDIDATE_DASH_ON * density, DP_CANDIDATE_DASH_OFF * density}, 0f));
+
+        selectedPaint.setStyle(Paint.Style.STROKE);
+        selectedPaint.setStrokeWidth(DP_SELECTED_STROKE * density);
+        selectedPaint.setColor(COLOR_SELECTED_BOX);
 
         // ROI 用独立颜色与更粗的描边：它是「本次真正分析过的区域」，
         // 和「后续阶段才会填上的候选框」不是一回事，不该混成同一个视觉编码。
@@ -260,8 +296,9 @@ public class TargetDebugOverlayView extends View {
         //    本框代表「点击后真正被分析过的那块区域」，是 Slice 4 最直接的调试证据。
         drawVideoBox(canvas, current.mapping.geometry, current.searchRoi, roiPaint);
 
-        // 3) 后续阶段才会填上的候选框（本 Slice 恒为空，直接返回）
-        drawReservedBoxes(canvas, current);
+        // 3) 矩形恢复的候选框 + 选中的框（视频坐标 → 经 mapper 正推回 View 再画）。
+        //    候选虚线黄、选中实线洋红；同样不参与任何命中计算，只反映已经算好的结果。
+        drawTargetBoxes(canvas, current);
 
         // 4) 原始触摸点：状态色 + 十字
         final int touchColor = colorForStatus(current.status());
@@ -296,25 +333,23 @@ public class TargetDebugOverlayView extends View {
     }
 
     /**
-     * 预留路径：把识别阶段的框（视频坐标）正推回 View 再画。
-     * 本 Slice 不会被触发（{@link TargetDebugState} 里这些字段恒为 null/空），
-     * 但绘制入口先备好，后续 Slice 填上数据即可复用，不必再改本类结构。
+     * 画矩形恢复的结果：所有候选框（虚线黄）+ 选中的框（实线洋红）。
      *
-     * <p>注意 {@code searchRoi} 不在这里 —— 它从 Slice 4 起就是<b>真实</b>数据，
-     * 由 {@link #onDraw(Canvas)} 用独立的 {@link #roiPaint} 画，视觉上与"候选框"区分开。</p>
+     * <p><b>本方法只读取</b> {@link TargetDebugState} 里已经算好的结果，不做任何命中判定 ——
+     * 判定是 {@code TargetHitTester} 的职责。若让叠加层自己再判一次"点在不在框里"，
+     * 就会出现两套逻辑；而调试图的全部价值恰恰是"帮我判断正式算法对不对"，
+     * 逻辑一分为二，这个价值就没了。</p>
+     *
+     * <p>选中框在候选之后绘制（更靠上层）：它通常也在候选列表里，于是会被画两遍 ——
+     * 这正是想要的效果，虚线黄打底、粗实线洋红覆盖，"这个候选被选中了"一眼可辨。</p>
      */
-    private void drawReservedBoxes(Canvas canvas, TargetDebugState current) {
-        final List<TargetBoundingBox> boxes = current.detectedBoxes;
-        if (boxes.isEmpty()
-                && current.selectedBox == null
-                && current.labelRoi == null) {
-            return;
-        }
+    private void drawTargetBoxes(Canvas canvas, TargetDebugState current) {
+        final List<DetectedTargetBox> boxes = current.detectedBoxes;
         for (int i = 0; i < boxes.size(); i++) {
-            drawVideoBox(canvas, current.mapping.geometry, boxes.get(i), boxPaint);
+            drawVideoBox(canvas, current.mapping.geometry, boxes.get(i).rectInVideo, candidatePaint);
         }
-        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, boxPaint);
-        drawVideoBox(canvas, current.mapping.geometry, current.selectedBox, boxPaint);
+        drawVideoBox(canvas, current.mapping.geometry, current.labelRoi, candidatePaint);
+        drawVideoBox(canvas, current.mapping.geometry, current.selectedBox, selectedPaint);
     }
 
     /** 把一个视频坐标下的矩形画到 View 上：四个角各自经 mapper 正推（旋转/镜像因此自动正确）。 */
@@ -407,7 +442,56 @@ public class TargetDebugOverlayView extends View {
             } else {
                 b.append("  blue=-");
             }
-            b.append("  ms=").append(current.processingMs);
+            // 做矩形恢复时不再印 ms：那时 processingMs 已是"掩码+检测+命中"的总耗时，
+            // 在掩码段再印一次会被误读成掩码单独耗时（详见 TargetDebugState#debugString）。
+            if (!current.hasBoxDetection()) {
+                b.append("  ms=").append(current.processingMs);
+            }
+        }
+
+        // Slice 5：矩形恢复 + 命中判定。同样"没做过就整段不输出"。
+        if (current.hasBoxDetection()) {
+            b.append('\n').append("boxes=").append(current.boxStatus())
+                    .append("  candidates=").append(current.candidateCount());
+            if (current.candidateCount() != current.detectedBoxes.size()) {
+                b.append(" (drawn ").append(current.detectedBoxes.size()).append(')');
+            }
+            b.append(current.isHit() ? "  HIT" : "  MISS");
+            if (current.isHit()) {
+                b.append("  sel=[");
+                appendFixed1(b, current.selectedBox.left);
+                b.append(',');
+                appendFixed1(b, current.selectedBox.top);
+                b.append(',');
+                appendFixed1(b, current.selectedBox.right);
+                b.append(',');
+                appendFixed1(b, current.selectedBox.bottom);
+                b.append(']').append(" conf=");
+                appendFixed(b, current.confidence, 2);
+            }
+            b.append("  detect=").append(current.detectMs)
+                    .append("ms hit=").append(current.hitTestMs)
+                    .append("ms total=").append(current.processingMs).append("ms");
+
+            // 逐个候选给出评分：直接回答"为什么选中的是这个而不是别的"。
+            // 只印前几行 —— 候选上限是几十，全印会把文本块撑满整个屏幕，
+            // 那反而把真正要看的框和触摸点挡住。
+            final int shown = Math.min(MAX_CANDIDATE_LINES, current.detectedBoxes.size());
+            for (int i = 0; i < shown; i++) {
+                final DetectedTargetBox box = current.detectedBoxes.get(i);
+                b.append('\n').append("  #").append(i).append(" conf=");
+                appendFixed(b, box.confidence, 2);
+                b.append(" comp=");
+                appendFixed(b, box.completeness, 2);
+                b.append(" edges=").append(box.presentEdges);
+                if (box.clippedByRoi) {
+                    b.append(" clip");
+                }
+            }
+            if (current.detectedBoxes.size() > shown) {
+                b.append('\n').append("  ... +")
+                        .append(current.detectedBoxes.size() - shown).append(" more");
+            }
         }
 
         // 量出块尺寸：逐行测量（换行符不参与宽度）

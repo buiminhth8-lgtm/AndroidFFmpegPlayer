@@ -79,6 +79,23 @@ public final class TargetBoundingBox {
         return videoX >= left && videoX <= right && videoY >= top && videoY <= bottom;
     }
 
+    /**
+     * 向外扩张 {@code margin} 像素后的新框（负值向内收缩），本对象不变。
+     *
+     * <p>用途：手指点击有抖动，而目标框可能只有几十像素高 —— 命中判定需要一个容差。
+     * 注意<b>只有判定过程该用扩张后的框</b>，返回给上层的永远是原始框，
+     * 否则下游拿到的坐标会比实际大一圈。</p>
+     *
+     * @param margin 扩张量（像素），NaN 视为不扩张
+     * @return 扩张后的新框；收缩过度时会得到退化框（{@link #isEmpty()} 为 true）
+     */
+    public TargetBoundingBox inflated(float margin) {
+        if (Float.isNaN(margin) || margin == 0f) {
+            return this;
+        }
+        return of(left - margin, top - margin, right + margin, bottom + margin);
+    }
+
     private static void requireFinite(float value, String name) {
         if (Float.isNaN(value) || Float.isInfinite(value)) {
             throw new IllegalArgumentException(name + " must be finite but was " + value);

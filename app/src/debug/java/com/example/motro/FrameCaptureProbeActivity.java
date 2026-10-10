@@ -35,6 +35,8 @@ import com.example.motro.targetselection.geometry.VideoPointMappingStatus;
 import com.example.motro.targetselection.geometry.VideoScaleType;
 import com.example.motro.targetselection.vision.BlueMaskAnalyzer;
 import com.example.motro.targetselection.vision.BlueMaskResult;
+import com.example.motro.targetselection.vision.TargetBoxAnalyzer;
+import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TouchRoiRequest;
 
 import org.json.JSONObject;
@@ -73,6 +75,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 取到的帧用完立即释放，叠加层只拿紧凑位掩码的统计量、不持有任何 Bitmap。
  * 本探针显式打开 {@code debugMaskEnabled} 以便在真机上核对 ROI 原始像素；
  * 这是调试入口的 opt-in，正式路径默认关闭。</p>
+ *
+ * <p>Slice 5 增加：同一份掩码<u>继续往下走</u>两段 ——
+ * {@code TargetBoxDetector} 恢复候选框、{@code TargetHitTester} 判定这次点击命中了哪个框，
+ * 结果并进 {@link TargetDebugState}。叠加层因此能画出候选框（虚线黄）与选中框（粗实线洋红），
+ * 并显示候选数、HIT/MISS、每框的 conf/comp/edges 与 detect/hit/total 三步耗时。
+ * 之所以复用同一份掩码（{@code TargetBoxAnalyzer.analyze(BlueMaskResult, x, y)}）
+ * 而不是重跑一遍：像素回读与 HSV 遍历没必要为调试付两遍。</p>
  */
 public final class FrameCaptureProbeActivity extends Activity implements SurfaceHolder.Callback {
 
@@ -95,6 +104,13 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
      * {@link TargetSelectionConfig}，本探针只额外打开 debug 像素保留以便真机核对。
      */
     private final BlueMaskAnalyzer blueMaskAnalyzer = new BlueMaskAnalyzer(
+            TargetSelectionConfig.defaults().toBuilder().debugMaskEnabled(true).build());
+
+    /**
+     * 矩形恢复 + 命中判定的单入口（播放器无关）。
+     * 与 {@link #blueMaskAnalyzer} 共用同一份配置，保证"探针看到的"与"单测/正式路径算的"一致。
+     */
+    private final TargetBoxAnalyzer targetBoxAnalyzer = new TargetBoxAnalyzer(
             TargetSelectionConfig.defaults().toBuilder().debugMaskEnabled(true).build());
 
     private SurfaceView surfaceView;
@@ -311,9 +327,16 @@ public final class FrameCaptureProbeActivity extends Activity implements Surface
                             + (mask.debugRoiArgb == null
                                     ? "" : " debugPixels=" + mask.debugRoiArgb.length));
 
+                    // 同一份掩码继续往下走：恢复候选框 + 判定这次点击命中了哪个框。
+                    // 传 mapping 里的视频坐标（与掩码同一次点击、同坐标系），不要用 ROI 局部坐标。
+                    final TargetBoxDetectionResult detection =
+                            targetBoxAnalyzer.analyze(mask, mapping.videoX, mapping.videoY);
+                    Log.i(TAG, "boxes " + detection.debugString());
+
                     final TargetDebugState updated = TargetDebugState
                             .builder(mapping, eventTimeNs)
                             .blueMask(mask)
+                            .boxDetection(detection)
                             .build();
                     mainHandler.post(() -> {
                         final TargetDebugOverlayView current = overlay;

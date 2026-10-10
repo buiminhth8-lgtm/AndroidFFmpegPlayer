@@ -51,7 +51,15 @@ dependencies {
 // BlueMaskSampleSmokeTest 会自动跳过（Assume）。需要时显式传入：
 //   ./gradlew :targetselection:testDebugUnitTest --tests '*BlueMaskSampleSmokeTest*' \
 //       -Dtargetselection.sampleDir=artifacts/roi_blue_mask_samples
+//
+// Slice 5 的样本用**独立**的属性名（boxSampleDir/boxSampleReport），与 Slice 4 的分开。
+// 两者共用同一个属性名的话，用 Slice 5 的目录去跑全量测试会让 Slice 4 的 smoke test
+// 撞上它不认识的 expect 值（HIT_BOX / MISS / NO_BOX）而报错 —— 那是配置问题，
+// 不是真实缺陷，不该以失败的形式冒出来。
 tasks.withType(Test).configureEach {
     systemProperty 'targetselection.sampleDir', System.getProperty('targetselection.sampleDir', '')
     systemProperty 'targetselection.sampleReport', System.getProperty('targetselection.sampleReport', '')
+    systemProperty 'targetselection.boxSampleDir', System.getProperty('targetselection.boxSampleDir', '')
+    systemProperty 'targetselection.boxSampleReport',
+            System.getProperty('targetselection.boxSampleReport', '')
 }

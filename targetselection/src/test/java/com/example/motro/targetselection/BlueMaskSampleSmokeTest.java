@@ -68,7 +68,14 @@ public class BlueMaskSampleSmokeTest {
         final File[] children = dir.listFiles();
         if (children != null) {
             for (File child : children) {
-                if (child.isFile() && child.getName().endsWith(".txt")) {
+                if (!child.isFile() || !child.getName().endsWith(".txt")) {
+                    continue;
+                }
+                // 只认"有同名 .rgba 的 .txt"才算样本描述：报告文件默认就写在这个目录里，
+                // 只按扩展名收会在"跑过一次带报告之后"把报告当成样本读进来，
+                // 报出"缺少字段 width"这种与真实缺陷无关的错。
+                final String base = child.getName().substring(0, child.getName().length() - 4);
+                if (new File(dir, base + ".rgba").isFile()) {
                     metas.add(child);
                 }
             }

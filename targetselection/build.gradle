@@ -71,4 +71,8 @@ tasks.withType(Test).configureEach {
             System.getProperty('targetselection.labelSampleDir', '')
     systemProperty 'targetselection.labelSampleReport',
             System.getProperty('targetselection.labelSampleReport', '')
+    systemProperty 'targetselection.idSampleDir',
+            System.getProperty('targetselection.idSampleDir', '')
+    systemProperty 'targetselection.idSampleReport',
+            System.getProperty('targetselection.idSampleReport', '')
 }

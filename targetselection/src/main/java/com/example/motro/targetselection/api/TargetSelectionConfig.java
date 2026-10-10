@@ -284,6 +284,50 @@ public final class TargetSelectionConfig {
      */
     public static final int DEFAULT_MAX_LABEL_CANDIDATE_COUNT = 8;
 
+    // ---------------------------------------------------------------- 编号识别（Slice 8）
+
+    /**
+     * {@link #labelUpscaleFactor} 的默认值：标签 ROI 在识别前放大 3 倍。
+     *
+     * <p>取 3 的理由：真实编号的笔画宽度只有 1~2px（1080p 实测字高 10~18px），
+     * 不放大时任何形态判据都被"一个像素的抖动"淹没；放大到 4 倍以上则
+     * 预处理耗时按平方增长，而识别率不再明显提升（最近邻放大不会创造新信息）。
+     * 3 倍是"够用且便宜"的折中。允许 1（不放大）到 4。</p>
+     */
+    public static final int DEFAULT_LABEL_UPSCALE_FACTOR = 3;
+
+    /**
+     * {@link #minIdConfidence} 的默认值：编号识别的最低<b>规则置信度</b>。
+     *
+     * <p>取 0.55 而不是 0.8，是因为它衡量的<b>不是概率</b>（见
+     * {@code TargetIdRecognitionResult#confidence} 的语义说明）：它是
+     * 「字形匹配得有多像」乘上「切出的块有多少被认成了已知字符」，
+     * 真实压缩样本实测在 0.6~0.85；而"某个字符没认出来"（记成 {@code ?}）
+     * 会把它直接拉到 0.5 以下。0.55 于是恰好切在"全都认出来了"
+     * 与"有一个字符不确定"之间 —— 不确定时上游会拿到
+     * {@code LOW_CONFIDENCE}（带 {@code rawText}），比一个可疑的编号好。</p>
+     */
+    public static final float DEFAULT_MIN_ID_CONFIDENCE = 0.55f;
+
+    /**
+     * {@link #idMinDigits} 的默认值：编号最少 1 位。
+     *
+     * <p>为什么不设成 2 或 3：编号是产品语义（{@code id:1} 也是合法目标），
+     * 压掉短编号会把合法的低位目标判成"读不出来"。真正需要挡掉的
+     * "单个数字的噪声笔画"由置信度与颜色筛选负责。</p>
+     */
+    public static final int DEFAULT_ID_MIN_DIGITS = 1;
+
+    /**
+     * {@link #idMaxDigits} 的默认值：编号最多 6 位。
+     *
+     * <p>取 6 的理由：它挡的不是"合法但很长的编号"，而是<b>把两行/两个编号连起来</b>
+     * 这种典型错误 —— 那是本层最容易发生的失误（字形空隙与字号同量级，
+     * 切分稍一放宽就会并排）。6 位（最多 999999 个目标）对任何真实产品都够用，
+     * 而连起来的两个编号通常 ≥ 8 位。</p>
+     */
+    public static final int DEFAULT_ID_MAX_DIGITS = 6;
+
     /** 是否启用。false 时控制器直接返回 {@code CANCELLED}，完全不触达帧来源与识别实现。 */
     public final boolean enabled;
 
@@ -431,6 +475,22 @@ public final class TargetSelectionConfig {
     /** 单次标签提取保留的候选上限（&ge; 1）；rank 0 永远保留。 */
     public final int maxLabelCandidateCount;
 
+    // ---------------------------------------------------------------- 编号识别（Slice 8）
+
+    /**
+     * 标签 ROI 在识别前放大的倍数（[1,4]）。见 {@link #DEFAULT_LABEL_UPSCALE_FACTOR}。
+     */
+    public final int labelUpscaleFactor;
+
+    /** 编号识别的最低规则置信度 [0,1]；低于它报 {@code LOW_CONFIDENCE}。 */
+    public final float minIdConfidence;
+
+    /** 可接受的编号最少位数（&ge; 1）。 */
+    public final int idMinDigits;
+
+    /** 可接受的编号最多位数（&ge; idMinDigits）。见 {@link #DEFAULT_ID_MAX_DIGITS}。 */
+    public final int idMaxDigits;
+
     private TargetSelectionConfig(Builder builder) {
         this.enabled = builder.enabled;
         this.captureTimeoutMs = builder.captureTimeoutMs;
@@ -473,6 +533,10 @@ public final class TargetSelectionConfig {
         this.minLabelCandidateWidth = builder.minLabelCandidateWidth;
         this.minLabelCandidateHeight = builder.minLabelCandidateHeight;
         this.maxLabelCandidateCount = builder.maxLabelCandidateCount;
+        this.labelUpscaleFactor = builder.labelUpscaleFactor;
+        this.minIdConfidence = builder.minIdConfidence;
+        this.idMinDigits = builder.idMinDigits;
+        this.idMaxDigits = builder.idMaxDigits;
     }
 
     /**
@@ -481,7 +545,8 @@ public final class TargetSelectionConfig {
      * 多目标选择用「EXACT 优先 → 中心距离 1.0 → 面积 1.0（更小优先）→
      * 置信度/完整度各 0.5」的加权分，最多保留 8 个已排名候选；
      * 标签提取在框顶上方 48px、左右各 16px、压进框顶 6px 的带状区域里搜索，
-     * 只接受离框顶 32px 以内、尺寸不小于 16×6 的视频像素块，最多保留 8 个候选。
+     * 只接受离框顶 32px 以内、尺寸不小于 16×6 的视频像素块，最多保留 8 个候选；
+     * 编号识别把标签 ROI 放大 3 倍后做字形匹配，只接受 1~6 位、置信度不低于 0.55 的编号。
      */
     public static TargetSelectionConfig defaults() {
         return new Builder().build();
@@ -529,7 +594,11 @@ public final class TargetSelectionConfig {
                 .labelMaxDistanceFromBoxPx(labelMaxDistanceFromBoxPx)
                 .minLabelCandidateWidth(minLabelCandidateWidth)
                 .minLabelCandidateHeight(minLabelCandidateHeight)
-                .maxLabelCandidateCount(maxLabelCandidateCount);
+                .maxLabelCandidateCount(maxLabelCandidateCount)
+                .labelUpscaleFactor(labelUpscaleFactor)
+                .minIdConfidence(minIdConfidence)
+                .idMinDigits(idMinDigits)
+                .idMaxDigits(idMaxDigits);
     }
 
     @Override
@@ -574,7 +643,11 @@ public final class TargetSelectionConfig {
                 + ", labelMaxDistanceFromBoxPx=" + labelMaxDistanceFromBoxPx
                 + ", minLabelCandidateWidth=" + minLabelCandidateWidth
                 + ", minLabelCandidateHeight=" + minLabelCandidateHeight
-                + ", maxLabelCandidateCount=" + maxLabelCandidateCount + "}";
+                + ", maxLabelCandidateCount=" + maxLabelCandidateCount
+                + ", labelUpscaleFactor=" + labelUpscaleFactor
+                + ", minIdConfidence=" + minIdConfidence
+                + ", idMinDigits=" + idMinDigits
+                + ", idMaxDigits=" + idMaxDigits + "}";
     }
 
     /** 构造器：非法组合在 {@link #build()} 处一次性失败，避免把坏配置带进点击路径。 */
@@ -625,6 +698,11 @@ public final class TargetSelectionConfig {
         private int minLabelCandidateWidth = DEFAULT_MIN_LABEL_CANDIDATE_WIDTH;
         private int minLabelCandidateHeight = DEFAULT_MIN_LABEL_CANDIDATE_HEIGHT;
         private int maxLabelCandidateCount = DEFAULT_MAX_LABEL_CANDIDATE_COUNT;
+
+        private int labelUpscaleFactor = DEFAULT_LABEL_UPSCALE_FACTOR;
+        private float minIdConfidence = DEFAULT_MIN_ID_CONFIDENCE;
+        private int idMinDigits = DEFAULT_ID_MIN_DIGITS;
+        private int idMaxDigits = DEFAULT_ID_MAX_DIGITS;
 
         public Builder enabled(boolean enabled) {
             this.enabled = enabled;
@@ -995,6 +1073,51 @@ public final class TargetSelectionConfig {
         }
 
         /**
+         * 标签 ROI 放大倍数。
+         *
+         * @throws IllegalArgumentException 不在 [1,4] 内（0 会让预处理直接除零，
+         *         大于 4 只会让耗时按平方增长而识别率不再提升）
+         */
+        public Builder labelUpscaleFactor(int labelUpscaleFactor) {
+            if (labelUpscaleFactor < 1 || labelUpscaleFactor > 4) {
+                throw new IllegalArgumentException("labelUpscaleFactor must be within [1,4] but was "
+                        + labelUpscaleFactor);
+            }
+            this.labelUpscaleFactor = labelUpscaleFactor;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 不在 [0,1] 内 */
+        public Builder minIdConfidence(float minIdConfidence) {
+            requireUnitRange(minIdConfidence, "minIdConfidence");
+            this.minIdConfidence = minIdConfidence;
+            return this;
+        }
+
+        /** @throws IllegalArgumentException 小于 1 */
+        public Builder idMinDigits(int idMinDigits) {
+            if (idMinDigits < 1) {
+                throw new IllegalArgumentException("idMinDigits must be >= 1 but was " + idMinDigits);
+            }
+            this.idMinDigits = idMinDigits;
+            return this;
+        }
+
+        /**
+         * 编号最多位数。
+         *
+         * @throws IllegalArgumentException 小于 {@link #idMinDigits}
+         */
+        public Builder idMaxDigits(int idMaxDigits) {
+            if (idMaxDigits < idMinDigits) {
+                throw new IllegalArgumentException("idMaxDigits (" + idMaxDigits
+                        + ") must be >= idMinDigits (" + idMinDigits + ")");
+            }
+            this.idMaxDigits = idMaxDigits;
+            return this;
+        }
+
+        /**
          * @throws IllegalArgumentException 任一视觉阈值非法（这里复用
          *         {@link BlueColorThresholds#of} 的校验，保证「配置里能过」等价于
          *         「检测器构造时能过」，不会出现"配置合法但分析器一构造就抛"）
@@ -1010,6 +1133,11 @@ public final class TargetSelectionConfig {
             if (labelVerticalPaddingPx >= labelSearchHeightPx) {
                 throw new IllegalArgumentException("labelVerticalPaddingPx (" + labelVerticalPaddingPx
                         + ") must be < labelSearchHeightPx (" + labelSearchHeightPx + ")");
+            }
+            // 编号位数的上下限同理：先设 max 再设 min 时单次调用看不出来。
+            if (idMaxDigits < idMinDigits) {
+                throw new IllegalArgumentException("idMaxDigits (" + idMaxDigits
+                        + ") must be >= idMinDigits (" + idMinDigits + ")");
             }
             return new TargetSelectionConfig(this);
         }

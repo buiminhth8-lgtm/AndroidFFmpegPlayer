@@ -647,6 +647,31 @@ public class TargetDebugOverlayView extends View {
             }
         }
 
+        // Slice 8：编号识别。这一段回答"编号读出来没有、读到的是什么"。
+        // rawText 必打 —— 识别失败时它是判断"OCR 读错了"还是"解析太严"的唯一依据；
+        // 而预处理二值图、逐模板命中明细这类实现内部细节一律不打，避免淹没关键信息。
+        if (current.hasTargetIdRecognition()) {
+            b.append('\n').append("id=").append(current.idRecognitionStatus());
+            b.append("  raw=");
+            if (current.idRawText() == null || current.idRawText().isEmpty()) {
+                b.append('-');
+            } else {
+                b.append('"').append(current.idRawText()).append('"');
+            }
+            b.append("  value=").append(current.hasTargetId() ? current.targetId : "-");
+            if (current.idConfidence() != null) {
+                b.append("  conf=");
+                appendFixed(b, current.idConfidence(), 2);
+            } else {
+                b.append("  conf=n/a");
+            }
+            b.append("  ms=").append(current.recognitionMs());
+            if (!current.hasTargetId() && current.hasLabelExtraction()) {
+                // 标签找到了却没读出编号 —— 明确提示这仍然是命中（HIT_ID_UNKNOWN）
+                b.append("  (HIT_ID_UNKNOWN)");
+            }
+        }
+
         // 量出块尺寸：逐行测量（换行符不参与宽度）
         final int length = b.length();
         int lines = 1;

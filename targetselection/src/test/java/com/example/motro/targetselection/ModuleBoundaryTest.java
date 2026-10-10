@@ -552,6 +552,96 @@ public class ModuleBoundaryTest {
         }
     }
 
+    /**
+     * Slice 8 的编号识别策略：放大倍数、置信度门槛、位数区间必须全部来自
+     * {@code TargetSelectionConfig}，而且<b>只允许识别实现与解析器读它们</b>。
+     *
+     * <p>同时钉住两条本 Slice 最重要的结构性约束：</p>
+     * <ol>
+     *   <li><b>蓝色阈值仍然只有一份</b>：识别阶段的"什么是文字像素"必须复用
+     *       {@link com.example.motro.targetselection.vision.BlueColorThresholds}
+     *       与配置里同一组 {@code blueHue*} / {@code minSaturation} / {@code minValue}，
+     *       不许因为"文字细、压缩后掉色狠"另起一套 —— 两套阈值意味着现场调参要调两处。</li>
+     *   <li><b>逐字符模板与阈值不外泄</b>：模板点阵与匹配相似度下限是识别实现的
+     *       内部细节，不构成配置项（它们不随画面变化，只随实现变化）。</li>
+     * </ol>
+     *
+     * <p>另外断言识别层的<b>纯 JVM</b>：{@code GlyphTemplateTargetIdRecognizer} 与
+     * {@code TargetIdParser} 都不得 import {@code android.*}（后者已由
+     * {@link #visionLayerStaysPureJvm()} 覆盖整个 vision 包，这里额外确认
+     * 识别实现没有"为了一个 Bitmap 就破例"）。</p>
+     */
+    @Test
+    public void targetIdRecognitionPolicyLivesOnlyInTheRecognizer() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String recognizer = read(new File(visionDir, "GlyphTemplateTargetIdRecognizer.java"));
+
+        for (String knob : new String[]{
+                "labelUpscaleFactor", "minIdConfidence", "idMinDigits", "idMaxDigits"}) {
+            assertTrue("GlyphTemplateTargetIdRecognizer 必须从配置读取 " + knob,
+                    recognizer.contains("config." + knob));
+        }
+        assertTrue("识别实现必须复用 BlueColorThresholds（不得新建第二套蓝阈值）",
+                recognizer.contains("BlueColorThresholds.of("));
+
+        // 解析规则与识别实现分开：解析器只读位数区间，不碰任何视觉参数。
+        // 只看<b>代码行</b>（跳过注释与 Javadoc）：本类开头就写明"注释散文不构成违规"，
+        // 而解析器的 Javadoc 恰好要提到 minIdConfidence 才能把分工解释清楚 ——
+        // 那是有价值的文档，不该被判成违规。
+        final String parserCode = codeOnly(new File(visionDir, "TargetIdParser.java"));
+        assertTrue("TargetIdParser 必须从配置读取 idMinDigits", parserCode.contains("config.idMinDigits"));
+        assertTrue("TargetIdParser 必须从配置读取 idMaxDigits", parserCode.contains("config.idMaxDigits"));
+        for (String visual : new String[]{"labelUpscaleFactor", "minIdConfidence",
+                "blueHueMinDegrees", "minSaturation", "labelSearchHeightPx"}) {
+            assertFalse("TargetIdParser 不得在代码里读取视觉参数（发现 " + visual + "）",
+                    parserCode.contains(visual));
+        }
+
+        // 识别参数不得掺进其它视觉阶段：否则"改了配置但行为没变"或"只变了一半"
+        for (String other : new String[]{"TargetBoxDetector.java", "TargetHitTester.java",
+                "TargetCandidateSelector.java", "BlueMaskDetector.java", "LabelRegionExtractor.java"}) {
+            String text = read(new File(visionDir, other));
+            for (String knob : new String[]{"labelUpscaleFactor", "minIdConfidence",
+                    "idMinDigits", "idMaxDigits"}) {
+                assertFalse(other + " 不得掺入编号识别参数（发现 " + knob + "）", text.contains(knob));
+            }
+        }
+
+        // 识别接口必须只依赖本模块自己的类型（不得漏出 SDK 类型到公开 API）
+        String contract = read(new File(visionDir, "TargetIdRecognizer.java"));
+        assertTrue("TargetIdRecognizer 必须以 LabelExtractionResult 为入参",
+                contract.contains("LabelExtractionResult"));
+        assertTrue("TargetIdRecognizer 必须以 TargetIdRecognitionResult 为出参",
+                contract.contains("TargetIdRecognitionResult"));
+    }
+
+    /**
+     * 识别失败不得把"已经确认的 bbox 命中"倒退成 MISS —— 这条语义必须由
+     * {@code TargetIdRecognitionStatus.keepsHit()} 一处给出，而不是散落在各调用点的
+     * 枚举比较里（那样迟早会漏掉一个分支）。
+     */
+    @Test
+    public void recognitionFailureNeverDowngradesAHit() throws IOException {
+        File visionDir = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/vision");
+        String status = read(new File(visionDir, "TargetIdRecognitionStatus.java"));
+        assertTrue("TargetIdRecognitionStatus 必须提供 keepsHit() 作为唯一的命中语义出口",
+                status.contains("public boolean keepsHit()"));
+        assertTrue("keepsHit() 必须恒为 true（识别是命中的附加步骤，失败不影响命中）",
+                status.contains("return true;"));
+
+        String result = read(new File(visionDir, "TargetIdRecognitionResult.java"));
+        assertTrue("TargetIdRecognitionResult 必须提供 isHitWithoutId()",
+                result.contains("isHitWithoutId()"));
+        // 非成功状态下 targetId 必须恒为 null（否则上层会写出 targetId != null 的模糊分支）
+        for (String factory : new String[]{"noId(", "lowConfidence(", "invalidLabel(",
+                "recognitionFailed("}) {
+            assertTrue("TargetIdRecognitionResult 必须提供 " + factory + " 工厂",
+                    result.contains(factory));
+        }
+    }
+
     // ---------------------------------------------------------------- utils
 
     private static void assertNoDependency(String deps, String needle) {
@@ -606,5 +696,24 @@ public class ModuleBoundaryTest {
         assertNotNull(file);
         assertTrue("文件不存在：" + file.getAbsolutePath(), file.isFile());
         return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 只保留<b>代码行</b>：丢掉纯注释行（{@code //}、{@code *}、{@code /*}）。
+     *
+     * <p>用于"某个标识符不得出现在代码里"这类断言 —— 本类开头明确写着
+     * 「注释里提到某个名字只是说明，不构成依赖」，若把注释也算进来，
+     * 就会逼着人删掉有价值的文档。</p>
+     */
+    private static String codeOnly(File file) throws IOException {
+        final StringBuilder code = new StringBuilder(4096);
+        for (String line : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
+            final String trimmed = line.trim();
+            if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+                continue;
+            }
+            code.append(line).append('\n');
+        }
+        return code.toString();
     }
 }

@@ -16,6 +16,8 @@ import com.example.motro.targetselection.vision.TargetBoxDetectionResult;
 import com.example.motro.targetselection.vision.TargetBoxDetectionStatus;
 import com.example.motro.targetselection.vision.TargetCandidateScore;
 import com.example.motro.targetselection.vision.TargetHitType;
+import com.example.motro.targetselection.vision.TargetIdRecognitionResult;
+import com.example.motro.targetselection.vision.TargetIdRecognitionStatus;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -193,6 +195,32 @@ public final class TargetDebugState {
     /** 预留：目标 id。本 Slice 恒为 null（标签提取不识别文字内容，见 Slice 7）。 */
     public final String targetId;
 
+    // ---------------------------------------------------------------- 编号识别（Slice 8）
+
+    /**
+     * 编号识别状态；未做识别时为 null。见 {@code TargetIdRecognitionStatus}。
+     *
+     * <p>它与 {@link #labelStatus} 是两层：标签状态回答"编号那块区域找到没有"，
+     * 本状态回答"那块区域里的编号读出来没有"。前者 SUCCESS 而后者 NO_ID 是
+     * 完全正常的一种组合（找到了文字块，但读不出数字）。</p>
+     */
+    public final TargetIdRecognitionStatus idRecognitionStatus;
+
+    /**
+     * 识别出的<b>原始</b>文本（未解析，可能含噪声）。它是排查"是 OCR 读错了
+     * 还是解析太严"的唯一线索 —— 只看 {@link #targetId} 区分不出这两类失败。
+     */
+    public final String idRawText;
+
+    /**
+     * 识别的规则置信度 [0,1]；无法给出时为空。
+     * <b>语义见 {@code TargetIdRecognitionResult#confidence}：它不是概率。</b>
+     */
+    public final Float idConfidence;
+
+    /** 识别阶段耗时（毫秒）；未做识别时为 0。 */
+    public final long recognitionMs;
+
     /** 选中框的置信度 [0,1]；未命中时为 0。 */
     public final float confidence;
 
@@ -233,6 +261,10 @@ public final class TargetDebugState {
         this.labelCropMs = builder.labelCropMs;
         this.labelRoi = builder.labelRoi;
         this.targetId = builder.targetId;
+        this.idRecognitionStatus = builder.idRecognitionStatus;
+        this.idRawText = builder.idRawText;
+        this.idConfidence = builder.idConfidence;
+        this.recognitionMs = builder.recognitionMs;
         this.confidence = builder.confidence;
         this.processingMs = builder.processingMs;
         this.detectMs = builder.detectMs;
@@ -304,6 +336,7 @@ public final class TargetDebugState {
                 .labelTimings(labelDetectMs, labelCropMs)
                 .labelRoi(labelRoi)
                 .targetId(targetId)
+                .idRecognition(idRecognitionStatus, idRawText, idConfidence, recognitionMs)
                 .confidence(confidence)
                 .processingMs(processingMs)
                 .timings(detectMs, hitTestMs);
@@ -379,6 +412,35 @@ public final class TargetDebugState {
         return toBuilder().labelExtraction(result).build();
     }
 
+    /**
+     * 复制并挂上一次编号识别的结果 —— Slice 8 的标准接法。
+     *
+     * <p>把 {@link TargetIdRecognitionResult} 里叠加层需要的几项翻成可视化字段：
+     * 状态、原始文本、编号、规则置信度、识别耗时。
+     * <b>预处理后的二值图像不进本对象</b> —— 叠加层只需要"读出了什么"，
+     * 把整块中间像素塞进调试状态只会让它在主线程上多背一份无用数据。</p>
+     *
+     * <p>{@link #targetId} 只在识别成功时被赋值（其余状态下结果里的 {@code targetId}
+     * 本来就是 null，见 {@code TargetIdRecognitionResult} 的说明）；
+     * {@link #idRawText} 始终带上 —— 识别失败时它是唯一的排查线索。</p>
+     *
+     * <p>{@link #processingMs} 会被<b>累加</b>上这次识别的耗时（而不是覆盖）：
+     * 识别发生在标签提取之后，两者是同一串工作的前后两段，
+     * 覆盖会让"这次点击一共花了多久"丢掉前半段。识别这一段自己的耗时另由
+     * {@link #recognitionMs} 给出。</p>
+     *
+     * <p>失败结果同样接受：{@link #idRecognitionStatus} 会如实带上
+     * {@code NO_ID} / {@code LOW_CONFIDENCE} / …，于是叠加层能显示"为什么读不出编号"。
+     * 注意这些状态<b>全部</b>表示"框已经点中了"（{@code HIT_ID_UNKNOWN}），
+     * 而不是 MISS。</p>
+     *
+     * @param result 识别结果，非 null
+     * @return 新的状态对象（本对象不变）
+     * @throws IllegalArgumentException result 为 null
+     */
+    public TargetDebugState withTargetIdRecognition(TargetIdRecognitionResult result) {
+        return toBuilder().targetIdRecognition(result).build();
+    }
 
     // ---------------------------------------------------------------- 几何代理（不解引用 null）
 
@@ -562,6 +624,36 @@ public final class TargetDebugState {
         return labelCropMs;
     }
 
+    /** 是否做过编号识别（即 {@link #idRecognitionStatus} 有值，无论成功还是失败）。 */
+    public boolean hasTargetIdRecognition() {
+        return idRecognitionStatus != null;
+    }
+
+    /** 编号识别状态；未做识别时为 null。 */
+    public TargetIdRecognitionStatus idRecognitionStatus() {
+        return idRecognitionStatus;
+    }
+
+    /** 识别的原始文本（未解析）；未做识别时为 null。 */
+    public String idRawText() {
+        return idRawText;
+    }
+
+    /** 识别的规则置信度 [0,1]；无法给出或未做识别时为 null。 */
+    public Float idConfidence() {
+        return idConfidence;
+    }
+
+    /** 识别阶段耗时（毫秒）；未做识别时为 0。 */
+    public long recognitionMs() {
+        return recognitionMs;
+    }
+
+    /** 是否真的读出了编号（成功且非 null）。 */
+    public boolean hasTargetId() {
+        return targetId != null;
+    }
+
     /** 本次点击是否命中了一个候选框（叠加层据此把选中框画成高亮样式）。 */
     public boolean isHit() {
         return selectedBox != null;
@@ -654,6 +746,17 @@ public final class TargetDebugState {
                     .append(" labelCropMs=").append(labelCropMs)
                     .append(" labelMs=").append(labelDetectMs + labelCropMs);
         }
+        // Slice 8：编号识别。同样"没做过就整段不输出"，于是只跑到 Slice 7 的日志逐字不变。
+        // rawText 一定要打：识别失败时，"读到了什么"是判断"是 OCR 读错还是解析太严"的唯一依据。
+        // 刻意不打预处理后的二值图/模板命中明细 —— 那是识别实现的内部细节，
+        // 打到日志里只会淹没真正要看的状态与文本。
+        if (hasTargetIdRecognition()) {
+            b.append(" id=").append(idRecognitionStatus)
+                    .append(" raw=").append(idRawText == null ? "-" : '"' + idRawText + '"')
+                    .append(" value=").append(targetId == null ? "-" : targetId)
+                    .append(" idConf=").append(idConfidence == null ? "n/a" : idConfidence)
+                    .append(" recMs=").append(recognitionMs);
+        }
         return b.toString();
     }
 
@@ -706,6 +809,10 @@ public final class TargetDebugState {
         private long labelCropMs;
         private TargetBoundingBox labelRoi;
         private String targetId;
+        private TargetIdRecognitionStatus idRecognitionStatus;
+        private String idRawText;
+        private Float idConfidence;
+        private long recognitionMs;
         private float confidence;
         private long processingMs;
         private long detectMs;
@@ -1003,6 +1110,51 @@ public final class TargetDebugState {
         /** 目标 id。本 Slice 恒为 null（标签提取不识别文字内容）。 */
         public Builder targetId(String targetId) {
             this.targetId = targetId;
+            return this;
+        }
+
+        /**
+         * 一次性把 {@link TargetIdRecognitionResult} 的可视信息并进来：状态、原始文本、
+         * 编号、规则置信度、识别耗时
+         * （见 {@link TargetDebugState#withTargetIdRecognition(TargetIdRecognitionResult)}）。
+         *
+         * <p>非成功状态下结果里的 {@code targetId} 本来就是 null，因此这里直接取值即可，
+         * 不必（也<b>不该</b>）再判断一次状态 —— 那条不变量由结果类型自己保证。</p>
+         *
+         * <p>{@code processingMs} 是<b>累加</b>而不是覆盖：识别在标签提取之后，
+         * 覆盖会让"这次点击一共花了多久"丢掉前半段。</p>
+         *
+         * @throws IllegalArgumentException result 为 null
+         */
+        public Builder targetIdRecognition(TargetIdRecognitionResult result) {
+            if (result == null) {
+                throw new IllegalArgumentException("result must not be null");
+            }
+            return targetId(result.targetId)
+                    .idRecognition(result.status, result.rawText, result.confidence,
+                            result.processingMs)
+                    .processingMs(processingMs + result.processingMs);
+        }
+
+        /**
+         * 编号识别的可视字段（拆分入口，供已有 {@code targetId} 的场景复用）。
+         *
+         * @throws IllegalArgumentException confidence 非 null 且不在 [0,1]；recognitionMs 为负
+         */
+        public Builder idRecognition(TargetIdRecognitionStatus status, String rawText,
+                                     Float confidence, long recognitionMs) {
+            if (confidence != null
+                    && (Float.isNaN(confidence) || confidence < 0f || confidence > 1f)) {
+                throw new IllegalArgumentException("idConfidence must be within [0,1] or null but was "
+                        + confidence);
+            }
+            if (recognitionMs < 0L) {
+                throw new IllegalArgumentException("recognitionMs must be >= 0 but was " + recognitionMs);
+            }
+            this.idRecognitionStatus = status;
+            this.idRawText = rawText;
+            this.idConfidence = confidence;
+            this.recognitionMs = recognitionMs;
             return this;
         }
 

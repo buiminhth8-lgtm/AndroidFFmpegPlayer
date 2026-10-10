@@ -24,10 +24,13 @@ import java.util.List;
  *       于是两个方向共用同一段代码，不必写两套扫描）。</li>
  *   <li><b>取边带</b>：把"连续若干行、每行蓝像素数都超过阈值"的区间取成一条<b>水平边带</b>；
  *       垂直边带同理。阈值来自
- *       {@code minBoxWidth/minBoxHeight × minEdgeCoverage}，不是拍脑袋的常数。</li>
+ *       {@code minBoxWidth/minBoxHeight × minEdgeCoverage}，不是拍脑袋的常数。
+ *       边带的空间范围只统计<b>本方向的长度超过线宽上限</b>的那些段 ——
+ *       横穿它的另一条框线只留下很短的一段，不能算成它的范围（见 {@code extractBands}）。</li>
  *   <li><b>细线判据</b>：边带厚度超过 {@code maxEdgeThicknessPx} 的直接丢掉 ——
  *       这一步把"一整块蓝色物体"（蓝色车身、蓝屏、天空）和"几像素宽的框线"区分开。
- *       实心色块在投影上表现为几十上百行都满覆盖，形成的边带极厚，一击即中。</li>
+ *       实心色块在投影上表现为几十上百行都满覆盖，形成的边带极厚，一击即中。
+ *       另一条判据是实心度（{@code minEdgeSolidity}）：跨度范围内像素太稀疏就不算线。</li>
  *   <li><b>配对</b>：两条水平边带配出上/下（横跨范围取交集），两条垂直边带配出左/右
  *       （纵向范围取交集）。<b>两个方向都做</b>，因为断裂通常只破坏其中一个方向：
  *       上边线断成两截时水平配对会出错，但左右两条竖线还在，垂直配对依然能给出正确的框。</li>
@@ -228,8 +231,18 @@ public final class TargetBoxDetector {
         /**
          * 取"连续若干行、每行蓝像素数都 &ge; {@code minCount}"的区间作为一条边带。
          *
-         * <p>边带的空间范围取<b>并集</b>（该区间内所有蓝像素在另一轴上的最小/最大坐标），
-         * 因此一条中间断裂的边线仍然是一条完整边带 —— 断裂只体现在覆盖率上，不体现在几何上。</p>
+         * <p>边带的空间范围取<b>该边自己的像素</b>的并集（"够长的段"，见下），因此一条中间
+         * 断裂的边线仍然是一条完整边带 —— 断裂只体现在覆盖率上，不体现在几何上。</p>
+         *
+         * <p><b>为什么跨度只统计"够长的段"（关键）</b>：一行里出现的蓝像素不全是这条边的 ——
+         * 任何<b>横穿</b>它的另一条框线也会在这一行留下几个像素，而那些像素在本方向上的长度
+         * 约等于对方那条线的<b>线宽</b>（&le; {@code maxThickness}）。把它们算进跨度，会让本边
+         * 的外接盒被撑到"跨到对面那条线"那么宽，实心度随之腰斩：
+         * 「大框套小框」时内层框的边就是这样被误判成假边丢掉的（实测 110px 的真边，
+         * 跨度被外框的两条竖边撑成 270px，实心度 1.0 → 0.44 &lt; {@code minEdgeSolidity}），
+         * 于是内层框永远不会成为候选，用户点它只会选中外面的大框。
+         * 只计入"比最粗允许线宽还长"的段以后，跨度还原成"这条边自己的范围"，
+         * 实心度也就回到了它本来的含义：<b>这条边的范围内有多实</b>（挡住点状/虚线的假边）。</p>
          */
         private List<Band> extractBands(RunIndex index, int minCount, int maxThickness, int limit) {
             final int height = index.mask.height();
@@ -237,6 +250,10 @@ public final class TargetBoxDetector {
             for (int i = 0; i < index.runs.length; i += 3) {
                 counts[index.runs[i]] += index.runs[i + 2] - index.runs[i + 1] + 1;
             }
+
+            // 横穿本方向的另一条框线，其"段长"约等于它自己的线宽；超过线宽上限的段
+            // 不可能是横穿线留下的，才算这条边自己的像素。
+            final int minSpanRun = maxThickness + 1;
 
             final List<Band> bands = new ArrayList<>();
             int y = 0;
@@ -253,6 +270,9 @@ public final class TargetBoxDetector {
                     for (int r = index.rowHead[y]; r < index.rowHead[y + 1]; r++) {
                         final int start = index.runs[r * 3 + 1];
                         final int end = index.runs[r * 3 + 2];
+                        if (end - start + 1 < minSpanRun) {
+                            continue;   // 横穿线留下的短段：不参与跨度，也不参与实心度
+                        }
                         if (start < band.spanStart) {
                             band.spanStart = start;
                         }
@@ -264,12 +284,17 @@ public final class TargetBoxDetector {
                     y++;
                 }
                 band.end = y - 1;
+                // 一整条边带里没有一段"够长的段"：它不是一个线状结构（例如一排点、
+                // 或纯粹由横穿线拼出来的行），直接丢掉，避免后面用未初始化的跨度算实心度。
+                if (band.spanStart == Integer.MAX_VALUE) {
+                    continue;
+                }
                 // 太厚 = 实心色块，不是细线框。这是区分"蓝色物体"与"蓝色框"的关键一步。
                 if (band.thickness() > maxThickness) {
                     continue;
                 }
-                // 太不实心 = 这一"边"是借来的像素凑出来的（典型：贴在框沿上的 id 文字列），
-                // 不是一段线。厚度的判据在这里无效 —— 那些列只有几像素宽，像极了细线。
+                // 太不实心 = 这一段在自身范围内是稀疏的（点状、虚线、断续的碎片），
+                // 不是一条连续的线。
                 if (band.solidity() < config.minEdgeSolidity) {
                     continue;
                 }
@@ -479,17 +504,19 @@ public final class TargetBoxDetector {
         }
 
         /**
-         * 实心度 = 蓝像素数 / 边带外接盒面积，落在 (0,1]。
+         * 实心度 = "这条边自己的像素数" / 边带外接盒面积，落在 (0,1]。
          *
          * <p>真实的一段框线是<b>实心</b>的，实心度≈1（一条 4px 线就是 4×长度 个像素）。
-         * 反过来，若某个方向上的"边带"是靠<b>借别的边的像素</b>凑够计数的，它的外接盒里
-         * 绝大部分是空的，实心度会低到 0.1 上下 —— 这正是「id 文字贴在框上沿」时的情形：
-         * 文字列的竖向像素数被上、下两条边线补到了阈值以上，于是冒充成一条贯穿整框高度的竖边，
-         * 与真正的竖边配对后造出若干<b>截断的子框</b>。子框比真框小，一旦点击点偏离真框中心，
-         * "面积更小者优先"会让它胜出，下游拿这个框去取标签区域就会取错。</p>
+         * 反过来，若这个范围内只有稀稀落落的点（点状噪声、虚线碎片），外接盒里绝大部分
+         * 是空的，实心度会明显低于 0.5 —— 这正是本判据要挡的东西。</p>
          *
-         * <p>厚度上限（{@link TargetSelectionConfig#maxEdgeThicknessPx}）挡不住这种情况：
-         * 那些文字列只有 4~14 px 宽，看着完全像细线。真正把它们与线区分开的是"线是实的"。</p>
+         * <p><b>它挡不住、也不该由它挡的东西</b>：横穿这条边的另一条框线留下的几个像素。
+         * 那些像素在<b>本方向</b>上只是很短的一段，会让跨度虚增、实心度无缘无故腰斩 ——
+         * 但本方向的长度本来就分辨不出"这是我自己的边"还是"别人路过"。
+         * 这件事已经由 {@code extractBands} 在统计跨度时就处理掉了（只计入够长的段），
+         * 所以到这里时 {@link #pixelCount} 与 {@link #spanLength()} 描述的都是<b>同一条边</b>。
+         * 若没有那一步，「大框套小框」里内层框那条 110px 的真边会被算成
+         * 4×270 的外接盒、实心度 0.44，从而被误当成假边丢掉。</p>
          */
         float solidity() {
             final int box = thickness() * spanLength();

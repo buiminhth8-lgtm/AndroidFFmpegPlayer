@@ -302,13 +302,14 @@ public class TargetBoxDetectorTest {
      * id 文字贴在框沿上（真实推流端的常见样式）时，<b>不得</b>多造出候选框。
      *
      * <p>这一条盯的是一个很隐蔽的误检机制：文字每一列同时穿过框的<b>上、下两条边线</b>，
-     * 于是该列的蓝像素数被"借"到了垂直阈值以上，而它的跨度并集又被拉到整框高度 ——
+     * 于是该列的蓝像素数被"借"到了垂直阈值以上，跨度并集又被拉到整框高度 ——
      * 一列文字就此<b>冒充</b>成一条贯穿全框的竖边，与真竖边配对后造出若干"截断的子框"。
      * 子框比真框小，一旦点击点偏离真框中心，"面积更小者优先"就会让它胜出，
      * 下游拿这个框去取标签区域就会取错。</p>
      *
-     * <p>挡不住它的原因是厚度判据失灵：那些文字列只有几像素宽，比真框线还细。
-     * 真正把它们与线区分开的是"线是实的"（见 {@code minEdgeSolidity}）。</p>
+     * <p>挡住它的有两道：① 统计跨度时不把"横穿线留下的短段"算进本边的范围
+     * （见 {@code TargetBoxDetector#extractBands}），于是文字列的范围只剩它自己那几行，
+     * 与真竖边的范围不再重叠、配不出框；② 文字行/列本身又会因为太厚或太稀疏被拒。</p>
      */
     @Test
     public void labelTextTouchingTheBoxEdgeDoesNotCreateExtraCandidates() {
@@ -325,6 +326,56 @@ public class TargetBoxDetectorTest {
         assertEquals("文字只应出现在覆盖率里，不该多造出候选框：" + dump(result),
                 1, result.candidateCount);
         assertBoxNear(result.candidates.get(0), 120f, 40f, 420f, 280f);
+    }
+
+    /**
+     * <b>大框套小框</b>：内层小框必须自己成为一个候选，而不是被外层大框吞掉。
+     *
+     * <p>这条用例是上面那条的<b>反面</b>，也是加它的直接原因：边带的空间范围如果按
+     * "该行所有蓝像素的并集"来取，内层框的边就会被外框的两条竖边把范围从 110px 撑到 270px，
+     * 实心度随之从 1.0 掉到 0.44 &lt; {@code minEdgeSolidity}，于是内层框的边被当成
+     * "借像素凑出来的假边"丢掉 —— 用户点内层小框，拿到的是外面那个大框，而画面看起来
+     * 一切正常（框的位置甚至是对的），这是最难被发现的一类错误。</p>
+     *
+     * <p>所以这里同时断言"两个框都在"与"它们都包含点击点"，把「嵌套框可被恢复」
+     * 钉成检测层的契约 —— 上层的选择策略才有机会去挑那个更小更具体的。</p>
+     */
+    @Test
+    public void aBoxNestedInsideALargerOneIsStillRecovered() {
+        int[] pixels = canvas();
+        TestImages.strokeRect(pixels, IMAGE_WIDTH, IMAGE_HEIGHT, 250, 200, 270, 270, 4,
+                TestImages.SHIFTED_BLUE);
+        TestImages.strokeRect(pixels, IMAGE_WIDTH, IMAGE_HEIGHT, 330, 270, 110, 100, 4,
+                TestImages.SHIFTED_BLUE);
+
+        TargetBoxDetectionResult result = analyze(pixels, 385f, 320f);
+
+        assertEquals(TargetBoxDetectionStatus.SUCCESS, result.status);
+        assertEquals("内层框与外层框都应该是候选：" + dump(result), 2, result.candidateCount);
+
+        DetectedTargetBox inner = findBox(result, 330f, 270f, 440f, 370f);
+        assertNotNull("内层小框没被恢复出来：" + dump(result), inner);
+        assertBoxNear(inner, 330f, 270f, 440f, 370f);
+        DetectedTargetBox outer = findBox(result, 250f, 200f, 520f, 470f);
+        assertNotNull("外层大框没被恢复出来：" + dump(result), outer);
+
+        // 两个框都真的包含点击点，上层才谈得上"挑更小更具体的那个"
+        assertTrue(inner.rectInVideo.contains(385f, 320f));
+        assertTrue(outer.rectInVideo.contains(385f, 320f));
+    }
+
+    /** 在候选里按"四条边都接近"找框；找不到返回 null（比 size 断言更好定位问题）。 */
+    private static DetectedTargetBox findBox(TargetBoxDetectionResult result,
+                                             float left, float top, float right, float bottom) {
+        for (DetectedTargetBox box : result.candidates) {
+            if (Math.abs(box.rectInVideo.left - left) <= EDGE_TOLERANCE
+                    && Math.abs(box.rectInVideo.top - top) <= EDGE_TOLERANCE
+                    && Math.abs(box.rectInVideo.right - right) <= EDGE_TOLERANCE
+                    && Math.abs(box.rectInVideo.bottom - bottom) <= EDGE_TOLERANCE) {
+                return box;
+            }
+        }
+        return null;
     }
 
     /** 把候选列表摊平进断言消息，失败时不必再跑一次才知道多出来的是什么。 */

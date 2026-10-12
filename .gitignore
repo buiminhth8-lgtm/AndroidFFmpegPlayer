@@ -31,3 +31,6 @@ __pycache__/
 /artifacts/target_label_real_samples/
 # Slice 7 期间的临时探针产物（人工查看真实帧用的裁剪/放大图）
 /artifacts/label_probe/
+# Slice 9（控制器端到端）的验证报告：由 TargetSelectionControllerSampleSmokeTest
+# 现场生成（-Dtargetselection.controllerSampleReport=...），属运行产物，不入版本库
+/artifacts/controller_smoke_report.txt

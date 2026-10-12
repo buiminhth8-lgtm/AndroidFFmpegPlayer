@@ -75,4 +75,12 @@ tasks.withType(Test).configureEach {
             System.getProperty('targetselection.idSampleDir', '')
     systemProperty 'targetselection.idSampleReport',
             System.getProperty('targetselection.idSampleReport', '')
+    // Slice 9（控制器端到端）：同样独立，缺参数即跳过（样本依赖的用例必须能整体 absent）。
+    // 它跑的是"一次性完整调用链"，与前面几个"分段" smoke test 互补：
+    //   ./gradlew :targetselection:testDebugUnitTest --tests '*ControllerSampleSmokeTest*' \
+    //       -Dtargetselection.controllerSampleDir=artifacts/target_label_samples,artifacts/target_label_real_samples
+    systemProperty 'targetselection.controllerSampleDir',
+            System.getProperty('targetselection.controllerSampleDir', '')
+    systemProperty 'targetselection.controllerSampleReport',
+            System.getProperty('targetselection.controllerSampleReport', '')
 }

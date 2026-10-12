@@ -642,7 +642,136 @@ public class ModuleBoundaryTest {
         }
     }
 
+    /**
+     * Slice 9 的编排约束：控制器只做编排，不得自持任何具体实现。
+     *
+     * <p>这是本 Slice 最核心的结构性要求。控制器若在内部 {@code new} 出取帧实现、
+     * 或引用 SurfaceView / TextureView / FFmpeg / MediaCodec，那么"换承载 View"或
+     * "换帧来源"就必须改控制器本身 —— 而这恰恰是 Slice 9 要避免的事。</p>
+     *
+     * <p>判据：</p>
+     * <ol>
+     *   <li>不得出现 {@code new SurfaceViewFrameSource} / {@code new TextureViewFrameSource} /
+     *       {@code android.view.SurfaceView} / {@code android.view.TextureView}；</li>
+     *   <li>不得出现 FFmpeg / MediaCodec / AVFrame 相关类型；</li>
+     *   <li>必须经构造注入全部视觉协作者（断言构造参数名可见）。</li>
+     * </ol>
+     */
+    @Test
+    public void controllerOnlyOrchestratesAndInjectsCollaborators() throws IOException {
+        String controller = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetSelectionController.java"));
+
+        for (String forbidden : new String[]{
+                "android.view.SurfaceView", "android.view.TextureView",
+                "new SurfaceViewFrameSource", "new TextureViewFrameSource",
+                "android.media.MediaCodec", "AVFrame", "android.media.MediaCodec",
+                "import com.example.motro.ffmpeg"}) {
+            assertFalse("控制器不得引用承载 View / 解码器 / FFmpeg（发现 " + forbidden + "）",
+                    controller.contains(forbidden));
+        }
+
+        // 全部视觉协作者必须作为构造参数注入，而不是内部 new
+        for (String collaborator : new String[]{
+                "TouchRoiExtractor roiExtractor", "BlueMaskDetector maskDetector",
+                "TargetBoxDetector boxDetector", "TargetHitTester hitTester",
+                "TargetCandidateSelector candidateSelector", "LabelRegionExtractor labelExtractor",
+                "TargetIdRecognizer idRecognizer", "VideoFrameSource frameSource",
+                "VideoGeometryProvider geometryProvider"}) {
+            assertTrue("控制器必须通过构造注入 " + collaborator, controller.contains(collaborator));
+        }
+    }
+
+    /**
+     * 识别实现的内部类型不得泄漏进控制器的 <b>public API 签名</b>。
+     *
+     * <p>将来接 OCR SDK 时，SDK 类型只能出现在实现类里；控制器的公开签名一旦沾上它们，
+     * 替换实现就会变成"改公共 API"，上层全部要跟着动。</p>
+     *
+     * <p><b>为什么不是"整个文件都不许出现"</b>：{@code withDefaults(...)} 这个便捷装配点
+     * 必须知道"默认实现是谁"，否则它无法装配。所以判据收窄到「签名不碰」：
+     * 具体实现的类名只能出现在方法体里（装配），不得出现在构造参数、公开方法参数
+     * 或返回类型里。这样"换实现不改 API"这条约束依然被钉住，而默认装配仍然可写。</p>
+     */
+    @Test
+    public void controllerPublicApiLeaksNoRecognizerInternals() throws IOException {
+        File controllerFile = new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetSelectionController.java");
+        String controller = read(controllerFile);
+
+        // 公开签名行 = 构造/公开方法的参数或返回类型；这里用"参数列表行"做近似判据：
+        // 具体实现类名一旦出现在参数位，就意味着 API 与实现绑死了。
+        final String signatureCode = signatureOnly(controllerFile);
+        for (String leaked : new String[]{"GlyphTemplateTargetIdRecognizer", "TargetIdParser",
+                "GlyphTemplate", "tflite", "mlkit", "opencv"}) {
+            assertFalse("控制器的公开 API 签名不得绑定识别实现（发现 " + leaked + "）",
+                    signatureCode.contains(leaked));
+        }
+
+        // 若引用了默认实现，只能出现在装配方法体里（本模块允许的唯一一点耦合）
+        assertTrue("withDefaults 必须能装配出默认识别器（这是 app 层的默认用法）",
+                controller.contains("withDefaults("));
+    }
+
+    /**
+     * {@link com.example.motro.targetselection.api.TargetHitResult} 必须是纯数据 + 纯 JVM，
+     * 且对外统一返回视频坐标。
+     */
+    @Test
+    public void hitResultStaysPureJvmAndVideoCoordinateBased() throws IOException {
+        String result = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetHitResult.java"));
+        assertFalse("TargetHitResult 必须保持纯 JVM（便于单测）", result.contains("import android."));
+        assertTrue("TargetHitResult 必须暴露 boundingBox（视频坐标）", result.contains("boundingBox"));
+        for (String field : new String[]{
+                "status", "targetId", "touchViewX", "touchViewY", "touchVideoX", "touchVideoY",
+                "framePtsUs", "requestTimeNs", "captureLatencyMs", "boxDetectMs",
+                "idRecognizeMs", "totalProcessingMs", "boxConfidence", "idConfidence"}) {
+            assertTrue("TargetHitResult 必须包含字段 " + field, result.contains(field));
+        }
+    }
+
+    /** 每次请求的状态集合必须完整覆盖 8 种结局，避免遗漏分支。 */
+    @Test
+    public void targetSelectionStatusCoversAllOutcomes() throws IOException {
+        String status = read(new File(moduleDir("targetselection"),
+                "src/main/java/com/example/motro/targetselection/api/TargetSelectionStatus.java"));
+        for (String value : new String[]{"HIT", "MISS", "HIT_ID_UNKNOWN", "OUTSIDE_VIDEO",
+                "GEOMETRY_UNAVAILABLE", "CAPTURE_FAILED", "NO_FRAME", "CANCELLED", "INTERNAL_ERROR"}) {
+            assertTrue("TargetSelectionStatus 必须包含 " + value, status.contains(value));
+        }
+    }
+
     // ---------------------------------------------------------------- utils
+
+    /**
+     * 提取「公开 API 签名」相关的行：{@code public} 声明行与其后的参数行。
+     *
+     * <p>用于"某个实现类名不得出现在 API 上"这类断言。方法体里的装配语句
+     * （{@code return new XxxRecognizer(...)}）不算 API，所以不能被算进来 ——
+     * 否则 {@code withDefaults(...)} 就永远写不出来了。</p>
+     */
+    private static String signatureOnly(File file) throws IOException {
+        final StringBuilder out = new StringBuilder(2048);
+        boolean inSignature = false;
+        for (String line : Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)) {
+            final String trimmed = line.trim();
+            if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+                continue;
+            }
+            if (trimmed.contains("public ") || trimmed.startsWith("public")) {
+                inSignature = true;
+            }
+            if (inSignature) {
+                out.append(line).append('\n');
+                // 签名结束：出现 '{' 或 ';' 即视为这一处声明结束
+                if (trimmed.contains("{") || trimmed.endsWith(";")) {
+                    inSignature = false;
+                }
+            }
+        }
+        return out.toString();
+    }
 
     private static void assertNoDependency(String deps, String needle) {
         if (deps.contains(needle)) {

@@ -12,6 +12,8 @@ package com.example.motro.targetselection.api;
  *   <li>{@link #GEOMETRY_UNAVAILABLE}：几何未知，无法映射</li>
  *   <li>{@link #CAPTURE_FAILED} / {@link #NO_FRAME}：取不到画面，前者是失败、后者是时序上没有帧</li>
  *   <li>{@link #CANCELLED}：请求在分析前被放弃</li>
+ *   <li>{@link #INTERNAL_ERROR}：管线内部出现<b>不该发生</b>的错误（未检查异常被兜住），
+ *       是编程错误的信号，不等于「没点中」</li>
  * </ul>
  */
 public enum TargetSelectionStatus {
@@ -38,9 +40,19 @@ public enum TargetSelectionStatus {
     NO_FRAME,
 
     /** 请求被放弃（配置关闭、显式取消）。 */
-    CANCELLED;
+    CANCELLED,
 
-    /** 是否“点到了目标”（含只有框没有 id 的情况）。 */
+    /**
+     * 管线内部出现不该发生的错误（未检查异常被兜住、协作者返回自相矛盾的结果等）。
+     *
+     * <p><b>它不等于 MISS</b>：MISS 意味着"分析跑了但点上没有目标"，
+     * 而本状态意味着"分析根本没跑完"。上层看到它应当视为<b>缺陷信号</b>
+     * （打点/上报），而不是正常的一次未命中。把它与 MISS 分开，
+     * 是为了避免"一个 NPE 被当成用户没点中"这种把 bug 埋掉的行为。</p>
+     */
+    INTERNAL_ERROR;
+
+    /** 是否"点到了目标"（含只有框没有 id 的情况）。 */
     public boolean isHit() {
         return this == HIT || this == HIT_ID_UNKNOWN;
     }
@@ -50,13 +62,14 @@ public enum TargetSelectionStatus {
         return this == HIT;
     }
 
-    /** 是否属于“没拿到结果”的异常/放弃路径，用于决定是否给出用户提示。 */
+    /** 是否属于"没拿到结果"的异常/放弃路径，用于决定是否给出用户提示。 */
     public boolean isFailure() {
         switch (this) {
             case CAPTURE_FAILED:
             case NO_FRAME:
             case GEOMETRY_UNAVAILABLE:
             case CANCELLED:
+            case INTERNAL_ERROR:
                 return true;
             default:
                 return false;

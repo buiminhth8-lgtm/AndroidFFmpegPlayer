@@ -28,7 +28,7 @@ public class TargetHitResultTest {
         assertSame(box, result.boundingBox);
         assertEquals(15f, result.touchVideoX, EPS);
         assertEquals(25f, result.touchVideoY, EPS);
-        assertEquals(0.9f, result.confidence, EPS);
+        assertEquals(0.9f, result.boxConfidence, EPS);
         assertEquals(123_456L, result.framePtsUs);
         assertEquals(7L, result.processingMs);
         assertTrue(result.isHit());
@@ -56,7 +56,7 @@ public class TargetHitResultTest {
         assertEquals(TargetSelectionStatus.MISS, result.status);
         assertNull(result.targetId);
         assertNull(result.boundingBox);
-        assertEquals(0f, result.confidence, EPS);
+        assertEquals(0f, result.boxConfidence, EPS);
         assertEquals(4f, result.touchVideoX, EPS);
         assertTrue(result.hasVideoCoordinates());
         assertFalse(result.isHit());
@@ -96,7 +96,7 @@ public class TargetHitResultTest {
 
         assertNull(result.targetId);
         assertNull(result.boundingBox);
-        assertEquals(0f, result.confidence, EPS);
+        assertEquals(0f, result.boxConfidence, EPS);
         assertEquals(1f, result.touchVideoX, EPS);
     }
 
@@ -120,20 +120,20 @@ public class TargetHitResultTest {
                 TargetBoundingBox.of(0f, 0f, 5f, 5f), 1f, 1f, 0.8f, 3L, 1L, null);
         assertEquals(TargetSelectionStatus.HIT_ID_UNKNOWN, result.status);
         assertNull(result.targetId);
-        assertEquals(0.8f, result.confidence, EPS);
+        assertEquals(0.8f, result.boxConfidence, EPS);
     }
 
     @Test
     public void confidenceAndProcessingTimeAreClamped() {
         TargetHitResult high = TargetHitResult.hit("A", TargetBoundingBox.of(0f, 0f, 1f, 1f), 7f, 0f, 0f, 0L, -3L);
-        assertEquals(1f, high.confidence, EPS);
+        assertEquals(1f, high.boxConfidence, EPS);
         assertEquals(0L, high.processingMs);
 
         TargetHitResult low = TargetHitResult.hit("A", TargetBoundingBox.of(0f, 0f, 1f, 1f), -2f, 0f, 0f, 0L, 0L);
-        assertEquals(0f, low.confidence, EPS);
+        assertEquals(0f, low.boxConfidence, EPS);
 
         TargetHitResult nan = TargetHitResult.hit("A", TargetBoundingBox.of(0f, 0f, 1f, 1f), Float.NaN, 0f, 0f, 0L, 0L);
-        assertEquals(0f, nan.confidence, EPS);
+        assertEquals(0f, nan.boxConfidence, EPS);
     }
 
     @Test

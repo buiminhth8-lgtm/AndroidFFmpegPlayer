@@ -10,6 +10,7 @@ import static org.junit.Assert.assertTrue;
 import com.example.motro.targetselection.api.TargetHitResult;
 import com.example.motro.targetselection.api.TargetSelectionConfig;
 import com.example.motro.targetselection.api.TargetSelectionController;
+import com.example.motro.targetselection.api.TargetSelectionRequest;
 import com.example.motro.targetselection.api.TargetSelectionStatus;
 import com.example.motro.targetselection.frame.CapturedFrame;
 import com.example.motro.targetselection.frame.FrameCaptureException;
@@ -26,10 +27,14 @@ import org.junit.Test;
 /**
  * {@link BlueBoxTargetProvider} —— 把像素法检测接到既有 {@code TargetProvider} 契约上的适配器。
  *
- * <p>它本身逻辑很少，但<b>位置关键</b>：它是"Slice 5 的算法"与"Slice 0 定好的控制器管线"
+ * <p>它本身逻辑很少，但<b>位置关键</b>：它是"Slice 5 的算法"与"Slice 0 定好的 provider 契约"
  * 之间唯一的接缝。所以这里既测适配器自身的映射（命中→无 id 候选，未命中→null），
- * 也测<b>端到端</b>：真控制器 + 真适配器，看它到底能不能产出 {@code HIT_ID_UNKNOWN}
- * 与 {@code MISS} —— 这正是本 Slice 对外的交付承诺。</p>
+ * 也测<b>端到端</b>：真控制器（Slice 9 的 13 参构造，直接注入像素法视觉链）
+ * 看它到底能不能产出 {@code HIT_ID_UNKNOWN} 与 {@code MISS}。</p>
+ *
+ * <p><b>与 Slice 9 的关系</b>：新控制器已经把像素法视觉链当作一等协作者注入，
+ * 不再经由本适配器；因此端到端用例改为验证"控制器原生链路"，
+ * 而本类的单元测试保持不变 —— 它仍是历史上那条接缝的可回归证据。</p>
  */
 public class BlueBoxTargetProviderTest {
 
@@ -108,18 +113,20 @@ public class BlueBoxTargetProviderTest {
      * 控制器链路上真实命中：{@code HIT_ID_UNKNOWN}（有框、没有 id）。
      *
      * <p>这条用例把本 Slice 的交付承诺钉死：算法不是只在单测里能跑，
-     * 而是<b>接上既有控制器管线后</b>能给出一个上层可用的结果。</p>
+     * 而是<b>接上控制器管线后</b>能给出一个上层可用的结果。
+     * Slice 9 起控制器直接装配像素法视觉链 + 默认识别器（字形模板），
+     * 合成画布上没有可辨识的字形，于是 id 读不出来 —— 正是 {@code HIT_ID_UNKNOWN}。</p>
      */
     @Test
     public void controllerReportsHitIdUnknownForABlueBox() {
         TargetSelectionController controller = controller();
 
-        TargetHitResult result = controller.selectTargetAtViewPoint(270f, 160f);
+        TargetHitResult result = controller.select(TargetSelectionRequest.ofNow(270f, 160f));
 
         assertEquals(TargetSelectionStatus.HIT_ID_UNKNOWN, result.status);
         assertTrue(result.isHit());
         assertFalse("没有 id，只能算未解析出 id", result.hasResolvedId());
-        assertNull("本 Slice 不得凭空给一个 id", result.targetId);
+        assertNull("不得凭空给一个 id", result.targetId);
         assertNotNull(result.boundingBox);
         assertEquals(120f, result.boundingBox.left, EPS);
         assertEquals(280f, result.boundingBox.bottom, EPS);
@@ -130,31 +137,11 @@ public class BlueBoxTargetProviderTest {
     public void controllerReportsMissWhenTappingOutside() {
         TargetSelectionController controller = controller();
 
-        TargetHitResult result = controller.selectTargetAtViewPoint(700f, 500f);
+        TargetHitResult result = controller.select(TargetSelectionRequest.ofNow(700f, 500f));
 
         assertEquals(TargetSelectionStatus.MISS, result.status);
         assertFalse(result.isHit());
         assertNull(result.boundingBox);
-    }
-
-    /**
-     * 只认 id 的调用方（{@code reportUnknownTargetId=false}）拿到的是 MISS，
-     * 而不是一个"有框没名字"的半成品 —— 降级必须发生在控制器里，不能漏到上层。
-     */
-    @Test
-    public void controllerDowngradesToMissWhenTheCallerOnlyAcceptsIds() {
-        TargetSelectionConfig config = TargetSelectionConfig.defaults().toBuilder()
-                .reportUnknownTargetId(false)
-                .build();
-        TargetSelectionController controller = new TargetSelectionController(
-                new StaticFrameSource(boxCanvas()),
-                new FixedGeometryProvider(oneToOneGeometry()),
-                providerFor(config),
-                config);
-
-        TargetHitResult result = controller.selectTargetAtViewPoint(270f, 160f);
-
-        assertEquals(TargetSelectionStatus.MISS, result.status);
     }
 
     // ---------------------------------------------------------------- 辅助
@@ -165,18 +152,17 @@ public class BlueBoxTargetProviderTest {
                 TargetSelectionConfig.defaults());
     }
 
-    private static BlueBoxTargetProvider providerFor(TargetSelectionConfig config) {
-        return new BlueBoxTargetProvider(new FixedGeometryProvider(null), config);
-    }
-
-    /** 真控制器 + 真适配器 + 1:1 几何（视频 800x600、View 800x600，View 坐标即视频坐标）。 */
+    /**
+     * 真控制器 + 默认视觉链 + 1:1 几何（视频 800x600、View 800x600，View 坐标即视频坐标）。
+     *
+     * <p>用 {@link TargetSelectionController#withDefaults} 装配：它就是 app 层的默认用法，
+     * 于是这条端到端用例同时验证了"默认装配是可用的"。</p>
+     */
     private static TargetSelectionController controller() {
-        final TargetSelectionConfig config = TargetSelectionConfig.defaults();
-        return new TargetSelectionController(
+        return TargetSelectionController.withDefaults(
                 new StaticFrameSource(boxCanvas()),
                 new FixedGeometryProvider(oneToOneGeometry()),
-                new BlueBoxTargetProvider(new FixedGeometryProvider(oneToOneGeometry()), config),
-                config);
+                TargetSelectionConfig.defaults());
     }
 
     /** 1:1 几何：不缩放、不旋转、不镜像，于是 View 坐标与视频坐标逐点相等（便于读断言）。 */
